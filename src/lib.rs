@@ -157,6 +157,31 @@ fn vision_point_to_schema(x: f64, y: f64) -> (f32, f32) {
   (clamp01(x as f32), clamp01((1.0 - y) as f32))
 }
 
+/// Derive an axis-aligned bounding box from the min/max of a pose's
+/// surviving joint coordinates. Returns `None` when the extent in
+/// either axis is zero — a single joint, or joints that are perfectly
+/// colinear horizontally/vertically, would otherwise produce a wire
+/// box that the validated domain `BoundingBox::try_new` rejects.
+/// Callers should skip the pose detection on `None`; the joints alone
+/// do not carry enough geometry to construct a valid box.
+#[cfg(target_os = "macos")]
+fn pose_bbox_from_joint_bounds(
+  min_x: f32,
+  min_y: f32,
+  max_x: f32,
+  max_y: f32,
+) -> Option<BoundingBox> {
+  if !(min_x.is_finite() && min_y.is_finite() && max_x.is_finite() && max_y.is_finite()) {
+    return None;
+  }
+  let width = max_x - min_x;
+  let height = max_y - min_y;
+  if width <= 0.0 || height <= 0.0 {
+    return None;
+  }
+  Some(BoundingBox::new(min_x, min_y, width, height))
+}
+
 // ----- CVPixelBuffer RAII lock ----------------------------------------------
 
 /// RAII guard that holds a `CVPixelBufferLockBaseAddress` lock for the
@@ -962,19 +987,15 @@ impl VisionAnalyzer {
         continue;
       }
 
-      joints.sort_by(|lhs, rhs| lhs.name().cmp(rhs.name()));
-      let bbox = if min_x.is_finite() && min_y.is_finite() && max_x.is_finite() && max_y.is_finite()
-      {
-        BoundingBox::new(
-          min_x,
-          min_y,
-          (max_x - min_x).max(0.0),
-          (max_y - min_y).max(0.0),
-        )
-      } else {
-        BoundingBox::default()
+      let Some(bbox) = pose_bbox_from_joint_bounds(min_x, min_y, max_x, max_y) else {
+        // A pose with only one surviving joint (or perfectly colinear
+        // joints) cannot produce a valid axis-aligned bbox; skip it
+        // rather than emit a zero-extent box that the domain
+        // validator would reject.
+        continue;
       };
 
+      joints.sort_by(|lhs, rhs| lhs.name().cmp(rhs.name()));
       body_poses.push(BodyPoseDetection::new(
         bbox,
         unsafe { obs.confidence() },
@@ -1090,19 +1111,11 @@ impl VisionAnalyzer {
         continue;
       }
 
-      joints.sort_by(|lhs, rhs| lhs.name().cmp(rhs.name()));
-      let bbox = if min_x.is_finite() && min_y.is_finite() && max_x.is_finite() && max_y.is_finite()
-      {
-        BoundingBox::new(
-          min_x,
-          min_y,
-          (max_x - min_x).max(0.0),
-          (max_y - min_y).max(0.0),
-        )
-      } else {
-        BoundingBox::default()
+      let Some(bbox) = pose_bbox_from_joint_bounds(min_x, min_y, max_x, max_y) else {
+        continue;
       };
 
+      joints.sort_by(|lhs, rhs| lhs.name().cmp(rhs.name()));
       hand_poses.push(HandPoseDetection::new(
         bbox,
         unsafe { obs.confidence() },
@@ -1265,19 +1278,11 @@ impl VisionAnalyzer {
         continue;
       }
 
-      joints.sort_by(|lhs, rhs| lhs.name().cmp(rhs.name()));
-      let bbox = if min_x.is_finite() && min_y.is_finite() && max_x.is_finite() && max_y.is_finite()
-      {
-        BoundingBox::new(
-          min_x,
-          min_y,
-          (max_x - min_x).max(0.0),
-          (max_y - min_y).max(0.0),
-        )
-      } else {
-        BoundingBox::default()
+      let Some(bbox) = pose_bbox_from_joint_bounds(min_x, min_y, max_x, max_y) else {
+        continue;
       };
 
+      joints.sort_by(|lhs, rhs| lhs.name().cmp(rhs.name()));
       body_poses.push(BodyPoseDetection::new(
         bbox,
         unsafe { obs.confidence() },
@@ -1415,17 +1420,49 @@ impl VisionAnalyzer {
       // system, so each corner's `y` must be flipped to land in the
       // top-left schema convention. The naming still matches afterwards
       // (the corner with the smallest `y` is still the top edge).
-      let top_left = unsafe { observation.topLeft() };
-      let top_right = unsafe { observation.topRight() };
-      let bottom_left = unsafe { observation.bottomLeft() };
-      let bottom_right = unsafe { observation.bottomRight() };
+      let top_left = vision_point_to_schema(
+        unsafe { observation.topLeft() }.x,
+        unsafe { observation.topLeft() }.y,
+      );
+      let top_right = vision_point_to_schema(
+        unsafe { observation.topRight() }.x,
+        unsafe { observation.topRight() }.y,
+      );
+      let bottom_left = vision_point_to_schema(
+        unsafe { observation.bottomLeft() }.x,
+        unsafe { observation.bottomLeft() }.y,
+      );
+      let bottom_right = vision_point_to_schema(
+        unsafe { observation.bottomRight() }.x,
+        unsafe { observation.bottomRight() }.y,
+      );
+
+      // Even after per-corner clamping, the resulting quad can be
+      // degenerate (coincident corners, zero shoelace area, or
+      // self-intersecting) when Vision returned an off-screen segment
+      // or near-collinear corners. mediaschema's domain
+      // `DocumentSegment::try_new` runs the same geometry guards
+      // (collapsed corners, zero area, bow-tie / inconsistent winding)
+      // that downstream consumers will apply, so we validate via that
+      // constructor and only emit the wire segment on success.
+      if mediaschema::domain::aggregates::video::DocumentSegment::try_new(
+        top_left,
+        top_right,
+        bottom_right,
+        bottom_left,
+        confidence,
+      )
+      .is_err()
+      {
+        continue;
+      }
 
       segments.push(
         DocumentSegment::default()
-          .with_top_left(vision_point_to_schema(top_left.x, top_left.y))
-          .with_top_right(vision_point_to_schema(top_right.x, top_right.y))
-          .with_bottom_left(vision_point_to_schema(bottom_left.x, bottom_left.y))
-          .with_bottom_right(vision_point_to_schema(bottom_right.x, bottom_right.y))
+          .with_top_left(top_left)
+          .with_top_right(top_right)
+          .with_bottom_left(bottom_left)
+          .with_bottom_right(bottom_right)
           .with_confidence(confidence),
       );
     }
@@ -2084,5 +2121,95 @@ mod macos_tests {
     assert!((bbox.y - 0.0).abs() < 1e-6);
     assert!((bbox.width - 1.0).abs() < 1e-6);
     assert!((bbox.height - 1.0).abs() < 1e-6);
+  }
+
+  /// A pose with only one surviving joint cannot derive a non-degenerate
+  /// bbox. The helper must report `None` so the pose extractor skips
+  /// it instead of emitting a zero-extent box that the domain
+  /// validator would reject.
+  #[test]
+  fn pose_bbox_from_single_joint_yields_none() {
+    assert!(pose_bbox_from_joint_bounds(0.5, 0.5, 0.5, 0.5).is_none());
+  }
+
+  /// A pose where every joint shares the same x (perfectly vertical
+  /// limbs) has zero-width bbox and must be reported as `None`.
+  #[test]
+  fn pose_bbox_from_vertical_joints_yields_none() {
+    assert!(pose_bbox_from_joint_bounds(0.5, 0.1, 0.5, 0.9).is_none());
+  }
+
+  /// A pose where every joint shares the same y has zero-height bbox
+  /// and must be reported as `None`.
+  #[test]
+  fn pose_bbox_from_horizontal_joints_yields_none() {
+    assert!(pose_bbox_from_joint_bounds(0.1, 0.5, 0.9, 0.5).is_none());
+  }
+
+  /// A pose with at least one joint per axis produces a valid bbox.
+  #[test]
+  fn pose_bbox_from_diagonal_joints_is_valid() {
+    let bbox =
+      pose_bbox_from_joint_bounds(0.1, 0.2, 0.4, 0.6).expect("non-degenerate joints yield Some");
+    assert!((bbox.x - 0.1).abs() < 1e-6);
+    assert!((bbox.y - 0.2).abs() < 1e-6);
+    assert!((bbox.width - 0.3).abs() < 1e-6);
+    assert!((bbox.height - 0.4).abs() < 1e-6);
+    mediaschema::domain::aggregates::video::BoundingBox::try_new(
+      bbox.x,
+      bbox.y,
+      bbox.width,
+      bbox.height,
+    )
+    .expect("pose-derived bbox satisfies domain invariants");
+  }
+
+  /// Non-finite joint coordinates (NaN/Inf from a glitched Vision
+  /// observation) must short-circuit before reaching the
+  /// `BoundingBox::new` constructor.
+  #[test]
+  fn pose_bbox_from_nan_joints_yields_none() {
+    assert!(pose_bbox_from_joint_bounds(f32::NAN, 0.5, 0.5, 0.5).is_none());
+    assert!(pose_bbox_from_joint_bounds(0.1, 0.1, f32::INFINITY, 0.5).is_none());
+  }
+
+  /// A document quad whose corners survive per-coord clamp but
+  /// collapse to a degenerate shape (e.g. all four corners on a
+  /// vertical line because they all clamped to `x = 0.0`) must be
+  /// rejected by the domain validator, which the extractor runs
+  /// pre-emission.
+  #[test]
+  fn document_quad_with_collapsed_corners_is_rejected_by_domain() {
+    // All four corners at (0.0, 0.0) — collapsed quad.
+    let p = (0.0_f32, 0.0_f32);
+    assert!(
+      mediaschema::domain::aggregates::video::DocumentSegment::try_new(p, p, p, p, 0.9).is_err()
+    );
+  }
+
+  /// A bow-tie quad (TL & BR swapped) is self-intersecting; the
+  /// domain validator rejects it, so the extractor must skip it.
+  #[test]
+  fn document_quad_bowtie_is_rejected_by_domain() {
+    let tl = (0.1_f32, 0.1_f32);
+    let tr = (0.9_f32, 0.1_f32);
+    let br = (0.1_f32, 0.9_f32);
+    let bl = (0.9_f32, 0.9_f32);
+    assert!(
+      mediaschema::domain::aggregates::video::DocumentSegment::try_new(tl, tr, br, bl, 0.9)
+        .is_err()
+    );
+  }
+
+  /// A well-formed quad passes the domain validator and produces a
+  /// valid wire segment.
+  #[test]
+  fn document_quad_well_formed_is_accepted_by_domain() {
+    let tl = (0.1_f32, 0.1_f32);
+    let tr = (0.9_f32, 0.1_f32);
+    let br = (0.9_f32, 0.9_f32);
+    let bl = (0.1_f32, 0.9_f32);
+    mediaschema::domain::aggregates::video::DocumentSegment::try_new(tl, tr, br, bl, 0.9)
+      .expect("well-formed unit quad is valid");
   }
 }
