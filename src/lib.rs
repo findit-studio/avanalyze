@@ -13,56 +13,73 @@
 //! Input: `Request` via crossbeam bounded channel
 //! Output: `Reply` via callback back to the processor-local coordinator
 
+#[cfg(target_os = "macos")]
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
+#[cfg(target_os = "macos")]
 use bytes::Bytes;
+#[cfg(target_os = "macos")]
 use mediaschema::{
   Aesthetics, AnimalAnalysis, BarcodeDetection, BodyPose3DDetection, BodyPose3DHeightEstimation,
   BodyPose3DJoint, BodyPoseDetection, BodyPoseJoint, BoundingBox, ClassificationDetection,
-  Dimensions, DocumentSegment, ErrorInfo, FaceDetection, FaceLandmarkPoint, FaceLandmarkRegion,
+  Dimensions, DocumentSegment, FaceDetection, FaceLandmarkPoint, FaceLandmarkRegion,
   FaceLandmarksDetection, FeaturePrint, HandChirality, HandPoseDetection, HorizonInfo,
-  HumanAnalysis, Id, Keyframe, PersonInstanceMaskDetection, PersonSegmentationMask, SaliencyRegion,
-  SubjectDetection, TextDetection, domain::ErrorCode,
+  HumanAnalysis, PersonInstanceMaskDetection, PersonSegmentationMask, SaliencyRegion,
+  SubjectDetection, TextDetection,
 };
+use mediaschema::{ErrorInfo, Id, Keyframe, domain::ErrorCode};
 
 use wire_ext::*;
 
 // use tracing::{info, warn};
 
+#[cfg(target_os = "macos")]
 use objc2::{
   encode::{Encode, Encoding},
   rc::Retained,
 };
+#[cfg(target_os = "macos")]
 use objc2_core_foundation::CGRect;
+#[cfg(target_os = "macos")]
 use objc2_core_video::{
   CVPixelBuffer, CVPixelBufferGetBaseAddress, CVPixelBufferGetBytesPerRow, CVPixelBufferGetHeight,
   CVPixelBufferGetPixelFormatType, CVPixelBufferGetWidth, CVPixelBufferLockBaseAddress,
   CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress, kCVPixelFormatType_OneComponent8,
   kCVPixelFormatType_OneComponent32Float, kCVReturnSuccess,
 };
+#[cfg(target_os = "macos")]
 use objc2_foundation::{NSArray, NSData, NSIndexSet, NSNotFound};
+#[cfg(target_os = "macos")]
 use objc2_vision::*;
+#[cfg(target_os = "macos")]
 use smol_str::{SmolStr, StrExt, ToSmolStr};
 
 pub use options::*;
 
 mod options;
+// `wire_ext` is platform-independent — it bridges mediaschema wire
+// types to richer ergonomic builders. Both the macOS Vision engine and
+// the non-macOS stub use `ErrorInfoExt::new` to construct errors.
 mod wire_ext;
 
+#[cfg(target_os = "macos")]
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Debug)]
 struct SimdFloat4([f32; 4]);
 
+#[cfg(target_os = "macos")]
 unsafe impl Encode for SimdFloat4 {
   const ENCODING: Encoding = Encoding::Unknown;
 }
 
+#[cfg(target_os = "macos")]
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Debug)]
 struct SimdFloat4x4 {
   columns: [SimdFloat4; 4],
 }
 
+#[cfg(target_os = "macos")]
 unsafe impl Encode for SimdFloat4x4 {
   // Clang reports @encode(simd_float4x4) as "{?=[4]}" because the vector element
   // encoding is intentionally opaque.
@@ -71,35 +88,73 @@ unsafe impl Encode for SimdFloat4x4 {
 
 // ----- Vision → mediaschema coordinate conversion ---------------------------
 
-/// Convert a Vision-framework normalized bounding box (lower-left origin,
-/// y grows up) into the mediaschema convention (top-left origin, y grows
-/// down). The schema documents `apple-vision convention: floats in
-/// [0.0, 1.0], origin top-left` (see `mediaschema::domain ... NormCoord`),
-/// while `VNObservation::boundingBox` is documented as a normalized rect
-/// in image coordinates where (0,0) is the lower-left corner.
-///
-/// Vision passes its rect through `standardize()` so the size is positive;
-/// the lower edge of the box in Vision space is `origin.y`, and the upper
-/// edge is `origin.y + size.height`. In schema space the upper edge maps
-/// to `1.0 - (origin.y + size.height)` (the new top y), and width/height
-/// are preserved.
+/// Clamp a finite `f32` into `[0.0, 1.0]`. Non-finite inputs collapse to
+/// `0.0` — Vision occasionally yields `NaN` for off-image rectangles
+/// and mediaschema's `NormCoord` rejects non-finite values, so we
+/// sanitise rather than propagate.
+#[cfg(target_os = "macos")]
 #[inline]
-fn vision_bbox_to_schema(rect: CGRect) -> BoundingBox {
-  let x = rect.origin.x as f32;
-  let y = (1.0 - (rect.origin.y + rect.size.height)) as f32;
-  let width = rect.size.width as f32;
-  let height = rect.size.height as f32;
-  BoundingBox::new(x, y, width, height)
+fn clamp01(value: f32) -> f32 {
+  if value.is_finite() {
+    value.clamp(0.0, 1.0)
+  } else {
+    0.0
+  }
 }
 
-/// Flip a Vision normalized point's y axis to match mediaschema's top-left
-/// origin. `BoundingBox`, `Point2D`, `BodyPoseJoint` (2-D), `FaceLandmarkPoint`,
+/// Convert a Vision-framework normalized bounding box (lower-left
+/// origin, y grows up) into the mediaschema convention (top-left
+/// origin, y grows down) and intersect it with the unit square
+/// `[0, 1] × [0, 1]`.
+///
+/// The schema documents `apple-vision convention: floats in [0.0, 1.0],
+/// origin top-left` (see `mediaschema::domain ... NormCoord`), while
+/// `VNObservation::boundingBox` is documented as a normalized rect in
+/// image coordinates where `(0,0)` is the lower-left corner. Vision is
+/// empirically loose about staying inside `[0, 1]` — partially
+/// off-screen detections can produce `origin.x < 0`,
+/// `origin.x + width > 1`, etc., which the validated domain
+/// `BoundingBox::try_new` would reject. We clamp every component and
+/// return `None` if the resulting rectangle is degenerate
+/// (zero-width or zero-height); the detection is then dropped at the
+/// engine layer instead of poisoning downstream storage.
+///
+/// `standardize()` is assumed to have already been called on `rect`;
+/// the input `size` is non-negative.
+#[cfg(target_os = "macos")]
+fn vision_bbox_to_schema(rect: CGRect) -> Option<BoundingBox> {
+  // Vision lower-left → schema top-left: the top edge in schema space
+  // is `1.0 - (origin.y + size.height)`.
+  let raw_x = rect.origin.x as f32;
+  let raw_y = (1.0 - (rect.origin.y + rect.size.height)) as f32;
+  let raw_width = rect.size.width as f32;
+  let raw_height = rect.size.height as f32;
+
+  // Intersect with the unit square. Compute right/bottom in raw space,
+  // then clamp the four edges so we never end up with `x + width > 1`.
+  let left = clamp01(raw_x);
+  let top = clamp01(raw_y);
+  let right = clamp01(raw_x + raw_width);
+  let bottom = clamp01(raw_y + raw_height);
+  let width = (right - left).max(0.0);
+  let height = (bottom - top).max(0.0);
+  if width <= 0.0 || height <= 0.0 {
+    return None;
+  }
+  Some(BoundingBox::new(left, top, width, height))
+}
+
+/// Flip a Vision normalized point's y axis to match mediaschema's
+/// top-left origin and clamp both components into `[0.0, 1.0]`.
+/// `BoundingBox`, `Point2D`, `BodyPoseJoint` (2-D), `FaceLandmarkPoint`,
 /// and `DocumentSegment` corners all share the top-left convention (see
-/// `NormCoord` doc-comment in mediaschema). 3-D joints (`BodyPose3DJoint`)
-/// are model-space metres and are NOT flipped.
+/// `NormCoord` doc-comment in mediaschema). 3-D joints
+/// (`BodyPose3DJoint`) are model-space metres and are NOT flipped or
+/// clamped.
+#[cfg(target_os = "macos")]
 #[inline]
 fn vision_point_to_schema(x: f64, y: f64) -> (f32, f32) {
-  (x as f32, (1.0 - y) as f32)
+  (clamp01(x as f32), clamp01((1.0 - y) as f32))
 }
 
 // ----- CVPixelBuffer RAII lock ----------------------------------------------
@@ -107,11 +162,13 @@ fn vision_point_to_schema(x: f64, y: f64) -> (f32, f32) {
 /// RAII guard that holds a `CVPixelBufferLockBaseAddress` lock for the
 /// lifetime of the guard. `Drop` unlocks even on panic-unwind so the
 /// buffer cannot be left in a locked state by a panicking slice index.
+#[cfg(target_os = "macos")]
 struct CVPixelBufferLockGuard<'a> {
   buffer: &'a CVPixelBuffer,
   flags: CVPixelBufferLockFlags,
 }
 
+#[cfg(target_os = "macos")]
 impl<'a> CVPixelBufferLockGuard<'a> {
   /// Acquire a lock on `buffer` with `flags`. Returns `None` if Core
   /// Video refused the lock; on success the guard's `Drop` is
@@ -136,6 +193,7 @@ impl<'a> CVPixelBufferLockGuard<'a> {
   }
 }
 
+#[cfg(target_os = "macos")]
 impl Drop for CVPixelBufferLockGuard<'_> {
   fn drop(&mut self) {
     // SAFETY: the corresponding lock was acquired successfully in
@@ -437,12 +495,14 @@ impl Drop for CVPixelBufferLockGuard<'_> {
 /// constructs one fresh analyzer per worker rather than cloning a
 /// single shared instance — `Clone` is intentionally not implemented to
 /// make that contract a compile-time error.
+#[cfg(target_os = "macos")]
 #[derive(Debug)]
 pub struct VisionAnalyzer {
   opts: ServiceOptions,
   requests: VisionRequests,
 }
 
+#[cfg(target_os = "macos")]
 #[derive(Debug)]
 struct VisionRequests {
   classify: Retained<VNClassifyImageRequest>,
@@ -482,6 +542,7 @@ fn apple_vision_keyframe_error(keyframe_id: Id, error: ErrorInfo) -> ErrorInfo {
   )
 }
 
+#[cfg(target_os = "macos")]
 impl VisionRequests {
   fn new(opts: ServiceOptions) -> Self {
     unsafe {
@@ -609,6 +670,7 @@ impl VisionRequests {
   }
 }
 
+#[cfg(target_os = "macos")]
 impl VisionAnalyzer {
   /// Creates a new Apple Vision analyzer with the specified options.
   #[cfg_attr(not(tarpaulin), inline(always))]
@@ -735,7 +797,6 @@ impl VisionAnalyzer {
 
     let mut faces = Vec::with_capacity(results.len());
     for obs in results.iter() {
-      let bbox = unsafe { obs.boundingBox() }.standardize();
       let confidence = unsafe { obs.confidence() };
       let capture_quality = unsafe { obs.faceCaptureQuality() }
         .map(|q| q.floatValue())
@@ -744,9 +805,12 @@ impl VisionAnalyzer {
         continue;
       }
 
+      let Some(bbox) = vision_bbox_to_schema(unsafe { obs.boundingBox() }.standardize()) else {
+        continue;
+      };
       faces.push(
         FaceDetection::default()
-          .with_bbox(vision_bbox_to_schema(bbox))
+          .with_bbox(bbox)
           .with_confidence(confidence)
           .with_capture_quality(capture_quality)
           .with_roll(unsafe { obs.roll() }.map(|v| v.floatValue()).unwrap_or(0.0))
@@ -775,10 +839,12 @@ impl VisionAnalyzer {
         continue;
       }
 
-      let bbox = unsafe { obs.boundingBox() }.standardize();
+      let Some(bbox) = vision_bbox_to_schema(unsafe { obs.boundingBox() }.standardize()) else {
+        continue;
+      };
       faces.push(
         FaceDetection::default()
-          .with_bbox(vision_bbox_to_schema(bbox))
+          .with_bbox(bbox)
           .with_confidence(confidence)
           .with_roll(unsafe { obs.roll() }.map(|v| v.floatValue()).unwrap_or(0.0))
           .with_yaw(unsafe { obs.yaw() }.map(|v| v.floatValue()).unwrap_or(0.0))
@@ -814,12 +880,10 @@ impl VisionAnalyzer {
         continue;
       }
 
-      let bbox = unsafe { obs.boundingBox() }.standardize();
-      detections.push(FaceLandmarksDetection::new(
-        vision_bbox_to_schema(bbox),
-        confidence,
-        regions,
-      ));
+      let Some(bbox) = vision_bbox_to_schema(unsafe { obs.boundingBox() }.standardize()) else {
+        continue;
+      };
+      detections.push(FaceLandmarksDetection::new(bbox, confidence, regions));
     }
 
     detections
@@ -838,11 +902,13 @@ impl VisionAnalyzer {
         continue;
       }
 
-      let bbox = unsafe { obs.boundingBox() }.standardize();
+      let Some(bbox) = vision_bbox_to_schema(unsafe { obs.boundingBox() }.standardize()) else {
+        continue;
+      };
       humans.push(SubjectDetection::new(
         SmolStr::from("person"),
         confidence,
-        vision_bbox_to_schema(bbox),
+        bbox,
       ));
     }
 
@@ -1137,13 +1203,10 @@ impl VisionAnalyzer {
           let confidence = label.confidence();
           if confidence >= self.opts.animals().min_confidence() {
             let id = label.identifier().to_smolstr();
-            if !id.is_empty() {
-              let bbox = obs.boundingBox().standardize();
-              animals.push(SubjectDetection::new(
-                id,
-                confidence,
-                vision_bbox_to_schema(bbox),
-              ));
+            if !id.is_empty()
+              && let Some(bbox) = vision_bbox_to_schema(obs.boundingBox().standardize())
+            {
+              animals.push(SubjectDetection::new(id, confidence, bbox));
             }
           }
         }
@@ -1235,13 +1298,10 @@ impl VisionAnalyzer {
       let candidates = obs.topCandidates(self.opts.text().max_candidates_per_observation());
       for candidate in candidates.iter() {
         let text = candidate.string().to_smolstr();
-        if text.len() >= self.opts.text().min_text_len() {
-          let bbox = unsafe { obs.boundingBox() }.standardize();
-          text_detections.push(TextDetection::new(
-            text,
-            candidate.confidence(),
-            vision_bbox_to_schema(bbox),
-          ));
+        if text.len() >= self.opts.text().min_text_len()
+          && let Some(bbox) = vision_bbox_to_schema(unsafe { obs.boundingBox() }.standardize())
+        {
+          text_detections.push(TextDetection::new(text, candidate.confidence(), bbox));
         }
       }
     }
@@ -1263,15 +1323,11 @@ impl VisionAnalyzer {
 
       if let Some(payload) = unsafe { obs.payloadStringValue() } {
         let s = payload.to_smolstr();
-        if s.len() >= opts.min_payload_len() {
-          let bbox = unsafe { obs.boundingBox() }.standardize();
+        if s.len() >= opts.min_payload_len()
+          && let Some(bbox) = vision_bbox_to_schema(unsafe { obs.boundingBox() }.standardize())
+        {
           let symbology = unsafe { obs.symbology() }.to_smolstr();
-          barcodes.push(BarcodeDetection::new(
-            s,
-            symbology,
-            confidence,
-            vision_bbox_to_schema(bbox),
-          ));
+          barcodes.push(BarcodeDetection::new(s, symbology, confidence, bbox));
         }
       }
     }
@@ -1312,8 +1368,11 @@ impl VisionAnalyzer {
           continue;
         }
 
-        let bbox = unsafe { object.boundingBox() }.standardize();
-        regions.push(SaliencyRegion::new(vision_bbox_to_schema(bbox), confidence));
+        let Some(bbox) = vision_bbox_to_schema(unsafe { object.boundingBox() }.standardize())
+        else {
+          continue;
+        };
+        regions.push(SaliencyRegion::new(bbox, confidence));
       }
     }
     regions
@@ -1414,10 +1473,12 @@ impl VisionAnalyzer {
   }
 }
 
+#[cfg(target_os = "macos")]
 fn normalize_classification_label(label: SmolStr) -> SmolStr {
   label.trim().to_ascii_lowercase_smolstr()
 }
 
+#[cfg(target_os = "macos")]
 fn extract_body_pose_3d_coordinates(
   point: &VNHumanBodyRecognizedPoint3D,
 ) -> Option<(f32, f32, f32)> {
@@ -1432,6 +1493,7 @@ fn extract_body_pose_3d_coordinates(
   Some((x, y, z))
 }
 
+#[cfg(target_os = "macos")]
 fn map_hand_chirality(chirality: VNChirality) -> HandChirality {
   match chirality {
     VNChirality::Left => HAND_CHIRALITY_LEFT,
@@ -1440,6 +1502,7 @@ fn map_hand_chirality(chirality: VNChirality) -> HandChirality {
   }
 }
 
+#[cfg(target_os = "macos")]
 fn extract_face_landmark_regions(landmarks: &VNFaceLandmarks2D) -> Vec<FaceLandmarkRegion> {
   let mut regions = Vec::new();
   push_face_landmark_region(&mut regions, "allPoints", unsafe { landmarks.allPoints() });
@@ -1468,6 +1531,7 @@ fn extract_face_landmark_regions(landmarks: &VNFaceLandmarks2D) -> Vec<FaceLandm
   regions
 }
 
+#[cfg(target_os = "macos")]
 fn push_face_landmark_region(
   regions: &mut Vec<FaceLandmarkRegion>,
   name: &'static str,
@@ -1504,6 +1568,7 @@ fn push_face_landmark_region(
   regions.push(FaceLandmarkRegion::new(name, points));
 }
 
+#[cfg(target_os = "macos")]
 fn map_body_pose_3d_height_estimation(
   estimation: VNHumanBodyPose3DObservationHeightEstimation,
 ) -> BodyPose3DHeightEstimation {
@@ -1520,10 +1585,14 @@ fn map_body_pose_3d_height_estimation(
 /// a normalized bounding box of the foreground.
 ///
 /// Returns `None` when the buffer is unlockable, has zero extent, a null
-/// base address, an unsupported pixel format, or fails one of the stride
-/// /size sanity checks. The lock is held via [`CVPixelBufferLockGuard`]
-/// for the duration of the copy and is released by `Drop` on every exit
-/// path — including a panic — so the buffer cannot be left locked.
+/// base address, an unsupported pixel format, fails one of the
+/// stride/size sanity checks, or contains no foreground pixels (an
+/// all-zero mask is represented by skipping the detection rather than
+/// emitting one with a degenerate bbox). The lock is held via
+/// [`CVPixelBufferLockGuard`] for the duration of the copy and is
+/// released by `Drop` on every exit path — including a panic — so the
+/// buffer cannot be left locked.
+#[cfg(target_os = "macos")]
 fn copy_instance_mask_buffer(
   pixel_buffer: &CVPixelBuffer,
 ) -> Option<(BoundingBox, Dimensions, Bytes)> {
@@ -1531,6 +1600,7 @@ fn copy_instance_mask_buffer(
   copy_instance_mask_buffer_locked(guard.buffer())
 }
 
+#[cfg(target_os = "macos")]
 #[allow(non_upper_case_globals)]
 fn copy_instance_mask_buffer_locked(
   pixel_buffer: &CVPixelBuffer,
@@ -1561,109 +1631,136 @@ fn copy_instance_mask_buffer_locked(
   if bytes_per_row < row_pixel_bytes {
     return None;
   }
-  let packed_len = row_pixel_bytes.checked_mul(height)?;
+  let total_src_len = bytes_per_row.checked_mul(height)?;
 
-  match pixel_format {
+  // SAFETY: `base_address` points at a buffer of at least
+  // `bytes_per_row * height` bytes (Core Video contract); the buffer
+  // is locked by the surrounding `CVPixelBufferLockGuard`. We bound
+  // the slice length explicitly so all downstream indexing happens
+  // against a Rust-managed slice with the usual bounds checks.
+  let src = unsafe { std::slice::from_raw_parts(base_address, total_src_len) };
+
+  let (bbox, packed) = match pixel_format {
     kCVPixelFormatType_OneComponent32Float => {
-      let mut packed = vec![0u8; packed_len];
-      let mut min_x = usize::MAX;
-      let mut min_y = usize::MAX;
-      let mut max_x = 0usize;
-      let mut max_y = 0usize;
-      let mut has_foreground = false;
-
-      for row in 0..height {
-        // SAFETY: `base_address` points at a buffer of at least
-        // `bytes_per_row * height` bytes (Core Video contract), and
-        // `row * bytes_per_row` fits in `usize` because `bytes_per_row
-        // * height >= row_pixel_bytes * height = packed_len`, which we
-        // verified does not overflow.
-        let src_row_ptr = unsafe { base_address.add(row.checked_mul(bytes_per_row)?) };
-        // `bytes_per_row / 4` is the maximum number of `f32` elements
-        // we can safely read from a row; we only ever index up to
-        // `width`, which we already verified fits in the row.
-        let src_f32 =
-          unsafe { std::slice::from_raw_parts(src_row_ptr as *const f32, bytes_per_row / 4) };
-        let dst_start = row.checked_mul(row_pixel_bytes)?;
-        let dst_end = dst_start.checked_add(row_pixel_bytes)?;
-        let dst_row = packed.get_mut(dst_start..dst_end)?;
-        for col in 0..width {
-          let value = *src_f32.get(col)?;
-          let dst_pixel_start = col.checked_mul(4)?;
-          let dst_pixel_end = dst_pixel_start.checked_add(4)?;
-          dst_row
-            .get_mut(dst_pixel_start..dst_pixel_end)?
-            .copy_from_slice(&value.to_le_bytes());
-          if value > 0.0 {
-            has_foreground = true;
-            min_x = min_x.min(col);
-            min_y = min_y.min(row);
-            max_x = max_x.max(col);
-            max_y = max_y.max(row);
-          }
-        }
-      }
-
-      let bbox = if has_foreground {
-        normalized_bbox_from_pixel_bounds(min_x, min_y, max_x, max_y, width, height)
-      } else {
-        BoundingBox::default()
-      };
-
-      Some((
-        bbox,
-        Dimensions::new(
-          u16::try_from(width).unwrap_or(u16::MAX),
-          u16::try_from(height).unwrap_or(u16::MAX),
-        ),
-        Bytes::from(packed),
-      ))
+      process_mask_bytes_f32(width, height, bytes_per_row, src)?
     }
-    kCVPixelFormatType_OneComponent8 => {
-      let mut packed = vec![0u8; packed_len];
-      let mut min_x = usize::MAX;
-      let mut min_y = usize::MAX;
-      let mut max_x = 0usize;
-      let mut max_y = 0usize;
-      let mut has_foreground = false;
+    kCVPixelFormatType_OneComponent8 => process_mask_bytes_u8(width, height, bytes_per_row, src)?,
+    _ => return None,
+  };
 
-      for row in 0..height {
-        // SAFETY: `base_address` points at a buffer of at least
-        // `bytes_per_row * height` bytes (Core Video contract).
-        let src_row_ptr = unsafe { base_address.add(row.checked_mul(bytes_per_row)?) };
-        let src_row = unsafe { std::slice::from_raw_parts(src_row_ptr, bytes_per_row) };
-        let dst_start = row.checked_mul(width)?;
-        let dst_end = dst_start.checked_add(width)?;
-        let dst_row = packed.get_mut(dst_start..dst_end)?;
-        dst_row.copy_from_slice(src_row.get(..width)?);
-        for (col, value) in dst_row.iter().copied().enumerate() {
-          if value > 0 {
-            has_foreground = true;
-            min_x = min_x.min(col);
-            min_y = min_y.min(row);
-            max_x = max_x.max(col);
-            max_y = max_y.max(row);
-          }
-        }
+  Some((
+    bbox,
+    Dimensions::new(
+      u16::try_from(width).unwrap_or(u16::MAX),
+      u16::try_from(height).unwrap_or(u16::MAX),
+    ),
+    Bytes::from(packed),
+  ))
+}
+
+/// Walk an `OneComponent32Float` mask, copy it tightly packed, and
+/// derive a normalized foreground bbox. Returns `None` for an
+/// all-zero mask so the caller skips emitting a detection.
+///
+/// The result is a `(bbox, packed_bytes)` pair where `packed_bytes`
+/// has length `width * height * size_of::<f32>()`. Bytes are
+/// little-endian per Vision's expected wire format.
+#[cfg(target_os = "macos")]
+fn process_mask_bytes_f32(
+  width: usize,
+  height: usize,
+  bytes_per_row: usize,
+  src: &[u8],
+) -> Option<(BoundingBox, Vec<u8>)> {
+  let row_pixel_bytes = width.checked_mul(core::mem::size_of::<f32>())?;
+  let packed_len = row_pixel_bytes.checked_mul(height)?;
+  let mut packed = vec![0u8; packed_len];
+
+  let mut min_x = usize::MAX;
+  let mut min_y = usize::MAX;
+  let mut max_x = 0usize;
+  let mut max_y = 0usize;
+  let mut has_foreground = false;
+
+  for row in 0..height {
+    let src_start = row.checked_mul(bytes_per_row)?;
+    let src_end = src_start.checked_add(row_pixel_bytes)?;
+    let src_row = src.get(src_start..src_end)?;
+    let dst_start = row.checked_mul(row_pixel_bytes)?;
+    let dst_end = dst_start.checked_add(row_pixel_bytes)?;
+    let dst_row = packed.get_mut(dst_start..dst_end)?;
+    for col in 0..width {
+      let pixel_start = col.checked_mul(4)?;
+      let pixel_end = pixel_start.checked_add(4)?;
+      let bytes: [u8; 4] = src_row.get(pixel_start..pixel_end)?.try_into().ok()?;
+      let value = f32::from_le_bytes(bytes);
+      dst_row
+        .get_mut(pixel_start..pixel_end)?
+        .copy_from_slice(&bytes);
+      if value > 0.0 {
+        has_foreground = true;
+        min_x = min_x.min(col);
+        min_y = min_y.min(row);
+        max_x = max_x.max(col);
+        max_y = max_y.max(row);
       }
-
-      let bbox = if has_foreground {
-        normalized_bbox_from_pixel_bounds(min_x, min_y, max_x, max_y, width, height)
-      } else {
-        BoundingBox::default()
-      };
-
-      Some((
-        bbox,
-        Dimensions::new(
-          u16::try_from(width).unwrap_or(u16::MAX),
-          u16::try_from(height).unwrap_or(u16::MAX),
-        ),
-        Bytes::from(packed),
-      ))
     }
-    _ => None,
   }
+
+  if !has_foreground {
+    // All-zero mask — skip the detection rather than emit one with a
+    // degenerate bbox. The validated domain `BoundingBox::try_new`
+    // rejects zero-extent boxes, so the previous
+    // `BoundingBox::default()` fallback would poison downstream
+    // conversion.
+    return None;
+  }
+  let bbox = normalized_bbox_from_pixel_bounds(min_x, min_y, max_x, max_y, width, height);
+  Some((bbox, packed))
+}
+
+/// Walk an `OneComponent8` mask, copy it tightly packed, and derive a
+/// normalized foreground bbox. Returns `None` for an all-zero mask.
+#[cfg(target_os = "macos")]
+fn process_mask_bytes_u8(
+  width: usize,
+  height: usize,
+  bytes_per_row: usize,
+  src: &[u8],
+) -> Option<(BoundingBox, Vec<u8>)> {
+  let packed_len = width.checked_mul(height)?;
+  let mut packed = vec![0u8; packed_len];
+
+  let mut min_x = usize::MAX;
+  let mut min_y = usize::MAX;
+  let mut max_x = 0usize;
+  let mut max_y = 0usize;
+  let mut has_foreground = false;
+
+  for row in 0..height {
+    let src_start = row.checked_mul(bytes_per_row)?;
+    let src_end = src_start.checked_add(width)?;
+    let src_row = src.get(src_start..src_end)?;
+    let dst_start = row.checked_mul(width)?;
+    let dst_end = dst_start.checked_add(width)?;
+    let dst_row = packed.get_mut(dst_start..dst_end)?;
+    dst_row.copy_from_slice(src_row);
+    for (col, value) in dst_row.iter().copied().enumerate() {
+      if value > 0 {
+        has_foreground = true;
+        min_x = min_x.min(col);
+        min_y = min_y.min(row);
+        max_x = max_x.max(col);
+        max_y = max_y.max(row);
+      }
+    }
+  }
+
+  if !has_foreground {
+    return None;
+  }
+  let bbox = normalized_bbox_from_pixel_bounds(min_x, min_y, max_x, max_y, width, height);
+  Some((bbox, packed))
 }
 
 /// Convert the foreground pixel bounds of a `CVPixelBuffer` mask into a
@@ -1672,6 +1769,7 @@ fn copy_instance_mask_buffer_locked(
 /// `CVPixelBuffer` rows are stored top-to-bottom in memory (row 0 is the
 /// top of the image), so the natural mapping `min_y / height` is already
 /// top-left and no y-flip is needed here.
+#[cfg(target_os = "macos")]
 fn normalized_bbox_from_pixel_bounds(
   min_x: usize,
   min_y: usize,
@@ -1687,9 +1785,86 @@ fn normalized_bbox_from_pixel_bounds(
   BoundingBox::new(x, y, w, h)
 }
 
+// ----- Non-macOS stub --------------------------------------------------------
+
+/// Non-macOS stub for [`VisionAnalyzer`]. Apple's Vision.framework is
+/// only available on macOS, so on every other target the analyzer
+/// always reports an [`ErrorCode::AppleVisionFailed`] platform error
+/// rather than producing detections. The README promises the crate
+/// compiles cleanly on non-macOS targets so downstream workspaces can
+/// keep `avanalyze` in their dep tree unconditionally; this stub is
+/// what makes that promise true.
+#[cfg(not(target_os = "macos"))]
+#[derive(Debug)]
+pub struct VisionAnalyzer {
+  // Keep the options around so a future native cross-platform
+  // engine can swap in here without breaking the public API.
+  #[allow(dead_code)]
+  opts: ServiceOptions,
+}
+
+#[cfg(not(target_os = "macos"))]
+impl VisionAnalyzer {
+  /// Construct a non-macOS stub analyzer. The configuration is
+  /// retained but unused — every `analyze_keyframe` call returns
+  /// [`ErrorCode::AppleVisionFailed`].
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn new(opts: ServiceOptions) -> Self {
+    Self { opts }
+  }
+
+  /// Non-macOS stub: Apple's Vision.framework is only available on
+  /// macOS, so this always returns
+  /// [`ErrorCode::AppleVisionFailed`] with an explanatory message.
+  /// `_jpeg_data` is ignored.
+  pub fn analyze_keyframe(
+    &self,
+    _scene_id: Id,
+    _keyframe_id: Id,
+    _jpeg_data: &[u8],
+  ) -> Result<Keyframe, ErrorInfo> {
+    Err(apple_vision_error(
+      ErrorCode::AppleVisionFailed,
+      "Apple Vision.framework is only available on macOS",
+    ))
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// Regression: `HumanAnalysis::with_body_poses_3d` previously dropped
+  /// its input on the floor. The wire `HumanAnalysis.body_poses_3d`
+  /// field has existed since the mediaschema mono-consolidation, so
+  /// the setter must persist the provided detections. Platform-
+  /// independent — the wire builder does not depend on Vision.
+  #[test]
+  fn body_poses_3d_survives_through_human_analysis() {
+    use mediaschema::{BodyPose3DDetection, HumanAnalysis};
+    let pose = BodyPose3DDetection::default();
+    let analysis = HumanAnalysis::new().with_body_poses_3d(vec![pose]);
+    assert_eq!(analysis.body_poses_3d.len(), 1);
+  }
+
+  /// Non-macOS `VisionAnalyzer` stub must report an Apple-Vision
+  /// platform error on every `analyze_keyframe` call.
+  #[cfg(not(target_os = "macos"))]
+  #[test]
+  fn non_macos_stub_reports_unavailable() {
+    use mediaschema::{Id, domain::ErrorCode};
+    let analyzer = VisionAnalyzer::new(ServiceOptions::new());
+    let err = analyzer
+      .analyze_keyframe(Id::default(), Id::default(), &[])
+      .expect_err("stub must return Err");
+    assert_eq!(err.code(), ErrorCode::AppleVisionFailed);
+  }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_tests {
+  use super::*;
+  use mediaschema::domain::aggregates::video::BoundingBox as DomainBoundingBox;
   use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 
   /// `vision_bbox_to_schema` must flip y. A Vision rect of
@@ -1699,42 +1874,131 @@ mod tests {
   #[test]
   fn vision_bbox_to_schema_flips_y() {
     let rect = CGRect::new(CGPoint::new(0.1, 0.2), CGSize::new(0.3, 0.4));
-    let bbox = vision_bbox_to_schema(rect);
+    let bbox = vision_bbox_to_schema(rect).expect("in-range rect must clamp to itself");
     assert!((bbox.x - 0.1).abs() < 1e-6, "x: {}", bbox.x);
     assert!((bbox.y - 0.4).abs() < 1e-6, "y: {}", bbox.y);
     assert!((bbox.width - 0.3).abs() < 1e-6, "w: {}", bbox.width);
     assert!((bbox.height - 0.4).abs() < 1e-6, "h: {}", bbox.height);
   }
 
-  /// `vision_bbox_to_schema` rejecting the y-flip (i.e. the old
-  /// behaviour of passing `origin.y` straight through) would still
-  /// yield a "valid"-looking rectangle but in the wrong half of the
-  /// image. Lock the flipped result against the domain's validating
+  /// Lock the flipped full-image result against the validating domain
   /// `BoundingBox::try_new` to ensure the components still satisfy the
   /// `[0, 1]` invariant after the flip.
   #[test]
   fn vision_bbox_to_schema_full_image_round_trip() {
     let rect = CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(1.0, 1.0));
-    let bbox = vision_bbox_to_schema(rect);
+    let bbox = vision_bbox_to_schema(rect).expect("unit rect must clamp to itself");
     assert_eq!(bbox.x, 0.0);
     assert_eq!(bbox.y, 0.0);
     assert_eq!(bbox.width, 1.0);
     assert_eq!(bbox.height, 1.0);
-    mediaschema::domain::aggregates::video::BoundingBox::try_new(
-      bbox.x,
-      bbox.y,
-      bbox.width,
-      bbox.height,
-    )
-    .expect("full-image bbox stays valid after flip");
+    DomainBoundingBox::try_new(bbox.x, bbox.y, bbox.width, bbox.height)
+      .expect("full-image bbox stays valid after flip");
   }
 
-  /// 2D points flip y; 3D coords (model-space metres) do not.
+  /// A Vision rect that spills off the right edge (`origin.x + width > 1`)
+  /// must be clamped to the unit square. Domain `BoundingBox::try_new`
+  /// would reject the un-clamped result, so without clamping a partially
+  /// off-screen detection would poison downstream conversion.
+  #[test]
+  fn vision_bbox_clamps_right_spill() {
+    // Vision rect: origin (0.8, 0.4), size (0.5, 0.2) — right edge at 1.3.
+    let rect = CGRect::new(CGPoint::new(0.8, 0.4), CGSize::new(0.5, 0.2));
+    let bbox = vision_bbox_to_schema(rect).expect("partial overlap must produce a bbox");
+    // Clamped right edge is 1.0 → width = 0.2 (1.0 - 0.8).
+    assert!((bbox.x - 0.8).abs() < 1e-6, "x: {}", bbox.x);
+    assert!((bbox.width - 0.2).abs() < 1e-6, "w: {}", bbox.width);
+    // y in schema space: 1.0 - (0.4 + 0.2) = 0.4 (in-range, no clamp).
+    assert!((bbox.y - 0.4).abs() < 1e-6, "y: {}", bbox.y);
+    assert!((bbox.height - 0.2).abs() < 1e-6, "h: {}", bbox.height);
+    DomainBoundingBox::try_new(bbox.x, bbox.y, bbox.width, bbox.height)
+      .expect("clamped bbox satisfies the [0,1] invariant");
+  }
+
+  /// A Vision rect that spills off the bottom (`origin.y < 0` in
+  /// Vision = `y + height > 1` in schema) must be clamped to the unit
+  /// square so the domain validator does not reject it.
+  #[test]
+  fn vision_bbox_clamps_bottom_spill() {
+    // Vision rect: origin (0.1, -0.1), size (0.3, 0.4) — Vision bottom edge
+    // at y = -0.1, top edge at y = 0.3.
+    // Schema: top = 1.0 - (−0.1 + 0.4) = 0.7, bottom = 1.0 - (−0.1) = 1.1.
+    let rect = CGRect::new(CGPoint::new(0.1, -0.1), CGSize::new(0.3, 0.4));
+    let bbox = vision_bbox_to_schema(rect).expect("partial overlap must produce a bbox");
+    // Bottom clamped to 1.0 → height = 1.0 - 0.7 = 0.3.
+    assert!((bbox.x - 0.1).abs() < 1e-6, "x: {}", bbox.x);
+    assert!((bbox.y - 0.7).abs() < 1e-6, "y: {}", bbox.y);
+    assert!((bbox.width - 0.3).abs() < 1e-6, "w: {}", bbox.width);
+    assert!((bbox.height - 0.3).abs() < 1e-6, "h: {}", bbox.height);
+    DomainBoundingBox::try_new(bbox.x, bbox.y, bbox.width, bbox.height)
+      .expect("clamped bbox satisfies the [0,1] invariant");
+  }
+
+  /// A Vision rect entirely outside the unit square must yield `None`
+  /// so the detection is skipped rather than producing a degenerate
+  /// wire bbox.
+  #[test]
+  fn vision_bbox_fully_offscreen_yields_none() {
+    let rect = CGRect::new(CGPoint::new(1.5, 0.5), CGSize::new(0.3, 0.4));
+    assert!(vision_bbox_to_schema(rect).is_none());
+  }
+
+  /// A Vision rect that intersects the unit square only at a single
+  /// edge must yield `None` (the intersection has zero width).
+  #[test]
+  fn vision_bbox_edge_only_yields_none() {
+    // Right edge at exactly x = 1.0, left edge at x = 1.0 — zero width.
+    let rect = CGRect::new(CGPoint::new(1.0, 0.5), CGSize::new(0.0, 0.4));
+    assert!(vision_bbox_to_schema(rect).is_none());
+  }
+
+  /// `NaN` from Vision (occasionally seen for off-image rects) must
+  /// not propagate — the helper sanitises non-finite components to
+  /// `0.0`. A `NaN` `origin.x` collapses left and right to 0.0, so the
+  /// rectangle has zero width after clamping and is reported as
+  /// `None` (the detection is dropped).
+  #[test]
+  fn vision_bbox_handles_nan_origin() {
+    let rect = CGRect::new(CGPoint::new(f64::NAN, 0.0), CGSize::new(0.3, 0.4));
+    assert!(vision_bbox_to_schema(rect).is_none());
+  }
+
+  /// `NaN` in a single size component still produces a usable
+  /// rectangle iff the surviving edges enclose a non-zero area. A
+  /// finite `origin.x`/`width` keeps the horizontal extent live; a
+  /// `NaN` `origin.y` collapses the vertical extent to zero and the
+  /// rectangle is dropped.
+  #[test]
+  fn vision_bbox_handles_nan_y_origin() {
+    let rect = CGRect::new(CGPoint::new(0.1, f64::NAN), CGSize::new(0.3, 0.4));
+    assert!(vision_bbox_to_schema(rect).is_none());
+  }
+
+  /// 2D points flip y AND clamp to `[0, 1]`. A Vision point that lands
+  /// outside `[0, 1]` after the flip is clamped to the unit edge so
+  /// downstream validation accepts it.
   #[test]
   fn vision_point_to_schema_flips_y_only() {
     let (x, y) = vision_point_to_schema(0.25, 0.75);
     assert!((x - 0.25).abs() < 1e-6);
     assert!((y - 0.25).abs() < 1e-6);
+  }
+
+  /// Out-of-range Vision points clamp to `[0, 1]`.
+  #[test]
+  fn vision_point_to_schema_clamps_out_of_range() {
+    let (x, y) = vision_point_to_schema(1.2, -0.3);
+    assert_eq!(x, 1.0);
+    // `y = 1.0 - (-0.3) = 1.3` → clamped to 1.0.
+    assert_eq!(y, 1.0);
+  }
+
+  /// Non-finite Vision points sanitise to `0.0`.
+  #[test]
+  fn vision_point_to_schema_sanitises_nan() {
+    let (x, y) = vision_point_to_schema(f64::NAN, 0.5);
+    assert_eq!(x, 0.0);
+    assert_eq!(y, 0.5);
   }
 
   /// `normalized_bbox_from_pixel_bounds` must NOT flip the y axis —
@@ -1753,14 +2017,72 @@ mod tests {
     assert!((bbox.height - 0.20).abs() < 1e-6);
   }
 
-  /// Regression: `HumanAnalysis::with_body_poses_3d` previously dropped
-  /// its input on the floor. The wire `HumanAnalysis.body_poses_3d` field
-  /// has existed since the mediaschema mono-consolidation, so the setter
-  /// must persist the provided detections.
+  /// An all-zero 8-bit mask must yield `None` so the caller skips the
+  /// detection. Previously the buffer returned `Some` with
+  /// `BoundingBox::default()` (a zero-extent box), which the domain
+  /// `BoundingBox::try_new` would later reject.
   #[test]
-  fn body_poses_3d_survives_through_human_analysis() {
-    let pose = BodyPose3DDetection::default();
-    let analysis = HumanAnalysis::new().with_body_poses_3d(vec![pose]);
-    assert_eq!(analysis.body_poses_3d.len(), 1);
+  fn empty_8bit_mask_yields_none() {
+    let src = vec![0u8; 4 * 4]; // 4×4 all-zero mask, tight stride.
+    assert!(process_mask_bytes_u8(4, 4, 4, &src).is_none());
+  }
+
+  /// An all-zero 32-bit-float mask must also yield `None`. Same
+  /// rationale as the 8-bit case.
+  #[test]
+  fn empty_32fp_mask_yields_none() {
+    let src = vec![0u8; 4 * 4 * 4]; // 4×4 all-zero f32 mask.
+    assert!(process_mask_bytes_f32(4, 4, 16, &src).is_none());
+  }
+
+  /// An 8-bit mask with one foreground pixel at row 1, col 2 of a
+  /// 4×4 buffer must round-trip the bbox and the packed bytes.
+  #[test]
+  fn single_pixel_8bit_mask_round_trip() {
+    let mut src = vec![0u8; 16];
+    // Row 1, column 2 — stride 4.
+    src[6] = 0xFF;
+    let (bbox, packed) = process_mask_bytes_u8(4, 4, 4, &src).expect("foreground produces Some");
+    assert!((bbox.x - 0.5).abs() < 1e-6, "x: {}", bbox.x);
+    assert!((bbox.y - 0.25).abs() < 1e-6, "y: {}", bbox.y);
+    assert!((bbox.width - 0.25).abs() < 1e-6, "w: {}", bbox.width);
+    assert!((bbox.height - 0.25).abs() < 1e-6, "h: {}", bbox.height);
+    // Packed bytes mirror the input (tight stride === input stride).
+    assert_eq!(packed, src);
+  }
+
+  /// A 32-fp mask with one foreground pixel must round-trip both the
+  /// bbox and the f32 little-endian payload.
+  #[test]
+  fn single_pixel_32fp_mask_round_trip() {
+    let mut src = vec![0u8; 4 * 4 * 4];
+    let value: f32 = 0.75;
+    let bytes = value.to_le_bytes();
+    // Row 1, column 2 — 4 bytes per pixel, 16 bytes per row.
+    let offset = 16 + 8;
+    src[offset..offset + 4].copy_from_slice(&bytes);
+    let (bbox, packed) = process_mask_bytes_f32(4, 4, 16, &src).expect("foreground produces Some");
+    assert!((bbox.x - 0.5).abs() < 1e-6, "x: {}", bbox.x);
+    assert!((bbox.y - 0.25).abs() < 1e-6, "y: {}", bbox.y);
+    assert_eq!(&packed[offset..offset + 4], &bytes);
+  }
+
+  /// A stride wider than `width * bytes_per_pixel` (the buffer has
+  /// per-row padding) must still produce the correct tightly-packed
+  /// output.
+  #[test]
+  fn padded_stride_8bit_mask_packs_correctly() {
+    // 3×2 mask, stride = 8 (5 bytes of right-padding per row).
+    let mut src = vec![0u8; 16];
+    src[0] = 1; // row 0, col 0.
+    src[10] = 1; // row 1, col 2 (offset 8 + 2).
+    let (bbox, packed) = process_mask_bytes_u8(3, 2, 8, &src).expect("foreground produces Some");
+    assert_eq!(packed.len(), 3 * 2);
+    assert_eq!(packed, [1, 0, 0, 0, 0, 1]);
+    // Foreground spans cols 0..=2 and rows 0..=1 — bbox is the whole mask.
+    assert!((bbox.x - 0.0).abs() < 1e-6);
+    assert!((bbox.y - 0.0).abs() < 1e-6);
+    assert!((bbox.width - 1.0).abs() < 1e-6);
+    assert!((bbox.height - 1.0).abs() < 1e-6);
   }
 }

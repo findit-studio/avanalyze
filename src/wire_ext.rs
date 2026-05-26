@@ -9,6 +9,14 @@
 //! All methods are `#[inline(always)]` and `#[must_use]`; the compiler should
 //! optimise them away. Nothing here adds new wire fields — these are pure
 //! syntactic adapters.
+//!
+//! `ErrorInfoExt` is the only entry point used from the non-macOS stub
+//! in `lib.rs`; every other trait in this file feeds the macOS Vision
+//! engine. `#![allow(dead_code, unused_imports)]` silences the
+//! warnings that would otherwise appear on non-macOS targets where
+//! those builders have no consumer.
+
+#![allow(dead_code, unused_imports)]
 
 use bytes::Bytes;
 use mediaschema::{
