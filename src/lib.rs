@@ -349,6 +349,27 @@ const MAX_TOTAL_ANIMAL_SUBJECTS_PER_FRAME: usize = 256;
 #[cfg(target_os = "macos")]
 const MAX_TOTAL_TEXT_DETECTIONS_PER_FRAME: usize = 256;
 
+/// Upper bound on the input image byte length accepted by
+/// [`VisionAnalyzer::analyze_keyframe`]. Pre-validates the keyframe
+/// payload BEFORE Foundation copies it into an `NSData`, so an
+/// oversized or hostile input cannot double the worker's peak
+/// memory and drive the allocator into the abort path. 64 MiB
+/// covers an extremely generous keyframe (Apple's typical
+/// keyframe encoded JPEG is well under 1 MiB); inputs above that
+/// surface as a structured `ErrorInfo` instead of an alloc-side
+/// crash (codex R17 F1).
+#[cfg(target_os = "macos")]
+const MAX_INPUT_IMAGE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Apple's documented maximum for
+/// `VNDetectHumanHandPoseRequest::setMaximumHandCount(_:)` at
+/// revision 1 — the request becomes invalid above this. The pinned
+/// request revision in this crate is revision 1; configurations
+/// requesting more must clamp at extractor build time to avoid an
+/// Objective-C exception crossing the FFI boundary (codex R17 F2).
+#[cfg(target_os = "macos")]
+const MAX_HAND_POSE_MAXIMUM_HAND_COUNT: usize = 6;
+
 /// Upper bound on the byte length of an FFI-sourced `NSString`
 /// before we refuse to convert it to a Rust `SmolStr` / `String`.
 /// Apple's Vision-emitted strings (OCR text, barcode payloads,
@@ -999,7 +1020,13 @@ impl VisionRequests {
       body_pose_3d.setRevision(VNDetectHumanBodyPose3DRequestRevision1);
 
       let hand_pose = VNDetectHumanHandPoseRequest::new();
-      hand_pose.setMaximumHandCount(opts.hand_pose().maximum_hand_count());
+      // Clamp the user-configured hand count to Apple's documented
+      // revision-1 maximum. Apple's request becomes invalid above 6
+      // and would surface as an Objective-C exception crossing the
+      // FFI boundary; clamp here so a stale/misconfigured option
+      // value still produces a usable Vision request (codex R17 F2).
+      let user_hand_count = opts.hand_pose().maximum_hand_count();
+      hand_pose.setMaximumHandCount(user_hand_count.min(MAX_HAND_POSE_MAXIMUM_HAND_COUNT));
       hand_pose.setRevision(VNDetectHumanHandPoseRequestRevision1);
 
       let animals = VNRecognizeAnimalsRequest::new();
@@ -1160,6 +1187,16 @@ impl VisionAnalyzer {
     keyframe_id: Id,
     jpeg_data: &[u8],
   ) -> Result<Keyframe, ErrorInfo> {
+    // Input-byte budget — refuse oversized payloads BEFORE
+    // Foundation copies them into an NSData and doubles peak
+    // memory. Surface as a structured error so the orchestrator
+    // can decide whether to retry, log, or escalate (codex R17 F1).
+    if jpeg_data.len() > MAX_INPUT_IMAGE_BYTES {
+      return Err(apple_vision_error(
+        ErrorCode::AppleVisionRequestFailed,
+        SmolStr::new_static("input image exceeds MAX_INPUT_IMAGE_BYTES"),
+      ));
+    }
     objc2::rc::autoreleasepool(|_| {
       let ns_data = NSData::with_bytes(jpeg_data);
       let handler = unsafe { VNSequenceRequestHandler::new() };
