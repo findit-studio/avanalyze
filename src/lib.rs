@@ -224,17 +224,32 @@ const MAX_FEATURE_PRINT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_LANDMARK_POINTS: usize = 1024;
 
 /// Upper bound on the number of detection results from a single
-/// Vision request before we refuse to pre-allocate capacity from
-/// the FFI-reported `results.len()`. Apple's per-frame extractor
+/// Vision request before we refuse to pre-allocate OR iterate the
+/// FFI-reported `results` array. Apple's per-frame extractor
 /// outputs cap out in the low hundreds at most (text recognition,
-/// face capture, etc.); 4096 is a generous defence-in-depth ceiling
-/// against a corrupted / adversarial `NSArray` length that would
-/// otherwise drive `Vec::with_capacity(results.len().min(MAX_VISION_RESULTS_PER_FRAME))` into the
-/// allocator's abort path. The extractor's own per-frame
-/// configured caps (`max_results`, `max_segments`, …) take effect
-/// inside the loop and bound the actual emitted count further.
+/// face capture, etc.); 4096 is a generous defence-in-depth
+/// ceiling against a corrupted / adversarial `NSArray` length that
+/// would otherwise drive either the initial `Vec::with_capacity`
+/// or the in-loop `Vec::push` reallocation into the allocator's
+/// abort path. Every `for x in results.iter()` is bounded with
+/// `.iter().take(MAX_VISION_RESULTS_PER_FRAME)` so the emitted
+/// count cannot exceed the cap, independently of whatever
+/// configured `max_results` / `max_segments` / … the call site
+/// uses inside the loop.
 #[cfg(target_os = "macos")]
 const MAX_VISION_RESULTS_PER_FRAME: usize = 4096;
+
+/// Upper bound on the number of joints / recognised points per
+/// pose observation before we refuse to materialise the joint
+/// dictionary via `NSDictionary::to_vecs()`. Apple's body-pose /
+/// hand-pose / animal-pose joint counts are fixed by the SDK
+/// (~17 body, ~21 hand, ~25 animal); 256 leaves headroom against
+/// future API expansion while still capping a corrupted /
+/// adversarial `points_by_joint.len()` that would otherwise drive
+/// `to_vecs()`'s internal allocations into the abort path before
+/// the per-extractor logic can drop the pose.
+#[cfg(target_os = "macos")]
+const MAX_POSE_JOINTS: usize = 256;
 
 /// Validate a byte-length payload pre-`from_raw_parts`. Two
 /// preconditions:
@@ -1039,7 +1054,7 @@ impl VisionAnalyzer {
     };
 
     let mut tags = Vec::with_capacity(results.len().min(opts.max_results()));
-    for obs in results.iter() {
+    for obs in results.iter().take(MAX_VISION_RESULTS_PER_FRAME) {
       let Some(confidence) =
         sanitize_confidence(unsafe { obs.confidence() }, opts.min_confidence())
       else {
@@ -1065,7 +1080,7 @@ impl VisionAnalyzer {
     let opts = self.opts.face_capture();
 
     let mut faces = Vec::with_capacity(results.len().min(MAX_VISION_RESULTS_PER_FRAME));
-    for obs in results.iter() {
+    for obs in results.iter().take(MAX_VISION_RESULTS_PER_FRAME) {
       let Some(confidence) =
         sanitize_confidence(unsafe { obs.confidence() }, opts.min_confidence())
       else {
@@ -1121,7 +1136,7 @@ impl VisionAnalyzer {
     let opts = self.opts.face_rectangles();
 
     let mut faces = Vec::with_capacity(results.len().min(MAX_VISION_RESULTS_PER_FRAME));
-    for obs in results.iter() {
+    for obs in results.iter().take(MAX_VISION_RESULTS_PER_FRAME) {
       let Some(confidence) =
         sanitize_confidence(unsafe { obs.confidence() }, opts.min_confidence())
       else {
@@ -1166,7 +1181,7 @@ impl VisionAnalyzer {
     let opts = self.opts.face_landmarks();
 
     let mut detections = Vec::with_capacity(results.len().min(MAX_VISION_RESULTS_PER_FRAME));
-    for obs in results.iter() {
+    for obs in results.iter().take(MAX_VISION_RESULTS_PER_FRAME) {
       let Some(landmarks) = (unsafe { obs.landmarks() }) else {
         continue;
       };
@@ -1206,7 +1221,7 @@ impl VisionAnalyzer {
     let opts = self.opts.human_subjects();
 
     let mut humans = Vec::with_capacity(results.len().min(MAX_VISION_RESULTS_PER_FRAME));
-    for obs in results.iter() {
+    for obs in results.iter().take(MAX_VISION_RESULTS_PER_FRAME) {
       let Some(confidence) =
         sanitize_confidence(unsafe { obs.confidence() }, opts.min_confidence())
       else {
@@ -1232,13 +1247,21 @@ impl VisionAnalyzer {
     };
 
     let mut body_poses = Vec::with_capacity(results.len().min(MAX_VISION_RESULTS_PER_FRAME));
-    for obs in results.iter() {
+    for obs in results.iter().take(MAX_VISION_RESULTS_PER_FRAME) {
       let Ok(points_by_joint) = (unsafe {
         obs.recognizedPointsForJointsGroupName_error(VNHumanBodyPoseObservationJointsGroupNameAll)
       }) else {
         continue;
       };
 
+      // Bound the dictionary materialisation: `to_vecs()` allocates
+      // two `Vec`s sized to `points_by_joint.len()`, which is FFI-
+      // reported. Drop the pose entirely if the joint count
+      // exceeds `MAX_POSE_JOINTS` rather than risking an allocator
+      // abort on a corrupted/adversarial Vision dictionary.
+      if points_by_joint.len() > MAX_POSE_JOINTS {
+        continue;
+      }
       let (joint_names, points) = points_by_joint.to_vecs();
       let mut joints = Vec::with_capacity(points.len());
       let mut min_x = f32::INFINITY;
@@ -1311,13 +1334,21 @@ impl VisionAnalyzer {
       };
 
       let mut body_poses = Vec::with_capacity(results.len().min(MAX_VISION_RESULTS_PER_FRAME));
-      for obs in results.iter() {
+      for obs in results.iter().take(MAX_VISION_RESULTS_PER_FRAME) {
         let Ok(points_by_joint) =
           (unsafe { obs.recognizedPointsForJointsGroupName_error(group_name) })
         else {
           continue;
         };
 
+        // Bound the dictionary materialisation: `to_vecs()` allocates
+        // two `Vec`s sized to `points_by_joint.len()`, which is FFI-
+        // reported. Drop the pose entirely if the joint count
+        // exceeds `MAX_POSE_JOINTS` rather than risking an allocator
+        // abort on a corrupted/adversarial Vision dictionary.
+        if points_by_joint.len() > MAX_POSE_JOINTS {
+          continue;
+        }
         let (joint_names, points) = points_by_joint.to_vecs();
         let mut joints = Vec::with_capacity(points.len());
 
@@ -1380,13 +1411,21 @@ impl VisionAnalyzer {
     };
 
     let mut hand_poses = Vec::with_capacity(results.len().min(MAX_VISION_RESULTS_PER_FRAME));
-    for obs in results.iter() {
+    for obs in results.iter().take(MAX_VISION_RESULTS_PER_FRAME) {
       let Ok(points_by_joint) = (unsafe {
         obs.recognizedPointsForJointsGroupName_error(VNHumanHandPoseObservationJointsGroupNameAll)
       }) else {
         continue;
       };
 
+      // Bound the dictionary materialisation: `to_vecs()` allocates
+      // two `Vec`s sized to `points_by_joint.len()`, which is FFI-
+      // reported. Drop the pose entirely if the joint count
+      // exceeds `MAX_POSE_JOINTS` rather than risking an allocator
+      // abort on a corrupted/adversarial Vision dictionary.
+      if points_by_joint.len() > MAX_POSE_JOINTS {
+        continue;
+      }
       let (joint_names, points) = points_by_joint.to_vecs();
       let mut joints = Vec::with_capacity(points.len());
       let mut min_x = f32::INFINITY;
@@ -1453,7 +1492,7 @@ impl VisionAnalyzer {
     let opts = self.opts.person_instance_masks();
 
     let mut masks = Vec::new();
-    for observation in results.iter() {
+    for observation in results.iter().take(MAX_VISION_RESULTS_PER_FRAME) {
       let Some(confidence) =
         sanitize_confidence(unsafe { observation.confidence() }, opts.min_confidence())
       else {
@@ -1512,7 +1551,7 @@ impl VisionAnalyzer {
     let opts = self.opts.person_segmentation_masks();
 
     let mut masks = Vec::with_capacity(results.len().min(MAX_VISION_RESULTS_PER_FRAME));
-    for observation in results.iter() {
+    for observation in results.iter().take(MAX_VISION_RESULTS_PER_FRAME) {
       let Some(confidence) =
         sanitize_confidence(unsafe { observation.confidence() }, opts.min_confidence())
       else {
@@ -1539,7 +1578,7 @@ impl VisionAnalyzer {
       };
 
       let mut animals = Vec::new();
-      for obs in results.iter() {
+      for obs in results.iter().take(MAX_VISION_RESULTS_PER_FRAME) {
         let labels = obs.labels();
         for label in labels.iter() {
           let Some(confidence) =
@@ -1569,13 +1608,21 @@ impl VisionAnalyzer {
     };
 
     let mut body_poses = Vec::with_capacity(results.len().min(MAX_VISION_RESULTS_PER_FRAME));
-    for obs in results.iter() {
+    for obs in results.iter().take(MAX_VISION_RESULTS_PER_FRAME) {
       let Ok(points_by_joint) =
         (unsafe { obs.recognizedPointsForJointsGroupName_error(group_name) })
       else {
         continue;
       };
 
+      // Bound the dictionary materialisation: `to_vecs()` allocates
+      // two `Vec`s sized to `points_by_joint.len()`, which is FFI-
+      // reported. Drop the pose entirely if the joint count
+      // exceeds `MAX_POSE_JOINTS` rather than risking an allocator
+      // abort on a corrupted/adversarial Vision dictionary.
+      if points_by_joint.len() > MAX_POSE_JOINTS {
+        continue;
+      }
       let (joint_names, points) = points_by_joint.to_vecs();
       let mut joints = Vec::with_capacity(points.len());
       let mut min_x = f32::INFINITY;
@@ -1636,7 +1683,7 @@ impl VisionAnalyzer {
     };
 
     let mut text_detections = Vec::with_capacity(results.len().min(MAX_VISION_RESULTS_PER_FRAME));
-    for obs in results.iter() {
+    for obs in results.iter().take(MAX_VISION_RESULTS_PER_FRAME) {
       let candidates = obs.topCandidates(self.opts.text().max_candidates_per_observation());
       for candidate in candidates.iter() {
         let text = candidate.string().to_smolstr();
@@ -1661,7 +1708,7 @@ impl VisionAnalyzer {
     let opts = self.opts.barcodes();
 
     let mut barcodes = Vec::with_capacity(results.len().min(MAX_VISION_RESULTS_PER_FRAME));
-    for obs in results.iter() {
+    for obs in results.iter().take(MAX_VISION_RESULTS_PER_FRAME) {
       let Some(confidence) =
         sanitize_confidence(unsafe { obs.confidence() }, opts.min_confidence())
       else {
@@ -1705,7 +1752,7 @@ impl VisionAnalyzer {
     };
 
     let mut regions = Vec::new();
-    for observation in observations.iter() {
+    for observation in observations.iter().take(MAX_VISION_RESULTS_PER_FRAME) {
       let Some(objects) = (unsafe { observation.salientObjects() }) else {
         continue;
       };
@@ -1756,7 +1803,7 @@ impl VisionAnalyzer {
     let opts = self.opts.document_segments();
 
     let mut segments = Vec::with_capacity(results.len().min(MAX_VISION_RESULTS_PER_FRAME));
-    for observation in results.iter() {
+    for observation in results.iter().take(MAX_VISION_RESULTS_PER_FRAME) {
       if segments.len() >= opts.max_segments() {
         break;
       }
