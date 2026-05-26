@@ -284,6 +284,27 @@ const MAX_TOTAL_MASKS_PER_FRAME: usize = 256;
 #[cfg(target_os = "macos")]
 const MAX_TOTAL_MASK_BYTES_PER_FRAME: usize = 256 * 1024 * 1024;
 
+/// Hard ceiling on the cumulative face-landmark points emitted per
+/// frame across all detections × all 13 named regions × all points.
+/// Apple's typical output is at most a few faces × ~76 points each,
+/// so 16384 is generous defence-in-depth against the worst-case
+/// nested-emission product (4096 × 13 × MAX_LANDMARK_POINTS).
+#[cfg(target_os = "macos")]
+const MAX_FACE_LANDMARK_POINTS_PER_FRAME: usize = 16384;
+
+/// Hard ceiling on the total animal-subject rows emitted per frame.
+/// Apple's animal recogniser returns a few species per frame at most;
+/// 256 caps the adversarial 4096 × MAX_NESTED_LABELS_PER_OBSERVATION
+/// product without restricting real workloads.
+#[cfg(target_os = "macos")]
+const MAX_TOTAL_ANIMAL_SUBJECTS_PER_FRAME: usize = 256;
+
+/// Hard ceiling on the total text detections emitted per frame.
+/// 256 caps the adversarial 4096 × MAX_TEXT_CANDIDATES_PER_OBSERVATION
+/// product without restricting real text-rich-document workloads.
+#[cfg(target_os = "macos")]
+const MAX_TOTAL_TEXT_DETECTIONS_PER_FRAME: usize = 256;
+
 /// Upper bound on the byte length of an FFI-sourced `NSString`
 /// before we refuse to convert it to a Rust `SmolStr` / `String`.
 /// Apple's Vision-emitted strings (OCR text, barcode payloads,
@@ -1276,7 +1297,18 @@ impl VisionAnalyzer {
     let opts = self.opts.face_landmarks();
 
     let mut detections = Vec::with_capacity(results.len().min(MAX_VISION_RESULTS_PER_FRAME));
+    // Per-frame cumulative point budget — bounds the
+    // detection × region × point product against the worst-case
+    // (4096 × 13 × MAX_LANDMARK_POINTS) explosion codex R13
+    // surfaced. Threaded into `extract_face_landmark_regions`
+    // (and through to `push_face_landmark_region`); the helper
+    // stops appending points once the remaining budget is
+    // exhausted.
+    let mut total_points_remaining: usize = MAX_FACE_LANDMARK_POINTS_PER_FRAME;
     for obs in results.iter().take(MAX_VISION_RESULTS_PER_FRAME) {
+      if total_points_remaining == 0 {
+        break;
+      }
       let Some(landmarks) = (unsafe { obs.landmarks() }) else {
         continue;
       };
@@ -1295,7 +1327,8 @@ impl VisionAnalyzer {
       //   faceBBox.y + p.y * faceBBox.height)`.
       let face_rect_vision = unsafe { obs.boundingBox() }.standardize();
 
-      let regions = extract_face_landmark_regions(&landmarks, face_rect_vision);
+      let regions =
+        extract_face_landmark_regions(&landmarks, face_rect_vision, &mut total_points_remaining);
       if regions.len() < opts.min_region_count() {
         continue;
       }
@@ -1637,7 +1670,13 @@ impl VisionAnalyzer {
           continue;
         };
 
-        let Some((bbox, dimensions, data)) = copy_instance_mask_buffer(&mask_buffer) else {
+        // Pre-allocation budget check: pass the remaining cumulative
+        // budget into the copier so it rejects the mask BEFORE
+        // allocating if the packed size would overshoot.
+        let remaining_budget = MAX_TOTAL_MASK_BYTES_PER_FRAME.saturating_sub(total_mask_bytes);
+        let Some((bbox, dimensions, data)) =
+          copy_instance_mask_buffer(&mask_buffer, remaining_budget)
+        else {
           instance_index = instances.indexGreaterThanIndex(instance_index);
           continue;
         };
@@ -1692,7 +1731,12 @@ impl VisionAnalyzer {
       };
 
       let pixel_buffer = unsafe { observation.pixelBuffer() };
-      let Some((bbox, dimensions, data)) = copy_instance_mask_buffer(&pixel_buffer) else {
+      // Pre-allocation budget check: refuse the mask before alloc
+      // if it would overshoot the per-frame cumulative budget.
+      let remaining_budget = MAX_TOTAL_MASK_BYTES_PER_FRAME.saturating_sub(total_mask_bytes);
+      let Some((bbox, dimensions, data)) =
+        copy_instance_mask_buffer(&pixel_buffer, remaining_budget)
+      else {
         continue;
       };
 
@@ -1711,13 +1755,20 @@ impl VisionAnalyzer {
         return Vec::new();
       };
 
-      let mut animals = Vec::new();
-      for obs in results.iter().take(MAX_VISION_RESULTS_PER_FRAME) {
+      let mut animals = Vec::with_capacity(MAX_TOTAL_ANIMAL_SUBJECTS_PER_FRAME);
+      'outer: for obs in results.iter().take(MAX_VISION_RESULTS_PER_FRAME) {
+        if animals.len() >= MAX_TOTAL_ANIMAL_SUBJECTS_PER_FRAME {
+          break;
+        }
         let labels = obs.labels();
-        // Animal-labels has no user-configured cap, so the hard
-        // ceiling alone bounds emission. Apple's request returns
-        // 1-3 species labels per observation in practice.
+        // Per-frame total cap: animal subjects can't multiply across
+        // outer × inner past the hard ceiling. The inner per-obs
+        // take cap remains so a single hostile observation can't
+        // exhaust the budget on its own either.
         for label in labels.iter().take(MAX_NESTED_LABELS_PER_OBSERVATION) {
+          if animals.len() >= MAX_TOTAL_ANIMAL_SUBJECTS_PER_FRAME {
+            break 'outer;
+          }
           let Some(confidence) =
             sanitize_confidence(label.confidence(), self.opts.animals().min_confidence())
           else {
@@ -1824,8 +1875,13 @@ impl VisionAnalyzer {
       return Vec::new();
     };
 
-    let mut text_detections = Vec::with_capacity(results.len().min(MAX_VISION_RESULTS_PER_FRAME));
-    for obs in results.iter().take(MAX_VISION_RESULTS_PER_FRAME) {
+    // Per-frame total cap on emitted text detections — bounds the
+    // outer × inner candidate product that codex R13 surfaced.
+    let mut text_detections = Vec::with_capacity(MAX_TOTAL_TEXT_DETECTIONS_PER_FRAME);
+    'outer: for obs in results.iter().take(MAX_VISION_RESULTS_PER_FRAME) {
+      if text_detections.len() >= MAX_TOTAL_TEXT_DETECTIONS_PER_FRAME {
+        break;
+      }
       // Bound the requested candidate count to the hard per-observation cap
       // — Apple's topCandidates allocates an NSArray sized to the argument.
       let candidate_cap = self
@@ -1835,6 +1891,9 @@ impl VisionAnalyzer {
         .min(MAX_TEXT_CANDIDATES_PER_OBSERVATION);
       let candidates = obs.topCandidates(candidate_cap);
       for candidate in candidates.iter().take(candidate_cap) {
+        if text_detections.len() >= MAX_TOTAL_TEXT_DETECTIONS_PER_FRAME {
+          break 'outer;
+        }
         // Bound the candidate string at MAX_FFI_STRING_BYTES before
         // routing through `to_smolstr` so a corrupted/adversarial
         // NSString length cannot drive the allocator into the abort
@@ -2155,86 +2214,35 @@ fn map_hand_chirality(chirality: VNChirality) -> HandChirality {
 fn extract_face_landmark_regions(
   landmarks: &VNFaceLandmarks2D,
   face_bbox_vision: CGRect,
+  total_points_remaining: &mut usize,
 ) -> Vec<FaceLandmarkRegion> {
   let mut regions = Vec::new();
-  push_face_landmark_region(
-    &mut regions,
-    "allPoints",
-    unsafe { landmarks.allPoints() },
-    face_bbox_vision,
-  );
-  push_face_landmark_region(
-    &mut regions,
-    "faceContour",
-    unsafe { landmarks.faceContour() },
-    face_bbox_vision,
-  );
-  push_face_landmark_region(
-    &mut regions,
-    "leftEye",
-    unsafe { landmarks.leftEye() },
-    face_bbox_vision,
-  );
-  push_face_landmark_region(
-    &mut regions,
-    "rightEye",
-    unsafe { landmarks.rightEye() },
-    face_bbox_vision,
-  );
-  push_face_landmark_region(
-    &mut regions,
-    "leftEyebrow",
-    unsafe { landmarks.leftEyebrow() },
-    face_bbox_vision,
-  );
-  push_face_landmark_region(
-    &mut regions,
-    "rightEyebrow",
-    unsafe { landmarks.rightEyebrow() },
-    face_bbox_vision,
-  );
-  push_face_landmark_region(
-    &mut regions,
-    "nose",
-    unsafe { landmarks.nose() },
-    face_bbox_vision,
-  );
-  push_face_landmark_region(
-    &mut regions,
-    "noseCrest",
-    unsafe { landmarks.noseCrest() },
-    face_bbox_vision,
-  );
-  push_face_landmark_region(
-    &mut regions,
-    "medianLine",
-    unsafe { landmarks.medianLine() },
-    face_bbox_vision,
-  );
-  push_face_landmark_region(
-    &mut regions,
-    "outerLips",
-    unsafe { landmarks.outerLips() },
-    face_bbox_vision,
-  );
-  push_face_landmark_region(
-    &mut regions,
-    "innerLips",
-    unsafe { landmarks.innerLips() },
-    face_bbox_vision,
-  );
-  push_face_landmark_region(
-    &mut regions,
-    "leftPupil",
-    unsafe { landmarks.leftPupil() },
-    face_bbox_vision,
-  );
-  push_face_landmark_region(
-    &mut regions,
-    "rightPupil",
-    unsafe { landmarks.rightPupil() },
-    face_bbox_vision,
-  );
+  for (name, region) in [
+    ("allPoints", unsafe { landmarks.allPoints() }),
+    ("faceContour", unsafe { landmarks.faceContour() }),
+    ("leftEye", unsafe { landmarks.leftEye() }),
+    ("rightEye", unsafe { landmarks.rightEye() }),
+    ("leftEyebrow", unsafe { landmarks.leftEyebrow() }),
+    ("rightEyebrow", unsafe { landmarks.rightEyebrow() }),
+    ("nose", unsafe { landmarks.nose() }),
+    ("noseCrest", unsafe { landmarks.noseCrest() }),
+    ("medianLine", unsafe { landmarks.medianLine() }),
+    ("outerLips", unsafe { landmarks.outerLips() }),
+    ("innerLips", unsafe { landmarks.innerLips() }),
+    ("leftPupil", unsafe { landmarks.leftPupil() }),
+    ("rightPupil", unsafe { landmarks.rightPupil() }),
+  ] {
+    if *total_points_remaining == 0 {
+      break;
+    }
+    push_face_landmark_region(
+      &mut regions,
+      name,
+      region,
+      face_bbox_vision,
+      total_points_remaining,
+    );
+  }
   regions
 }
 
@@ -2244,7 +2252,11 @@ fn push_face_landmark_region(
   name: &'static str,
   region: Option<Retained<VNFaceLandmarkRegion2D>>,
   face_bbox_vision: CGRect,
+  total_points_remaining: &mut usize,
 ) {
+  if *total_points_remaining == 0 {
+    return;
+  }
   let Some(region) = region else {
     return;
   };
@@ -2268,27 +2280,36 @@ fn push_face_landmark_region(
     return;
   }
 
+  // Bound this region's slice to the per-frame remaining budget.
+  // The local raw-slice cap (MAX_LANDMARK_POINTS) bounds the slice
+  // length to satisfy from_raw_parts; the budget cap bounds the
+  // per-frame emission. Each point we successfully emit decrements
+  // the shared remaining counter; the next region (or next face)
+  // sees the reduced budget.
+  let region_cap = point_count.min(*total_points_remaining);
   let points = unsafe { std::slice::from_raw_parts(points_ptr, point_count) };
-  let points = points
-    .iter()
-    .filter_map(|point| {
-      // Apple's convention: landmark points are normalized within the
-      // face's normalized bbox (NOT the image). Project to image-
-      // normalized Vision coordinates first, THEN route through
-      // `vision_point_to_schema` for the top-left flip + clamp +
-      // finite check. A non-finite raw or projected component drops
-      // only the offending point; partial-point regions are still
-      // meaningful.
-      let projected = project_landmark_to_image(*point, face_bbox_vision);
-      let (x, y) = vision_point_to_schema(projected.x, projected.y)?;
-      Some(FaceLandmarkPoint::new(x, y))
-    })
-    .collect::<Vec<_>>();
-  if points.is_empty() {
+  let mut emitted_points: Vec<FaceLandmarkPoint> = Vec::with_capacity(region_cap);
+  for point in points.iter().take(region_cap) {
+    // Apple's convention: landmark points are normalized within the
+    // face's normalized bbox (NOT the image). Project to image-
+    // normalized Vision coordinates first, THEN route through
+    // `vision_point_to_schema` for the top-left flip + clamp +
+    // finite check. A non-finite raw or projected component drops
+    // only the offending point; partial-point regions are still
+    // meaningful.
+    let projected = project_landmark_to_image(*point, face_bbox_vision);
+    if let Some((x, y)) = vision_point_to_schema(projected.x, projected.y) {
+      emitted_points.push(FaceLandmarkPoint::new(x, y));
+    }
+  }
+  if emitted_points.is_empty() {
     return;
   }
+  // Decrement the shared budget by the number of points actually
+  // emitted (finite-rejected points don't consume budget).
+  *total_points_remaining = total_points_remaining.saturating_sub(emitted_points.len());
 
-  regions.push(FaceLandmarkRegion::new(name, points));
+  regions.push(FaceLandmarkRegion::new(name, emitted_points));
 }
 
 #[cfg(target_os = "macos")]
@@ -2326,9 +2347,10 @@ fn map_body_pose_3d_height_estimation(
 #[cfg(target_os = "macos")]
 fn copy_instance_mask_buffer(
   pixel_buffer: &CVPixelBuffer,
+  remaining_byte_budget: usize,
 ) -> Option<(BoundingBox, Dimensions, Bytes)> {
   let guard = CVPixelBufferLockGuard::lock(pixel_buffer, CVPixelBufferLockFlags::ReadOnly)?;
-  copy_instance_mask_buffer_locked(guard.buffer())
+  copy_instance_mask_buffer_locked(guard.buffer(), remaining_byte_budget)
 }
 
 /// Internal worker that runs the locked copy and assembles the wire
@@ -2349,10 +2371,20 @@ fn copy_instance_mask_buffer(
 #[allow(non_upper_case_globals)]
 fn copy_instance_mask_buffer_locked(
   pixel_buffer: &CVPixelBuffer,
+  remaining_byte_budget: usize,
 ) -> Option<(BoundingBox, Dimensions, Bytes)> {
   let width = CVPixelBufferGetWidth(pixel_buffer);
   let height = CVPixelBufferGetHeight(pixel_buffer);
   if width == 0 || height == 0 {
+    return None;
+  }
+  // Pre-allocation budget check: refuse to allocate this mask if
+  // its packed size (`width * height` bytes) would exceed the
+  // caller's remaining per-frame budget. This prevents the peak
+  // memory from briefly exceeding the per-frame cap by one full
+  // mask payload — codex R13 finding F2.
+  let output_payload = width.checked_mul(height)?;
+  if output_payload > remaining_byte_budget {
     return None;
   }
 
