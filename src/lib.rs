@@ -224,6 +224,77 @@ fn try_alloc_packed_mask(packed_len: usize) -> Option<Vec<u8>> {
   Some(packed)
 }
 
+/// Sanitise a raw face captureQuality reading from Vision.
+///
+/// Distinguishes three states explicitly:
+/// - `Some(finite)` — Vision provided a real measurement; pass it
+///   through.
+/// - `Some(0.0)` — Vision did NOT provide a value (the underlying
+///   `NSNumber?` was `None`). Map to `0.0` so the caller's threshold
+///   comparison fails closed for any positive minimum.
+/// - `None` — Vision provided a non-finite value (`NaN` / `±Inf`).
+///   Caller MUST drop the detection: a non-finite reading is not a
+///   real measurement, and substituting `0.0` would silently admit
+///   the detection through any `min_capture_quality = 0.0`
+///   configuration.
+#[cfg(target_os = "macos")]
+#[inline]
+fn sanitize_capture_quality(raw: Option<f32>) -> Option<f32> {
+  match raw {
+    Some(v) => finite_f32(v),
+    None => Some(0.0),
+  }
+}
+
+/// Sanitise a raw 3-D body-pose height + height-estimation pair.
+///
+/// Vision's `bodyHeight()` is metres in model space. When the
+/// reading is non-finite, both `body_height` AND `height_estimation`
+/// must be neutralised together — substituting `0.0` for the height
+/// while preserving a `Measured` or `Reference` enum would tell
+/// consumers there is a known 0-metre subject. The pair
+/// `(0.0, UNKNOWN)` is the truthful encoding of "no estimate
+/// available" and the only consistent fallback.
+#[cfg(target_os = "macos")]
+#[inline]
+fn sanitize_body_height_pair(
+  raw_height: f32,
+  measured_or_reference: BodyPose3DHeightEstimation,
+) -> (f32, BodyPose3DHeightEstimation) {
+  match finite_f32(raw_height) {
+    Some(finite) => (finite, measured_or_reference),
+    None => (0.0, BODY_POSE_3D_HEIGHT_ESTIMATION_UNKNOWN),
+  }
+}
+
+/// Validate mask dimensions BEFORE constructing the raw-parts slice
+/// over a `CVPixelBuffer`'s base address. Two preconditions are
+/// checked here so the unsafe `std::slice::from_raw_parts` call
+/// downstream is sound even against a corrupted or adversarial
+/// `CVPixelBuffer`:
+///
+/// 1. `width * height` (the output payload size after packing to
+///    `OneComponent8`) must not exceed [`MAX_MASK_BYTES`].
+/// 2. `total_src_len = bytes_per_row * height` (the raw slice
+///    length) must fit in `isize::MAX`, which is the
+///    [`std::slice::from_raw_parts`] contract.
+///
+/// Returns `None` on either violation; the caller propagates the
+/// `None` so the mask detection is dropped rather than triggering
+/// UB.
+#[cfg(target_os = "macos")]
+#[inline]
+fn validate_mask_dims_for_slice(width: usize, height: usize, total_src_len: usize) -> Option<()> {
+  let output_payload = width.checked_mul(height)?;
+  if output_payload > MAX_MASK_BYTES {
+    return None;
+  }
+  if total_src_len > isize::MAX as usize {
+    return None;
+  }
+  Some(())
+}
+
 /// Project a face-bbox-relative landmark point into the image's
 /// normalized coordinate space (Vision lower-left) using Apple's
 /// documented convention: landmark points are normalized within the
@@ -931,13 +1002,13 @@ impl VisionAnalyzer {
       else {
         continue;
       };
-      let capture_quality = unsafe { obs.faceCaptureQuality() }
-        .map(|q| q.floatValue())
-        .and_then(finite_f32)
-        .unwrap_or(0.0);
-      // NaN was previously fail-open here: `NaN < threshold` is false, so any
-      // non-finite quality slipped past the gate. `finite_f32` collapses it to
-      // 0.0 above, which now fails closed against any non-zero threshold.
+      // See `sanitize_capture_quality` for the three-state policy
+      // (absent → 0.0, finite → pass-through, non-finite → drop).
+      let Some(capture_quality) =
+        sanitize_capture_quality(unsafe { obs.faceCaptureQuality() }.map(|q| q.floatValue()))
+      else {
+        continue;
+      };
       if capture_quality < opts.min_capture_quality() {
         continue;
       }
@@ -1209,17 +1280,18 @@ impl VisionAnalyzer {
         };
 
         joints.sort_by(|lhs, rhs| lhs.name().cmp(rhs.name()));
-        // Vision `bodyHeight()` is metres in model space. Non-finite
-        // (NaN/Inf) would otherwise enter the wire and trip downstream
-        // schema/storage validation. Substitute 0.0 — the wire schema
-        // treats 0.0 as "no estimate"; the accompanying
-        // `heightEstimation` enum already carries the
-        // measured/reference/unknown signal.
-        let body_height = finite_f32(unsafe { obs.bodyHeight() }).unwrap_or(0.0);
+        // See `sanitize_body_height_pair` — couples the
+        // body_height substitution with the height_estimation enum
+        // so `(0.0, UNKNOWN)` is the only fallback for non-finite
+        // readings.
+        let mapped_estimation =
+          map_body_pose_3d_height_estimation(unsafe { obs.heightEstimation() });
+        let (body_height, height_estimation) =
+          sanitize_body_height_pair(unsafe { obs.bodyHeight() }, mapped_estimation);
         body_poses.push(BodyPose3DDetection::new(
           pose_confidence,
           body_height,
-          map_body_pose_3d_height_estimation(unsafe { obs.heightEstimation() }),
+          height_estimation,
           joints,
         ));
       }
@@ -1986,11 +2058,22 @@ fn copy_instance_mask_buffer_locked(
   }
   let total_src_len = bytes_per_row.checked_mul(height)?;
 
+  // Pre-validate the two mask preconditions that `from_raw_parts`
+  // requires (`total_src_len <= isize::MAX`) and that the bounded
+  // allocator requires (`width * height <= MAX_MASK_BYTES`).
+  // Centralised in `validate_mask_dims_for_slice` so a corrupted or
+  // adversarial `CVPixelBuffer` cannot reach the unsafe slice with
+  // values that would either trigger UB or drive the worker into
+  // the allocator's abort path.
+  validate_mask_dims_for_slice(width, height, total_src_len)?;
+
   // SAFETY: `base_address` points at a buffer of at least
   // `bytes_per_row * height` bytes (Core Video contract); the buffer
-  // is locked by the surrounding `CVPixelBufferLockGuard`. We bound
-  // the slice length explicitly so all downstream indexing happens
-  // against a Rust-managed slice with the usual bounds checks.
+  // is locked by the surrounding `CVPixelBufferLockGuard`. The
+  // pre-validation above satisfies the `from_raw_parts` contract
+  // (`total_src_len <= isize::MAX`) regardless of what Core Video
+  // reports for the dimensions; the downstream bounded allocator
+  // re-checks `width * height` against `MAX_MASK_BYTES`.
   let src = unsafe { std::slice::from_raw_parts(base_address, total_src_len) };
 
   // The wire `Dimensions` stores `u32`. A mask whose width or height
@@ -2746,5 +2829,103 @@ mod macos_tests {
     let face = CGRect::new(CGPoint::new(0.2, 0.3), CGSize::new(0.4, 0.2));
     let projected = project_landmark_to_image(CGPoint::new(f64::NAN, 0.5), face);
     assert!(vision_point_to_schema(projected.x, projected.y).is_none());
+  }
+
+  // ──────────────── R7 fixes (codex round 7) ────────────────
+
+  /// `sanitize_capture_quality` distinguishes absent from corrupt:
+  /// `None` (Vision did not provide a value) collapses to `Some(0.0)`
+  /// — fail-closed against any positive threshold; `Some(non_finite)`
+  /// collapses to `None` so the caller drops the detection
+  /// unconditionally (any `min_capture_quality = 0.0` configuration
+  /// would otherwise admit a non-finite reading as a 0.0-quality
+  /// face).
+  #[test]
+  fn sanitize_capture_quality_absent_maps_to_zero() {
+    assert_eq!(sanitize_capture_quality(None), Some(0.0));
+  }
+
+  #[test]
+  fn sanitize_capture_quality_finite_passes_through() {
+    assert_eq!(sanitize_capture_quality(Some(0.75)), Some(0.75));
+    assert_eq!(sanitize_capture_quality(Some(0.0)), Some(0.0));
+    assert_eq!(sanitize_capture_quality(Some(1.0)), Some(1.0));
+  }
+
+  /// THE key regression: a non-finite captureQuality must NOT be
+  /// substituted with a real value. The previous R6 code returned
+  /// `unwrap_or(0.0)` which passed any `min_capture_quality = 0.0`
+  /// configuration and admitted the detection. `sanitize_capture_quality`
+  /// returns `None` so the caller's `let Some(_) = ... else { continue }`
+  /// drops the detection regardless of the configured threshold.
+  #[test]
+  fn sanitize_capture_quality_non_finite_returns_none() {
+    assert_eq!(sanitize_capture_quality(Some(f32::NAN)), None);
+    assert_eq!(sanitize_capture_quality(Some(f32::INFINITY)), None);
+    assert_eq!(sanitize_capture_quality(Some(f32::NEG_INFINITY)), None);
+  }
+
+  /// A finite body_height pairs with whatever height_estimation enum
+  /// Vision reported. The pair is forwarded unchanged.
+  #[test]
+  fn sanitize_body_height_pair_finite_preserves_estimation() {
+    let measured = BODY_POSE_3D_HEIGHT_ESTIMATION_MEASURED;
+    let (h, e) = sanitize_body_height_pair(1.75, measured);
+    assert!((h - 1.75).abs() < 1e-6);
+    assert_eq!(e, measured);
+
+    let reference = BODY_POSE_3D_HEIGHT_ESTIMATION_REFERENCE;
+    let (h, e) = sanitize_body_height_pair(0.42, reference);
+    assert!((h - 0.42).abs() < 1e-6);
+    assert_eq!(e, reference);
+  }
+
+  /// THE key regression: when body_height is non-finite, the
+  /// estimation enum MUST be forced to UNKNOWN. Preserving
+  /// MEASURED/REFERENCE while substituting 0.0 would tell consumers
+  /// there is a known 0-metre subject — a worse semantic than
+  /// "unknown estimate".
+  #[test]
+  fn sanitize_body_height_pair_non_finite_forces_unknown() {
+    for raw in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+      // Even with a Measured input the result must be UNKNOWN.
+      let (h, e) = sanitize_body_height_pair(raw, BODY_POSE_3D_HEIGHT_ESTIMATION_MEASURED);
+      assert_eq!(h, 0.0, "non-finite must collapse to 0.0 (raw = {raw:?})");
+      assert_eq!(
+        e, BODY_POSE_3D_HEIGHT_ESTIMATION_UNKNOWN,
+        "non-finite must force UNKNOWN (raw = {raw:?})",
+      );
+      // Same for Reference.
+      let (h, e) = sanitize_body_height_pair(raw, BODY_POSE_3D_HEIGHT_ESTIMATION_REFERENCE);
+      assert_eq!(h, 0.0);
+      assert_eq!(e, BODY_POSE_3D_HEIGHT_ESTIMATION_UNKNOWN);
+    }
+  }
+
+  /// `validate_mask_dims_for_slice` rejects an output-payload that
+  /// would exceed `MAX_MASK_BYTES`, even when the source slice length
+  /// is small. This guards the bounded allocator from being asked
+  /// for an impossible amount.
+  #[test]
+  fn validate_mask_dims_rejects_oversize_output() {
+    assert!(validate_mask_dims_for_slice(MAX_MASK_BYTES, 1, 0).is_some());
+    assert!(validate_mask_dims_for_slice(MAX_MASK_BYTES + 1, 1, 0).is_none());
+  }
+
+  /// `validate_mask_dims_for_slice` rejects a source-slice length
+  /// over `isize::MAX`. This is the `from_raw_parts` contract; a
+  /// corrupted `CVPixelBuffer` reporting a huge `bytes_per_row *
+  /// height` must be dropped before the unsafe slice construction.
+  #[test]
+  fn validate_mask_dims_rejects_isize_overflow_source() {
+    assert!(validate_mask_dims_for_slice(1, 1, isize::MAX as usize).is_some());
+    assert!(validate_mask_dims_for_slice(1, 1, (isize::MAX as usize).wrapping_add(1)).is_none());
+  }
+
+  /// `width * height` overflow returns `None` (the `checked_mul`
+  /// inside).
+  #[test]
+  fn validate_mask_dims_rejects_dim_overflow() {
+    assert!(validate_mask_dims_for_slice(usize::MAX, 2, 0).is_none());
   }
 }
