@@ -209,6 +209,62 @@ fn finite_f32(v: f32) -> Option<f32> {
 #[cfg(target_os = "macos")]
 const MAX_MASK_BYTES: usize = 64 * 1024 * 1024;
 
+/// Upper bound on a single Vision FeaturePrint payload. Apple's
+/// VNFeaturePrintObservation typically returns ~2 KiB per request;
+/// 64 MiB is a generous upper bound against a corrupted or
+/// adversarial `NSData` length.
+#[cfg(target_os = "macos")]
+const MAX_FEATURE_PRINT_BYTES: usize = 64 * 1024 * 1024;
+
+/// Upper bound on the number of landmark points per face-landmark
+/// region. Vision's `allPoints` is ~76 points; per-feature regions
+/// are smaller. 1024 leaves headroom against future API expansion
+/// while still capping a corrupted/adversarial `pointCount`.
+#[cfg(target_os = "macos")]
+const MAX_LANDMARK_POINTS: usize = 1024;
+
+/// Validate a byte-length payload pre-`from_raw_parts`. Two
+/// preconditions:
+///
+/// 1. `byte_len <= max_bytes` (caller-provided ceiling against
+///    corrupted/adversarial sizes that would drive the bounded
+///    allocator into refusal).
+/// 2. `byte_len <= isize::MAX as usize` (the
+///    [`std::slice::from_raw_parts`] contract for `T: u8`).
+///
+/// Returns `None` on either violation; the caller propagates that
+/// `None` so the detection is dropped rather than triggering UB or
+/// the allocator's abort path.
+#[cfg(target_os = "macos")]
+#[inline]
+fn validate_raw_slice_bytes(byte_len: usize, max_bytes: usize) -> Option<()> {
+  if byte_len > max_bytes {
+    return None;
+  }
+  if byte_len > isize::MAX as usize {
+    return None;
+  }
+  Some(())
+}
+
+/// Validate an element-count payload pre-`from_raw_parts<T>`. Same
+/// shape as [`validate_raw_slice_bytes`] but computes
+/// `byte_len = elem_count * size_of::<T>()` with overflow checking
+/// before the `isize::MAX` comparison, so the helper is safe for
+/// element types larger than `u8`.
+#[cfg(target_os = "macos")]
+#[inline]
+fn validate_raw_slice_elems<T>(elem_count: usize, max_elems: usize) -> Option<()> {
+  if elem_count > max_elems {
+    return None;
+  }
+  let byte_len = elem_count.checked_mul(core::mem::size_of::<T>())?;
+  if byte_len > isize::MAX as usize {
+    return None;
+  }
+  Some(())
+}
+
 /// Allocate a zero-initialised packed mask buffer with bounded
 /// `try_reserve_exact`. Returns `None` on either bound violation or
 /// allocator failure — both surface to the caller as a dropped mask
@@ -1794,12 +1850,29 @@ impl VisionAnalyzer {
 
     let ns_data = unsafe { obs.data() };
     let len = ns_data.len();
-    let ptr: *const std::ffi::c_void = unsafe { objc2::msg_send![&*ns_data, bytes] };
-    if ptr.is_null() || len == 0 {
+    if len == 0 {
       return FeaturePrint::default();
     }
-
-    let data = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) }.to_vec();
+    // Pre-validate the raw-slice preconditions (cap + isize::MAX)
+    // BEFORE the unsafe slice construction. Same policy as
+    // `validate_mask_dims_for_slice` for `CVPixelBuffer` payloads.
+    if validate_raw_slice_bytes(len, MAX_FEATURE_PRINT_BYTES).is_none() {
+      return FeaturePrint::default();
+    }
+    let ptr: *const std::ffi::c_void = unsafe { objc2::msg_send![&*ns_data, bytes] };
+    if ptr.is_null() {
+      return FeaturePrint::default();
+    }
+    // Fallible copy: `to_vec` allocates infallibly; switch to
+    // `try_reserve_exact` so an allocator failure on a borderline-
+    // legal payload returns a default detection instead of aborting
+    // the worker process.
+    let src = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
+    let mut data: Vec<u8> = Vec::new();
+    if data.try_reserve_exact(len).is_err() {
+      return FeaturePrint::default();
+    }
+    data.extend_from_slice(src);
     let element_type = u32::try_from(unsafe { obs.elementType() }.0).unwrap_or_default();
     FeaturePrint::new(Bytes::from(data), element_type)
   }
@@ -1940,6 +2013,15 @@ fn push_face_landmark_region(
 
   let point_count = unsafe { region.pointCount() };
   if point_count == 0 {
+    return;
+  }
+  // Pre-validate the raw-slice preconditions
+  // (count <= MAX_LANDMARK_POINTS AND count * size_of::<CGPoint>() <= isize::MAX)
+  // BEFORE the unsafe slice construction. Same policy as
+  // `validate_mask_dims_for_slice` and the FeaturePrint path —
+  // every Vision boundary that builds a Rust slice from an FFI
+  // pointer goes through a `validate_raw_slice_*` gate.
+  if validate_raw_slice_elems::<CGPoint>(point_count, MAX_LANDMARK_POINTS).is_none() {
     return;
   }
 
@@ -2173,7 +2255,7 @@ fn process_mask_bytes_f32(
     // conversion.
     return None;
   }
-  let bbox = normalized_bbox_from_pixel_bounds(min_x, min_y, max_x, max_y, width, height);
+  let bbox = normalized_bbox_from_pixel_bounds(min_x, min_y, max_x, max_y, width, height)?;
   Some((bbox, packed))
 }
 
@@ -2218,7 +2300,7 @@ fn process_mask_bytes_u8(
   if !has_foreground {
     return None;
   }
-  let bbox = normalized_bbox_from_pixel_bounds(min_x, min_y, max_x, max_y, width, height);
+  let bbox = normalized_bbox_from_pixel_bounds(min_x, min_y, max_x, max_y, width, height)?;
   Some((bbox, packed))
 }
 
@@ -2228,6 +2310,22 @@ fn process_mask_bytes_u8(
 /// `CVPixelBuffer` rows are stored top-to-bottom in memory (row 0 is the
 /// top of the image), so the natural mapping `min_y / height` is already
 /// top-left and no y-flip is needed here.
+/// Convert integer pixel bounds into a normalized `[0, 1]`
+/// `BoundingBox`. The intermediate division is performed in `f64`
+/// because R7's bounded mask cap (`MAX_MASK_BYTES = 64 MiB`) admits
+/// widths above `2^24`, where consecutive `usize` values round to
+/// the same `f32` (mantissa exhaustion). A naive
+/// `min_x as f32 / width as f32` then produces `x = 1.0` with a
+/// positive width on right-edge foreground at width `2^24 + 1`,
+/// which violates the schema's `[0, 1]` invariant.
+///
+/// `f64` has 52 mantissa bits and represents every `usize` up to
+/// `2^52` exactly on 64-bit targets; only the final narrow to `f32`
+/// loses precision, which is invariant-safe because the result is
+/// in `[0, 1]`. Returns `None` if the final bbox fails the domain
+/// validator's `[0, 1]` + non-zero-extent invariants — a corrupted
+/// pixel-bound input cannot produce a wire bbox that downstream
+/// storage would reject.
 #[cfg(target_os = "macos")]
 fn normalized_bbox_from_pixel_bounds(
   min_x: usize,
@@ -2236,12 +2334,28 @@ fn normalized_bbox_from_pixel_bounds(
   max_y: usize,
   width: usize,
   height: usize,
-) -> BoundingBox {
-  let x = min_x as f32 / width as f32;
-  let y = min_y as f32 / height as f32;
-  let w = (max_x + 1 - min_x) as f32 / width as f32;
-  let h = (max_y + 1 - min_y) as f32 / height as f32;
-  BoundingBox::new(x, y, w, h)
+) -> Option<BoundingBox> {
+  if width == 0 || height == 0 {
+    return None;
+  }
+  let w64 = width as f64;
+  let h64 = height as f64;
+  let x = (min_x as f64 / w64) as f32;
+  let y = (min_y as f64 / h64) as f32;
+  // `max_x + 1` would overflow `usize::MAX`; the caller bounds
+  // `max_x < width <= MAX_MASK_BYTES` (well below `usize::MAX`), but
+  // use `checked_add` for defence-in-depth.
+  let w_pixels = max_x.checked_sub(min_x)?.checked_add(1)?;
+  let h_pixels = max_y.checked_sub(min_y)?.checked_add(1)?;
+  let w = (w_pixels as f64 / w64) as f32;
+  let h = (h_pixels as f64 / h64) as f32;
+  // Route through the domain validator's `[0, 1]` invariant. The
+  // intermediate `f64` math guarantees we don't synthesise
+  // `x + w > 1.0` on large widths, but the explicit validator gate
+  // here means a future change to the math cannot silently
+  // re-introduce a wire bbox the storage layer rejects.
+  mediaschema::domain::aggregates::video::BoundingBox::try_new(x, y, w, h).ok()?;
+  Some(BoundingBox::new(x, y, w, h))
 }
 
 // ----- Non-macOS stub --------------------------------------------------------
@@ -2514,7 +2628,7 @@ mod macos_tests {
     // A 100x100 mask with the foreground rectangle in rows 10..=29,
     // columns 5..=24. The expected normalized bbox is
     // `(5/100, 10/100, 20/100, 20/100)` in top-left convention.
-    let bbox = normalized_bbox_from_pixel_bounds(5, 10, 24, 29, 100, 100);
+    let bbox = normalized_bbox_from_pixel_bounds(5, 10, 24, 29, 100, 100).expect("valid bbox");
     assert!((bbox.x - 0.05).abs() < 1e-6);
     assert!((bbox.y - 0.10).abs() < 1e-6);
     assert!((bbox.width - 0.20).abs() < 1e-6);
@@ -2927,5 +3041,96 @@ mod macos_tests {
   #[test]
   fn validate_mask_dims_rejects_dim_overflow() {
     assert!(validate_mask_dims_for_slice(usize::MAX, 2, 0).is_none());
+  }
+
+  // ──────────────── R8 fixes (codex round 8) ────────────────
+
+  /// `validate_raw_slice_bytes` rejects payloads above the cap and
+  /// above `isize::MAX`, in either order.
+  #[test]
+  fn validate_raw_slice_bytes_rejects_over_cap() {
+    assert!(validate_raw_slice_bytes(0, MAX_FEATURE_PRINT_BYTES).is_some());
+    assert!(validate_raw_slice_bytes(MAX_FEATURE_PRINT_BYTES, MAX_FEATURE_PRINT_BYTES).is_some());
+    assert!(
+      validate_raw_slice_bytes(MAX_FEATURE_PRINT_BYTES + 1, MAX_FEATURE_PRINT_BYTES).is_none()
+    );
+  }
+
+  /// `validate_raw_slice_bytes` rejects `byte_len > isize::MAX` even
+  /// when the caller's cap is `usize::MAX` (i.e. no cap). This pins
+  /// the FFI-side `from_raw_parts` contract independently of the
+  /// caller-side ceiling.
+  #[test]
+  fn validate_raw_slice_bytes_rejects_isize_overflow() {
+    assert!(validate_raw_slice_bytes(isize::MAX as usize, usize::MAX).is_some());
+    assert!(validate_raw_slice_bytes((isize::MAX as usize).wrapping_add(1), usize::MAX).is_none());
+  }
+
+  /// `validate_raw_slice_elems::<CGPoint>` rejects element counts
+  /// above the caller-provided max regardless of the size_of math.
+  #[test]
+  fn validate_raw_slice_elems_rejects_over_cap() {
+    assert!(
+      validate_raw_slice_elems::<CGPoint>(MAX_LANDMARK_POINTS, MAX_LANDMARK_POINTS).is_some()
+    );
+    assert!(
+      validate_raw_slice_elems::<CGPoint>(MAX_LANDMARK_POINTS + 1, MAX_LANDMARK_POINTS).is_none()
+    );
+  }
+
+  /// `validate_raw_slice_elems::<u8>` rejects when `elem_count *
+  /// size_of::<T>()` overflows usize. For `T = u8` size_of is 1 so
+  /// the overflow surfaces only on the isize::MAX check.
+  #[test]
+  fn validate_raw_slice_elems_rejects_byte_overflow() {
+    // `usize::MAX / 2 + 2` * 16 (size_of CGPoint with two f64) overflows.
+    assert!(validate_raw_slice_elems::<CGPoint>(usize::MAX, usize::MAX).is_none());
+  }
+
+  /// The key R8 regression: a 2^24+1-pixel-wide mask with foreground
+  /// in the rightmost column previously produced `x = 1.0` with
+  /// positive width (because `f32` cannot distinguish `2^24` from
+  /// `2^24 + 1`). The f64-intermediate fix should now produce a
+  /// `[0, 1]`-valid bbox OR drop the detection — never emit
+  /// `x + width > 1.0`.
+  #[test]
+  fn normalized_bbox_handles_2pow24_plus_one_width() {
+    // 2^24 = 16,777,216. Pick a width slightly above the f32
+    // mantissa exhaustion point. Foreground = rightmost column.
+    let width: usize = (1 << 24) + 1;
+    let height: usize = 1;
+    let right_col = width - 1;
+    let bbox = normalized_bbox_from_pixel_bounds(right_col, 0, right_col, 0, width, height)
+      .expect("valid bbox at right edge");
+    // Without the f64 fix this would have been `x = 1.0`. With the
+    // fix `x = (2^24) / (2^24 + 1)` ≈ 0.99999994 (f32).
+    assert!(
+      bbox.x < 1.0,
+      "x must remain strictly less than 1.0: {}",
+      bbox.x
+    );
+    assert!(
+      bbox.width > 0.0,
+      "positive foreground width: {}",
+      bbox.width
+    );
+    // `x + width` MUST satisfy the schema `<= 1.0` invariant
+    // (in fact equals 1.0 modulo f32 representation).
+    let right_edge = bbox.x + bbox.width;
+    assert!(
+      right_edge <= 1.0 + 1e-6,
+      "right edge exceeds image: {right_edge}"
+    );
+  }
+
+  /// The normalizer rejects degenerate input (width or height zero,
+  /// or max < min) by returning `None` rather than emitting a wire
+  /// bbox the domain validator would reject.
+  #[test]
+  fn normalized_bbox_rejects_degenerate_input() {
+    assert!(normalized_bbox_from_pixel_bounds(0, 0, 10, 10, 0, 100).is_none());
+    assert!(normalized_bbox_from_pixel_bounds(0, 0, 10, 10, 100, 0).is_none());
+    // max < min (corrupted input)
+    assert!(normalized_bbox_from_pixel_bounds(20, 0, 10, 10, 100, 100).is_none());
   }
 }
