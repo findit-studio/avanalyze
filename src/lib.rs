@@ -251,6 +251,71 @@ const MAX_VISION_RESULTS_PER_FRAME: usize = 4096;
 #[cfg(target_os = "macos")]
 const MAX_POSE_JOINTS: usize = 256;
 
+/// Hard ceiling on instances per segmentation-mask observation.
+#[cfg(target_os = "macos")]
+const MAX_NESTED_INSTANCES_PER_OBSERVATION: usize = 64;
+
+/// Hard ceiling on labels per recognised-animal observation.
+#[cfg(target_os = "macos")]
+const MAX_NESTED_LABELS_PER_OBSERVATION: usize = 32;
+
+/// Hard ceiling on candidate strings per text-recognition observation.
+#[cfg(target_os = "macos")]
+const MAX_TEXT_CANDIDATES_PER_OBSERVATION: usize = 16;
+
+/// Hard ceiling on saliency regions per frame.
+#[cfg(target_os = "macos")]
+const MAX_SALIENCY_REGIONS_PER_FRAME: usize = 64;
+
+/// Upper bound on the byte length of an FFI-sourced `NSString`
+/// before we refuse to convert it to a Rust `SmolStr` / `String`.
+/// Apple's Vision-emitted strings (OCR text, barcode payloads,
+/// classification identifiers, joint names) cap out in the low
+/// hundreds of bytes for realistic content; 4096 is a generous
+/// defence-in-depth ceiling against a corrupted / adversarial
+/// `NSString` whose reported length would drive Rust's infallible
+/// string allocation into the abort path. Strings exceeding the
+/// cap are dropped; callers skip the offending field rather than
+/// truncating mid-grapheme.
+#[cfg(target_os = "macos")]
+const MAX_FFI_STRING_BYTES: usize = 4096;
+
+/// Convert an FFI-sourced `NSString` to a Rust `SmolStr` after
+/// verifying its UTF-8 byte length is within
+/// [`MAX_FFI_STRING_BYTES`]. Returns `None` if the `NSString`'s
+/// reported byte length exceeds the bound; callers drop the
+/// offending field (text candidate / barcode payload /
+/// classification label / joint name) rather than driving the
+/// allocator into the abort path. The length query is FFI but
+/// allocation-free.
+#[cfg(target_os = "macos")]
+fn ffi_nsstring_to_smolstr(ns_str: &objc2_foundation::NSString) -> Option<SmolStr> {
+  // `NSStringEncoding` is a `usize` type alias (objc2_foundation
+  // re-exports it from `objc2::ffi::NSUInteger = usize`).
+  // `NSUTF8StringEncoding` is the documented value 4.
+  const NS_UTF8_STRING_ENCODING: objc2_foundation::NSStringEncoding = 4;
+  // `lengthOfBytesUsingEncoding` is exposed as safe by
+  // objc2-foundation 0.3.2 — no `unsafe` wrapper required.
+  let utf8_len: usize = ns_str.lengthOfBytesUsingEncoding(NS_UTF8_STRING_ENCODING);
+  if utf8_len > MAX_FFI_STRING_BYTES {
+    return None;
+  }
+  Some(ns_str.to_smolstr())
+}
+
+/// Compute the effective per-extractor cap as
+/// `min(user_configured_max, MAX_VISION_RESULTS_PER_FRAME)`. Use
+/// this for ALL of: `Vec::with_capacity(cap)`, `.iter().take(cap)`,
+/// and the in-loop `if emitted.len() >= cap { break; }` guard.
+/// Composing the three around the SAME `cap` value bounds both
+/// capacity and emission to the hard ceiling, regardless of what
+/// the caller configured.
+#[cfg(target_os = "macos")]
+#[inline]
+fn effective_results_cap(user_max: usize) -> usize {
+  user_max.min(MAX_VISION_RESULTS_PER_FRAME)
+}
+
 /// Validate a byte-length payload pre-`from_raw_parts`. Two
 /// preconditions:
 ///
@@ -1053,20 +1118,28 @@ impl VisionAnalyzer {
       return Vec::new();
     };
 
-    let mut tags = Vec::with_capacity(results.len().min(opts.max_results()));
-    for obs in results.iter().take(MAX_VISION_RESULTS_PER_FRAME) {
+    // Effective cap composes user-configured + hard ceiling so
+    // with_capacity, take, and the emission guard all bound to
+    // the SAME value (no `Vec::push` reallocation past the cap).
+    let cap = effective_results_cap(opts.max_results());
+    let mut tags = Vec::with_capacity(cap);
+    for obs in results.iter().take(cap) {
+      if tags.len() >= cap {
+        break;
+      }
       let Some(confidence) =
         sanitize_confidence(unsafe { obs.confidence() }, opts.min_confidence())
       else {
         continue;
       };
 
-      let label = normalize_classification_label(unsafe { obs.identifier() }.to_smolstr());
+      let identifier = unsafe { obs.identifier() };
+      let Some(label) = ffi_nsstring_to_smolstr(&identifier) else {
+        continue;
+      };
+      let label = normalize_classification_label(label);
       if !label.is_empty() {
         tags.push(ClassificationDetection::new(label, confidence));
-        if tags.len() >= opts.max_results() {
-          break;
-        }
       }
     }
 
@@ -1270,7 +1343,9 @@ impl VisionAnalyzer {
       let mut max_y = f32::NEG_INFINITY;
 
       for (joint_name, point) in joint_names.into_iter().zip(points) {
-        let name = joint_name.to_smolstr();
+        let Some(name) = ffi_nsstring_to_smolstr(&joint_name) else {
+          continue;
+        };
         if name.is_empty() {
           continue;
         }
@@ -1353,7 +1428,9 @@ impl VisionAnalyzer {
         let mut joints = Vec::with_capacity(points.len());
 
         for (joint_name, point) in joint_names.into_iter().zip(points) {
-          let name = joint_name.to_smolstr();
+          let Some(name) = ffi_nsstring_to_smolstr(&joint_name) else {
+            continue;
+          };
           if name.is_empty() {
             continue;
           }
@@ -1434,7 +1511,9 @@ impl VisionAnalyzer {
       let mut max_y = f32::NEG_INFINITY;
 
       for (joint_name, point) in joint_names.into_iter().zip(points) {
-        let name = joint_name.to_smolstr();
+        let Some(name) = ffi_nsstring_to_smolstr(&joint_name) else {
+          continue;
+        };
         if name.is_empty() {
           continue;
         }
@@ -1502,8 +1581,12 @@ impl VisionAnalyzer {
       let instances = unsafe { observation.allInstances() };
       let mut instance_index = instances.firstIndex();
       let mut emitted = 0usize;
+      // Effective inner cap: user-configured AND hard ceiling.
+      let inner_cap = opts
+        .max_instances_per_observation()
+        .min(MAX_NESTED_INSTANCES_PER_OBSERVATION);
       while instance_index != NSNotFound as usize {
-        if emitted >= opts.max_instances_per_observation() {
+        if emitted >= inner_cap {
           break;
         }
 
@@ -1580,13 +1663,19 @@ impl VisionAnalyzer {
       let mut animals = Vec::new();
       for obs in results.iter().take(MAX_VISION_RESULTS_PER_FRAME) {
         let labels = obs.labels();
-        for label in labels.iter() {
+        // Animal-labels has no user-configured cap, so the hard
+        // ceiling alone bounds emission. Apple's request returns
+        // 1-3 species labels per observation in practice.
+        for label in labels.iter().take(MAX_NESTED_LABELS_PER_OBSERVATION) {
           let Some(confidence) =
             sanitize_confidence(label.confidence(), self.opts.animals().min_confidence())
           else {
             continue;
           };
-          let id = label.identifier().to_smolstr();
+          let identifier = label.identifier();
+          let Some(id) = ffi_nsstring_to_smolstr(&identifier) else {
+            continue;
+          };
           if !id.is_empty()
             && let Some(bbox) = vision_bbox_to_schema(obs.boundingBox().standardize())
           {
@@ -1631,7 +1720,9 @@ impl VisionAnalyzer {
       let mut max_y = f32::NEG_INFINITY;
 
       for (joint_name, point) in joint_names.into_iter().zip(points) {
-        let name = joint_name.to_smolstr();
+        let Some(name) = ffi_nsstring_to_smolstr(&joint_name) else {
+          continue;
+        };
         if name.is_empty() {
           continue;
         }
@@ -1684,9 +1775,23 @@ impl VisionAnalyzer {
 
     let mut text_detections = Vec::with_capacity(results.len().min(MAX_VISION_RESULTS_PER_FRAME));
     for obs in results.iter().take(MAX_VISION_RESULTS_PER_FRAME) {
-      let candidates = obs.topCandidates(self.opts.text().max_candidates_per_observation());
-      for candidate in candidates.iter() {
-        let text = candidate.string().to_smolstr();
+      // Bound the requested candidate count to the hard per-observation cap
+      // — Apple's topCandidates allocates an NSArray sized to the argument.
+      let candidate_cap = self
+        .opts
+        .text()
+        .max_candidates_per_observation()
+        .min(MAX_TEXT_CANDIDATES_PER_OBSERVATION);
+      let candidates = obs.topCandidates(candidate_cap);
+      for candidate in candidates.iter().take(candidate_cap) {
+        // Bound the candidate string at MAX_FFI_STRING_BYTES before
+        // routing through `to_smolstr` so a corrupted/adversarial
+        // NSString length cannot drive the allocator into the abort
+        // path.
+        let raw_string = candidate.string();
+        let Some(text) = ffi_nsstring_to_smolstr(&raw_string) else {
+          continue;
+        };
         if text.len() < self.opts.text().min_text_len() {
           continue;
         }
@@ -1716,11 +1821,17 @@ impl VisionAnalyzer {
       };
 
       if let Some(payload) = unsafe { obs.payloadStringValue() } {
-        let s = payload.to_smolstr();
+        // Bound the payload + symbology at MAX_FFI_STRING_BYTES.
+        let Some(s) = ffi_nsstring_to_smolstr(&payload) else {
+          continue;
+        };
         if s.len() >= opts.min_payload_len()
           && let Some(bbox) = vision_bbox_to_schema(unsafe { obs.boundingBox() }.standardize())
         {
-          let symbology = unsafe { obs.symbology() }.to_smolstr();
+          let raw_sym = unsafe { obs.symbology() };
+          let Some(symbology) = ffi_nsstring_to_smolstr(&raw_sym) else {
+            continue;
+          };
           barcodes.push(BarcodeDetection::new(s, symbology, confidence, bbox));
         }
       }
@@ -1756,7 +1867,9 @@ impl VisionAnalyzer {
       let Some(objects) = (unsafe { observation.salientObjects() }) else {
         continue;
       };
-      for object in objects.iter().take(opts.max_regions()) {
+      // Bound the inner cap: user-configured AND hard per-frame ceiling.
+      let region_cap = opts.max_regions().min(MAX_SALIENCY_REGIONS_PER_FRAME);
+      for object in objects.iter().take(region_cap) {
         let Some(confidence) =
           sanitize_confidence(unsafe { object.confidence() }, opts.min_confidence())
         else {
@@ -1802,9 +1915,12 @@ impl VisionAnalyzer {
     };
     let opts = self.opts.document_segments();
 
-    let mut segments = Vec::with_capacity(results.len().min(MAX_VISION_RESULTS_PER_FRAME));
-    for observation in results.iter().take(MAX_VISION_RESULTS_PER_FRAME) {
-      if segments.len() >= opts.max_segments() {
+    // Effective cap: user-configured max_segments AND hard ceiling.
+    // with_capacity, take, and the emission guard all share `cap`.
+    let cap = effective_results_cap(opts.max_segments());
+    let mut segments = Vec::with_capacity(cap);
+    for observation in results.iter().take(cap) {
+      if segments.len() >= cap {
         break;
       }
 
