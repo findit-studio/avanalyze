@@ -1,13 +1,13 @@
 [package]
-name = "template-rs"
+name = "avanalyze"
 version = "0.0.0"
-edition = "2021"
-repository = "https://github.com/al8n/template-rs"
-homepage = "https://github.com/al8n/template-rs"
-documentation = "https://docs.rs/template-rs"
-description = "A template for creating Rust open-source repo on GitHub"
+edition = "2024"
+repository = "https://github.com/Findit-AI/avanalyze"
+homepage = "https://github.com/Findit-AI/avanalyze"
+documentation = "https://docs.rs/avanalyze"
+description = "Long-running Apple Vision.framework worker that analyses keyframes and emits mediaschema-shaped detections."
 license = "MIT OR Apache-2.0"
-rust-version = "1.73"
+rust-version = "1.95"
 
 [[bench]]
 path = "benches/foo.rs"
@@ -15,11 +15,58 @@ name = "foo"
 harness = false
 
 [features]
-default = ["std"]
-alloc = []
-std = []
+default = ["serde?/default"]
+serde = ["dep:serde"]
+tracing = ["dep:tracing"]
 
 [dependencies]
+bytes = "1"
+serde = { version = "1", optional = true, features = ["derive"] }
+smol_str = "0.3"
+
+tracing = { version = "0.1", optional = true }
+
+# Domain types live in `mediaschema` — engine output IS the storage shape.
+# Only the `video` aggregate tree is needed (apple-vision feeds Keyframe +
+# detections). Path dep for now; switch to crates.io once mediaschema 0.2 is
+# published with the medium-gate features.
+mediaschema = { path = "../mediaschema", default-features = false, features = ["std", "video", "buffa"] }
+mediaframe = { version = "0.1", default-features = false, features = ["std"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-core-foundation = { version = "0.3", features = ["CFCGTypes"] }
+objc2-foundation = { version = "0.3", features = ["NSArray", "NSString", "NSData", "NSError", "NSObjCRuntime", "NSIndexSet"] }
+objc2-core-video = { version = "0.3", features = ["CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVReturn"] }
+objc2-vision = { version = "0.3", features = [
+  "objc2-core-foundation",
+  "alloc",
+  "VNRequest", "VNRequestHandler", "VNObservation",
+  "VNClassifyImageRequest",
+  "VNDetectFaceRectanglesRequest",
+  "VNDetectFaceLandmarksRequest",
+  "VNFaceLandmarks",
+  "VNDetectFaceCaptureQualityRequest",
+  "VNDetectHumanRectanglesRequest",
+  "VNRecognizeAnimalsRequest",
+  "VNDetectHumanBodyPoseRequest",
+  "VNDetectHumanBodyPose3DRequest",
+  "VNGeneratePersonInstanceMaskRequest",
+  "VNGeneratePersonSegmentationRequest",
+  "VNGeometry", "VNRecognizedPoint3D", "VNHumanBodyRecognizedPoint3D",
+  "VNDetectedPoint", "VNTypes",
+  "VNGenerateAttentionBasedSaliencyImageRequest",
+  "VNGenerateObjectnessBasedSaliencyImageRequest",
+  "VNRecognizeTextRequest",
+  "VNDetectBarcodesRequest",
+  "VNCalculateImageAestheticsScoresRequest",
+  "VNDetectHorizonRequest",
+  "VNDetectDocumentSegmentationRequest",
+  "VNGenerateImageFeaturePrintRequest",
+] }
+
+[lints]
+workspace = true
 
 [dev-dependencies]
 criterion = "0.8"
@@ -39,7 +86,7 @@ rpath = false
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
-[lints.rust]
+[workspace.lints.rust]
 rust_2018_idioms = "warn"
 single_use_lifetimes = "warn"
 unexpected_cfgs = { level = "warn", check-cfg = [
