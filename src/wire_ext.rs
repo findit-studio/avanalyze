@@ -53,19 +53,25 @@ impl BoundingBoxExt for BoundingBox {
 // ----- Dimensions -----------------------------------------------------------
 
 /// Constructor sugar for [`Dimensions`].
+///
+/// The wire layer stores `u32` width and height; we accept the same
+/// width here so callers can pass the raw `CVPixelBufferGet{Width,
+/// Height}` (a `usize`) through `u32::try_from(...)` and stay in
+/// agreement with the actual payload size. Saturating to `u16::MAX`
+/// would silently desynchronise the dimensions from the packed mask
+/// bytes for masks above 65535 pixels in either axis.
 pub trait DimensionsExt {
-  /// Build a `Dimensions` from `(width, height)`. The wire layer stores `u32`
-  /// while the engine works in `u16`; we widen here.
+  /// Build a `Dimensions` from a `(width, height)` pair in wire units.
   #[must_use]
-  fn new(width: u16, height: u16) -> Self;
+  fn new(width: u32, height: u32) -> Self;
 }
 
 impl DimensionsExt for Dimensions {
   #[inline(always)]
-  fn new(width: u16, height: u16) -> Self {
+  fn new(width: u32, height: u32) -> Self {
     Self {
-      width: u32::from(width),
-      height: u32::from(height),
+      width,
+      height,
       ..Default::default()
     }
   }

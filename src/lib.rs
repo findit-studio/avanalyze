@@ -182,6 +182,24 @@ fn pose_bbox_from_joint_bounds(
   Some(BoundingBox::new(min_x, min_y, width, height))
 }
 
+/// Validate a raw Vision `confidence` value against the configured
+/// per-request minimum and the wire/domain `Confidence` invariant
+/// (finite, in `[0.0, 1.0]`). Returns `None` if the value is
+/// non-finite, outside `[0, 1]`, or below `min` — the caller drops
+/// the detection in that case. A simple `value < min` threshold
+/// previously let `NaN` through (since every NaN comparison is
+/// false) and accepted `>1.0` values, both of which mediaschema's
+/// domain `Confidence::try_new` rejects.
+#[cfg(target_os = "macos")]
+#[inline]
+fn sanitize_confidence(value: f32, min: f32) -> Option<f32> {
+  if value.is_finite() && (0.0..=1.0).contains(&value) && value >= min {
+    Some(value)
+  } else {
+    None
+  }
+}
+
 // ----- CVPixelBuffer RAII lock ----------------------------------------------
 
 /// RAII guard that holds a `CVPixelBufferLockBaseAddress` lock for the
@@ -797,10 +815,11 @@ impl VisionAnalyzer {
 
     let mut tags = Vec::with_capacity(results.len().min(opts.max_results()));
     for obs in results.iter() {
-      let confidence = unsafe { obs.confidence() };
-      if confidence < opts.min_confidence() {
+      let Some(confidence) =
+        sanitize_confidence(unsafe { obs.confidence() }, opts.min_confidence())
+      else {
         continue;
-      }
+      };
 
       let label = normalize_classification_label(unsafe { obs.identifier() }.to_smolstr());
       if !label.is_empty() {
@@ -822,11 +841,15 @@ impl VisionAnalyzer {
 
     let mut faces = Vec::with_capacity(results.len());
     for obs in results.iter() {
-      let confidence = unsafe { obs.confidence() };
+      let Some(confidence) =
+        sanitize_confidence(unsafe { obs.confidence() }, opts.min_confidence())
+      else {
+        continue;
+      };
       let capture_quality = unsafe { obs.faceCaptureQuality() }
         .map(|q| q.floatValue())
         .unwrap_or(0.0);
-      if confidence < opts.min_confidence() || capture_quality < opts.min_capture_quality() {
+      if capture_quality < opts.min_capture_quality() {
         continue;
       }
 
@@ -859,10 +882,11 @@ impl VisionAnalyzer {
 
     let mut faces = Vec::with_capacity(results.len());
     for obs in results.iter() {
-      let confidence = unsafe { obs.confidence() };
-      if confidence < opts.min_confidence() {
+      let Some(confidence) =
+        sanitize_confidence(unsafe { obs.confidence() }, opts.min_confidence())
+      else {
         continue;
-      }
+      };
 
       let Some(bbox) = vision_bbox_to_schema(unsafe { obs.boundingBox() }.standardize()) else {
         continue;
@@ -895,10 +919,11 @@ impl VisionAnalyzer {
       let Some(landmarks) = (unsafe { obs.landmarks() }) else {
         continue;
       };
-      let confidence = unsafe { landmarks.confidence() };
-      if confidence < opts.min_confidence() {
+      let Some(confidence) =
+        sanitize_confidence(unsafe { landmarks.confidence() }, opts.min_confidence())
+      else {
         continue;
-      }
+      };
 
       let regions = extract_face_landmark_regions(&landmarks);
       if regions.len() < opts.min_region_count() {
@@ -922,10 +947,11 @@ impl VisionAnalyzer {
 
     let mut humans = Vec::with_capacity(results.len());
     for obs in results.iter() {
-      let confidence = unsafe { obs.confidence() };
-      if confidence < opts.min_confidence() {
+      let Some(confidence) =
+        sanitize_confidence(unsafe { obs.confidence() }, opts.min_confidence())
+      else {
         continue;
-      }
+      };
 
       let Some(bbox) = vision_bbox_to_schema(unsafe { obs.boundingBox() }.standardize()) else {
         continue;
@@ -970,10 +996,12 @@ impl VisionAnalyzer {
         // top-left schema convention before recording the joint or
         // deriving the bbox.
         let (x, y) = vision_point_to_schema(unsafe { point.x() }, unsafe { point.y() });
-        let confidence = unsafe { point.confidence() };
-        if confidence < self.opts.body_pose().min_joint_confidence() {
+        let Some(confidence) = sanitize_confidence(
+          unsafe { point.confidence() },
+          self.opts.body_pose().min_joint_confidence(),
+        ) else {
           continue;
-        }
+        };
 
         min_x = min_x.min(x);
         min_y = min_y.min(y);
@@ -994,13 +1022,15 @@ impl VisionAnalyzer {
         // validator would reject.
         continue;
       };
+      // Observation confidence carries the per-pose score; sanitise it
+      // against the same `[0, 1]` invariant. A non-finite observation
+      // confidence cannot be emitted faithfully — drop the pose.
+      let Some(pose_confidence) = sanitize_confidence(unsafe { obs.confidence() }, 0.0) else {
+        continue;
+      };
 
       joints.sort_by(|lhs, rhs| lhs.name().cmp(rhs.name()));
-      body_poses.push(BodyPoseDetection::new(
-        bbox,
-        unsafe { obs.confidence() },
-        joints,
-      ));
+      body_poses.push(BodyPoseDetection::new(bbox, pose_confidence, joints));
     }
 
     body_poses
@@ -1035,10 +1065,13 @@ impl VisionAnalyzer {
           let Some((x, y, z)) = extract_body_pose_3d_coordinates(&point) else {
             continue;
           };
-          let confidence: f32 = unsafe { objc2::msg_send![&*point, confidence] };
-          if confidence < self.opts.body_pose_3d().min_joint_confidence() {
+          let raw_confidence: f32 = unsafe { objc2::msg_send![&*point, confidence] };
+          let Some(confidence) = sanitize_confidence(
+            raw_confidence,
+            self.opts.body_pose_3d().min_joint_confidence(),
+          ) else {
             continue;
-          }
+          };
 
           joints.push(BodyPose3DJoint::new(name, x, y, z, confidence));
         }
@@ -1046,10 +1079,13 @@ impl VisionAnalyzer {
         if joints.is_empty() {
           continue;
         }
+        let Some(pose_confidence) = sanitize_confidence(unsafe { obs.confidence() }, 0.0) else {
+          continue;
+        };
 
         joints.sort_by(|lhs, rhs| lhs.name().cmp(rhs.name()));
         body_poses.push(BodyPose3DDetection::new(
-          unsafe { obs.confidence() },
+          pose_confidence,
           unsafe { obs.bodyHeight() },
           map_body_pose_3d_height_estimation(unsafe { obs.heightEstimation() }),
           joints,
@@ -1094,10 +1130,12 @@ impl VisionAnalyzer {
         // Vision normalized points are lower-left origin; flip y for
         // the top-left schema convention.
         let (x, y) = vision_point_to_schema(unsafe { point.x() }, unsafe { point.y() });
-        let confidence = unsafe { point.confidence() };
-        if confidence < self.opts.hand_pose().min_joint_confidence() {
+        let Some(confidence) = sanitize_confidence(
+          unsafe { point.confidence() },
+          self.opts.hand_pose().min_joint_confidence(),
+        ) else {
           continue;
-        }
+        };
 
         min_x = min_x.min(x);
         min_y = min_y.min(y);
@@ -1114,11 +1152,14 @@ impl VisionAnalyzer {
       let Some(bbox) = pose_bbox_from_joint_bounds(min_x, min_y, max_x, max_y) else {
         continue;
       };
+      let Some(pose_confidence) = sanitize_confidence(unsafe { obs.confidence() }, 0.0) else {
+        continue;
+      };
 
       joints.sort_by(|lhs, rhs| lhs.name().cmp(rhs.name()));
       hand_poses.push(HandPoseDetection::new(
         bbox,
-        unsafe { obs.confidence() },
+        pose_confidence,
         map_hand_chirality(unsafe { obs.chirality() }),
         joints,
       ));
@@ -1135,10 +1176,11 @@ impl VisionAnalyzer {
 
     let mut masks = Vec::new();
     for observation in results.iter() {
-      let confidence = unsafe { observation.confidence() };
-      if confidence < opts.min_confidence() {
+      let Some(confidence) =
+        sanitize_confidence(unsafe { observation.confidence() }, opts.min_confidence())
+      else {
         continue;
-      }
+      };
 
       let instances = unsafe { observation.allInstances() };
       let mut instance_index = instances.firstIndex();
@@ -1161,10 +1203,18 @@ impl VisionAnalyzer {
           continue;
         };
 
+        // `instance_index` is a `usize` from `NSIndexSet`; the wire
+        // type stores `u32`. Saturating to `0` would silently merge
+        // distinct instances — reject and continue instead.
+        let Ok(wire_instance_index) = u32::try_from(instance_index) else {
+          instance_index = instances.indexGreaterThanIndex(instance_index);
+          continue;
+        };
+
         masks.push(PersonInstanceMaskDetection::new(
           bbox,
           confidence,
-          u32::try_from(instance_index).unwrap_or_default(),
+          wire_instance_index,
           dimensions,
           data,
         ));
@@ -1185,10 +1235,11 @@ impl VisionAnalyzer {
 
     let mut masks = Vec::with_capacity(results.len());
     for observation in results.iter() {
-      let confidence = unsafe { observation.confidence() };
-      if confidence < opts.min_confidence() {
+      let Some(confidence) =
+        sanitize_confidence(unsafe { observation.confidence() }, opts.min_confidence())
+      else {
         continue;
-      }
+      };
 
       let pixel_buffer = unsafe { observation.pixelBuffer() };
       let Some((bbox, dimensions, data)) = copy_instance_mask_buffer(&pixel_buffer) else {
@@ -1213,14 +1264,16 @@ impl VisionAnalyzer {
       for obs in results.iter() {
         let labels = obs.labels();
         for label in labels.iter() {
-          let confidence = label.confidence();
-          if confidence >= self.opts.animals().min_confidence() {
-            let id = label.identifier().to_smolstr();
-            if !id.is_empty()
-              && let Some(bbox) = vision_bbox_to_schema(obs.boundingBox().standardize())
-            {
-              animals.push(SubjectDetection::new(id, confidence, bbox));
-            }
+          let Some(confidence) =
+            sanitize_confidence(label.confidence(), self.opts.animals().min_confidence())
+          else {
+            continue;
+          };
+          let id = label.identifier().to_smolstr();
+          if !id.is_empty()
+            && let Some(bbox) = vision_bbox_to_schema(obs.boundingBox().standardize())
+          {
+            animals.push(SubjectDetection::new(id, confidence, bbox));
           }
         }
       }
@@ -1261,10 +1314,12 @@ impl VisionAnalyzer {
         // Vision normalized points are lower-left origin; flip y for
         // the top-left schema convention.
         let (x, y) = vision_point_to_schema(unsafe { point.x() }, unsafe { point.y() });
-        let confidence = unsafe { point.confidence() };
-        if confidence < self.opts.animal_pose().min_joint_confidence() {
+        let Some(confidence) = sanitize_confidence(
+          unsafe { point.confidence() },
+          self.opts.animal_pose().min_joint_confidence(),
+        ) else {
           continue;
-        }
+        };
 
         min_x = min_x.min(x);
         min_y = min_y.min(y);
@@ -1281,13 +1336,12 @@ impl VisionAnalyzer {
       let Some(bbox) = pose_bbox_from_joint_bounds(min_x, min_y, max_x, max_y) else {
         continue;
       };
+      let Some(pose_confidence) = sanitize_confidence(unsafe { obs.confidence() }, 0.0) else {
+        continue;
+      };
 
       joints.sort_by(|lhs, rhs| lhs.name().cmp(rhs.name()));
-      body_poses.push(BodyPoseDetection::new(
-        bbox,
-        unsafe { obs.confidence() },
-        joints,
-      ));
+      body_poses.push(BodyPoseDetection::new(bbox, pose_confidence, joints));
     }
 
     body_poses
@@ -1303,10 +1357,14 @@ impl VisionAnalyzer {
       let candidates = obs.topCandidates(self.opts.text().max_candidates_per_observation());
       for candidate in candidates.iter() {
         let text = candidate.string().to_smolstr();
-        if text.len() >= self.opts.text().min_text_len()
-          && let Some(bbox) = vision_bbox_to_schema(unsafe { obs.boundingBox() }.standardize())
-        {
-          text_detections.push(TextDetection::new(text, candidate.confidence(), bbox));
+        if text.len() < self.opts.text().min_text_len() {
+          continue;
+        }
+        let Some(confidence) = sanitize_confidence(candidate.confidence(), 0.0) else {
+          continue;
+        };
+        if let Some(bbox) = vision_bbox_to_schema(unsafe { obs.boundingBox() }.standardize()) {
+          text_detections.push(TextDetection::new(text, confidence, bbox));
         }
       }
     }
@@ -1321,10 +1379,11 @@ impl VisionAnalyzer {
 
     let mut barcodes = Vec::with_capacity(results.len());
     for obs in results.iter() {
-      let confidence = unsafe { obs.confidence() };
-      if confidence < opts.min_confidence() {
+      let Some(confidence) =
+        sanitize_confidence(unsafe { obs.confidence() }, opts.min_confidence())
+      else {
         continue;
-      }
+      };
 
       if let Some(payload) = unsafe { obs.payloadStringValue() } {
         let s = payload.to_smolstr();
@@ -1368,10 +1427,11 @@ impl VisionAnalyzer {
         continue;
       };
       for object in objects.iter().take(opts.max_regions()) {
-        let confidence = unsafe { object.confidence() };
-        if confidence < opts.min_confidence() {
+        let Some(confidence) =
+          sanitize_confidence(unsafe { object.confidence() }, opts.min_confidence())
+        else {
           continue;
-        }
+        };
 
         let Some(bbox) = vision_bbox_to_schema(unsafe { object.boundingBox() }.standardize())
         else {
@@ -1390,10 +1450,12 @@ impl VisionAnalyzer {
     let Some(observation) = results.iter().next() else {
       return HorizonInfo::default();
     };
-    let confidence = unsafe { observation.confidence() };
-    if confidence < self.opts.horizon().min_confidence() {
+    let Some(confidence) = sanitize_confidence(
+      unsafe { observation.confidence() },
+      self.opts.horizon().min_confidence(),
+    ) else {
       return HorizonInfo::default();
-    }
+    };
 
     HorizonInfo::new(unsafe { observation.angle() } as f32, confidence)
   }
@@ -1410,10 +1472,11 @@ impl VisionAnalyzer {
         break;
       }
 
-      let confidence = unsafe { observation.confidence() };
-      if confidence < opts.min_confidence() {
+      let Some(confidence) =
+        sanitize_confidence(unsafe { observation.confidence() }, opts.min_confidence())
+      else {
         continue;
-      }
+      };
 
       // Vision's named corners ("topLeft" etc.) refer to image-space
       // orientation but use the framework's lower-left-origin coordinate
@@ -1677,6 +1740,15 @@ fn copy_instance_mask_buffer_locked(
   // against a Rust-managed slice with the usual bounds checks.
   let src = unsafe { std::slice::from_raw_parts(base_address, total_src_len) };
 
+  // The wire `Dimensions` stores `u32`. A mask whose width or height
+  // exceeds `u32::MAX` cannot be represented faithfully — we'd have
+  // to saturate the dimensions to a value smaller than the actual
+  // packed payload, which would silently desynchronise consumers
+  // that size buffers from the metadata. Reject overflow here so the
+  // detection is dropped rather than poisoning storage.
+  let dim_width = u32::try_from(width).ok()?;
+  let dim_height = u32::try_from(height).ok()?;
+
   let (bbox, packed) = match pixel_format {
     kCVPixelFormatType_OneComponent32Float => {
       process_mask_bytes_f32(width, height, bytes_per_row, src)?
@@ -1687,10 +1759,7 @@ fn copy_instance_mask_buffer_locked(
 
   Some((
     bbox,
-    Dimensions::new(
-      u16::try_from(width).unwrap_or(u16::MAX),
-      u16::try_from(height).unwrap_or(u16::MAX),
-    ),
+    Dimensions::new(dim_width, dim_height),
     Bytes::from(packed),
   ))
 }
