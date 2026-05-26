@@ -1121,6 +1121,17 @@ impl VisionAnalyzer {
       let handler = unsafe { VNSequenceRequestHandler::new() };
       self.requests.perform(&handler, &ns_data)?;
 
+      // Shared mask budget — both `extract_person_instance_masks`
+      // and `extract_person_segmentation_masks` charge against the
+      // SAME per-frame totals so the cumulative cap is enforced
+      // across both surfaces, not per-extractor (codex R14 F1).
+      let mut mask_total_bytes: usize = 0;
+      let mut mask_total_count: usize = 0;
+      let instance_masks =
+        self.extract_person_instance_masks(&mut mask_total_bytes, &mut mask_total_count);
+      let segmentation_masks =
+        self.extract_person_segmentation_masks(&mut mask_total_bytes, &mut mask_total_count);
+
       Ok(
         Keyframe::default()
           .with_id(keyframe_id)
@@ -1135,8 +1146,8 @@ impl VisionAnalyzer {
               .with_body_poses(self.extract_body_poses())
               .with_hand_poses(self.extract_hand_poses())
               .with_body_poses_3d(self.extract_body_poses_3d())
-              .with_instance_masks(self.extract_person_instance_masks())
-              .with_segmentation_masks(self.extract_person_segmentation_masks()),
+              .with_instance_masks(instance_masks)
+              .with_segmentation_masks(segmentation_masks),
           )
           .with_animals(
             AnimalAnalysis::new()
@@ -1327,8 +1338,14 @@ impl VisionAnalyzer {
       //   faceBBox.y + p.y * faceBBox.height)`.
       let face_rect_vision = unsafe { obs.boundingBox() }.standardize();
 
+      // Tentative budget — commit point-budget consumption ONLY
+      // after the detection survives every gate (region count +
+      // bbox conversion). A face dropped downstream must not
+      // consume the per-frame landmark budget and starve later
+      // valid faces (codex R14 F3).
+      let mut tentative_remaining = total_points_remaining;
       let regions =
-        extract_face_landmark_regions(&landmarks, face_rect_vision, &mut total_points_remaining);
+        extract_face_landmark_regions(&landmarks, face_rect_vision, &mut tentative_remaining);
       if regions.len() < opts.min_region_count() {
         continue;
       }
@@ -1336,6 +1353,8 @@ impl VisionAnalyzer {
       let Some(bbox) = vision_bbox_to_schema(face_rect_vision) else {
         continue;
       };
+      // Commit the budget — the detection is being pushed.
+      total_points_remaining = tentative_remaining;
       detections.push(FaceLandmarksDetection::new(bbox, confidence, regions));
     }
 
@@ -1619,21 +1638,23 @@ impl VisionAnalyzer {
     hand_poses
   }
 
-  fn extract_person_instance_masks(&self) -> Vec<PersonInstanceMaskDetection> {
+  fn extract_person_instance_masks(
+    &self,
+    total_mask_bytes: &mut usize,
+    total_mask_count: &mut usize,
+  ) -> Vec<PersonInstanceMaskDetection> {
     let Some(results) = (unsafe { self.requests.person_instance_mask.results() }) else {
       return Vec::new();
     };
     let opts = self.opts.person_instance_masks();
 
-    // Per-frame budgets — count AND cumulative payload bytes —
-    // bound the cross-observation × instance product so a corrupted
-    // results array can't emit 4096 × 64 = 256K mask detections
-    // even though each individual mask passes the per-mask cap.
-    let mut masks = Vec::with_capacity(MAX_TOTAL_MASKS_PER_FRAME);
-    let mut total_mask_bytes: usize = 0;
+    // Per-frame budgets — count AND cumulative payload bytes — are
+    // SHARED across both mask extractors via the caller's mutable
+    // counters, so the cap holds across the keyframe as a whole.
+    let mut masks = Vec::new();
     'outer: for observation in results.iter().take(MAX_VISION_RESULTS_PER_FRAME) {
-      if masks.len() >= MAX_TOTAL_MASKS_PER_FRAME
-        || total_mask_bytes >= MAX_TOTAL_MASK_BYTES_PER_FRAME
+      if *total_mask_count >= MAX_TOTAL_MASKS_PER_FRAME
+        || *total_mask_bytes >= MAX_TOTAL_MASK_BYTES_PER_FRAME
       {
         break;
       }
@@ -1645,22 +1666,35 @@ impl VisionAnalyzer {
 
       let instances = unsafe { observation.allInstances() };
       let mut instance_index = instances.firstIndex();
-      let mut emitted = 0usize;
-      // Effective inner cap: user-configured AND hard ceiling.
+      // Track ATTEMPTS (every iteration), not just successful
+      // emissions — otherwise a corrupted NSIndexSet whose entries
+      // all fail generation/copy/u32 conversion can drive unbounded
+      // traversal at full Vision-call cost per iteration
+      // (codex R14 F2).
+      let mut visited = 0usize;
       let inner_cap = opts
         .max_instances_per_observation()
         .min(MAX_NESTED_INSTANCES_PER_OBSERVATION);
       while instance_index != NSNotFound as usize {
-        if emitted >= inner_cap {
+        if visited >= inner_cap {
           break;
         }
+        visited += 1;
         // Per-frame budget check: stop the entire extraction once
         // either ceiling is reached, not just the inner loop.
-        if masks.len() >= MAX_TOTAL_MASKS_PER_FRAME
-          || total_mask_bytes >= MAX_TOTAL_MASK_BYTES_PER_FRAME
+        if *total_mask_count >= MAX_TOTAL_MASKS_PER_FRAME
+          || *total_mask_bytes >= MAX_TOTAL_MASK_BYTES_PER_FRAME
         {
           break 'outer;
         }
+
+        // Validate u32-fit of the instance index BEFORE generating
+        // or copying the mask — overflowing here would force a
+        // costly retry per-iteration; cheaper to skip up-front.
+        let Ok(wire_instance_index) = u32::try_from(instance_index) else {
+          instance_index = instances.indexGreaterThanIndex(instance_index);
+          continue;
+        };
 
         let selected_instances = NSIndexSet::indexSetWithIndex(instance_index);
         let Ok(mask_buffer) =
@@ -1673,7 +1707,7 @@ impl VisionAnalyzer {
         // Pre-allocation budget check: pass the remaining cumulative
         // budget into the copier so it rejects the mask BEFORE
         // allocating if the packed size would overshoot.
-        let remaining_budget = MAX_TOTAL_MASK_BYTES_PER_FRAME.saturating_sub(total_mask_bytes);
+        let remaining_budget = MAX_TOTAL_MASK_BYTES_PER_FRAME.saturating_sub(*total_mask_bytes);
         let Some((bbox, dimensions, data)) =
           copy_instance_mask_buffer(&mask_buffer, remaining_budget)
         else {
@@ -1681,15 +1715,8 @@ impl VisionAnalyzer {
           continue;
         };
 
-        // `instance_index` is a `usize` from `NSIndexSet`; the wire
-        // type stores `u32`. Saturating to `0` would silently merge
-        // distinct instances — reject and continue instead.
-        let Ok(wire_instance_index) = u32::try_from(instance_index) else {
-          instance_index = instances.indexGreaterThanIndex(instance_index);
-          continue;
-        };
-
-        total_mask_bytes = total_mask_bytes.saturating_add(data.len());
+        *total_mask_bytes = total_mask_bytes.saturating_add(data.len());
+        *total_mask_count = total_mask_count.saturating_add(1);
         masks.push(PersonInstanceMaskDetection::new(
           bbox,
           confidence,
@@ -1697,7 +1724,6 @@ impl VisionAnalyzer {
           dimensions,
           data,
         ));
-        emitted += 1;
 
         instance_index = instances.indexGreaterThanIndex(instance_index);
       }
@@ -1706,21 +1732,24 @@ impl VisionAnalyzer {
     masks
   }
 
-  fn extract_person_segmentation_masks(&self) -> Vec<PersonSegmentationMask> {
+  fn extract_person_segmentation_masks(
+    &self,
+    total_mask_bytes: &mut usize,
+    total_mask_count: &mut usize,
+  ) -> Vec<PersonSegmentationMask> {
     let Some(results) = (unsafe { self.requests.person_segmentation.results() }) else {
       return Vec::new();
     };
     let opts = self.opts.person_segmentation_masks();
 
-    // Per-frame budgets bound this extractor the same way as
-    // `extract_person_instance_masks`: a single saturated outer
-    // results array cannot push past MAX_TOTAL_MASKS_PER_FRAME or
-    // MAX_TOTAL_MASK_BYTES_PER_FRAME.
-    let mut masks = Vec::with_capacity(MAX_TOTAL_MASKS_PER_FRAME);
-    let mut total_mask_bytes: usize = 0;
+    // Shared per-frame mask budget — counters owned by the caller,
+    // also charged by `extract_person_instance_masks`. The cumulative
+    // cap holds across BOTH extractors, not per-extractor (codex
+    // R14 F1).
+    let mut masks = Vec::new();
     for observation in results.iter().take(MAX_VISION_RESULTS_PER_FRAME) {
-      if masks.len() >= MAX_TOTAL_MASKS_PER_FRAME
-        || total_mask_bytes >= MAX_TOTAL_MASK_BYTES_PER_FRAME
+      if *total_mask_count >= MAX_TOTAL_MASKS_PER_FRAME
+        || *total_mask_bytes >= MAX_TOTAL_MASK_BYTES_PER_FRAME
       {
         break;
       }
@@ -1733,14 +1762,15 @@ impl VisionAnalyzer {
       let pixel_buffer = unsafe { observation.pixelBuffer() };
       // Pre-allocation budget check: refuse the mask before alloc
       // if it would overshoot the per-frame cumulative budget.
-      let remaining_budget = MAX_TOTAL_MASK_BYTES_PER_FRAME.saturating_sub(total_mask_bytes);
+      let remaining_budget = MAX_TOTAL_MASK_BYTES_PER_FRAME.saturating_sub(*total_mask_bytes);
       let Some((bbox, dimensions, data)) =
         copy_instance_mask_buffer(&pixel_buffer, remaining_budget)
       else {
         continue;
       };
 
-      total_mask_bytes = total_mask_bytes.saturating_add(data.len());
+      *total_mask_bytes = total_mask_bytes.saturating_add(data.len());
+      *total_mask_count = total_mask_count.saturating_add(1);
       masks.push(PersonSegmentationMask::new(
         bbox, confidence, dimensions, data,
       ));
@@ -2280,16 +2310,24 @@ fn push_face_landmark_region(
     return;
   }
 
-  // Bound this region's slice to the per-frame remaining budget.
-  // The local raw-slice cap (MAX_LANDMARK_POINTS) bounds the slice
-  // length to satisfy from_raw_parts; the budget cap bounds the
-  // per-frame emission. Each point we successfully emit decrements
-  // the shared remaining counter; the next region (or next face)
-  // sees the reduced budget.
+  // Construct the unsafe slice to the CAPPED element count, not
+  // the FFI-reported point_count: when remaining < point_count,
+  // exposing the full slice to subsequent code would let
+  // from_raw_parts trust more elements than we'll read (codex
+  // R14 F4). The cap is `point_count.min(remaining_budget)` —
+  // already validated against MAX_LANDMARK_POINTS above.
   let region_cap = point_count.min(*total_points_remaining);
-  let points = unsafe { std::slice::from_raw_parts(points_ptr, point_count) };
+  if region_cap == 0 {
+    return;
+  }
+  // SAFETY: `points_ptr` points at `point_count` valid `CGPoint`s
+  // (Vision API contract). `region_cap <= point_count` and
+  // `region_cap <= MAX_LANDMARK_POINTS` (verified via
+  // `validate_raw_slice_elems::<CGPoint>` above), so the slice
+  // length fits both the FFI buffer and the `isize::MAX` contract.
+  let points = unsafe { std::slice::from_raw_parts(points_ptr, region_cap) };
   let mut emitted_points: Vec<FaceLandmarkPoint> = Vec::with_capacity(region_cap);
-  for point in points.iter().take(region_cap) {
+  for point in points.iter() {
     // Apple's convention: landmark points are normalized within the
     // face's normalized bbox (NOT the image). Project to image-
     // normalized Vision coordinates first, THEN route through
