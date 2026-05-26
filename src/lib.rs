@@ -260,9 +260,16 @@ const MAX_NESTED_INSTANCES_PER_OBSERVATION: usize = 64;
 #[cfg(target_os = "macos")]
 const MAX_NESTED_LABELS_PER_OBSERVATION: usize = 32;
 
-/// Hard ceiling on candidate strings per text-recognition observation.
+/// Hard ceiling on candidate strings per text-recognition
+/// observation. Apple's
+/// `VNRecognizedTextObservation::topCandidates(_:)` documents an
+/// upper limit of 10 — requesting more violates the Objective-C
+/// API contract and can surface as a framework exception or
+/// undefined behaviour across OS versions, so we clamp to 10 here
+/// even though realistic workloads ask for 1-3 candidates
+/// (codex R17 F3).
 #[cfg(target_os = "macos")]
-const MAX_TEXT_CANDIDATES_PER_OBSERVATION: usize = 16;
+const MAX_TEXT_CANDIDATES_PER_OBSERVATION: usize = 10;
 
 /// Hard ceiling on saliency regions per frame.
 #[cfg(target_os = "macos")]
@@ -292,12 +299,34 @@ const MAX_TOTAL_MASK_BYTES_PER_FRAME: usize = 256 * 1024 * 1024;
 /// `generateMaskForInstances_error` calls (each forcing Vision to
 /// compute/allocate a mask buffer) while the emission counters
 /// stay below their caps. The attempt budget bounds the
-/// failure-path work itself (codex R15). 4096 matches
-/// `MAX_VISION_RESULTS_PER_FRAME` — one attempt per outer
-/// observation on average, generous for any realistic workload
-/// while still defending the worker.
+/// failure-path work itself (codex R15 + R16).
+///
+/// Sized as `4 * MAX_TOTAL_MASKS_PER_FRAME` (= 1024): each emitted
+/// mask gets up to 3 failed sibling attempts before the budget
+/// trips, which leaves ample headroom for transient Vision
+/// failures while keeping the attempt cap tied to the emission
+/// cap rather than the much larger general results-array cap.
+/// Apple's mask APIs return a small number of masks per frame
+/// (low units for segmentation, typically <20 for instance masks),
+/// so 1024 attempts is conservative against realistic workloads
+/// while still defending against the corrupted-array case.
 #[cfg(target_os = "macos")]
-const MAX_TOTAL_MASK_ATTEMPTS_PER_FRAME: usize = 4096;
+const MAX_TOTAL_MASK_ATTEMPTS_PER_FRAME: usize = 4 * MAX_TOTAL_MASKS_PER_FRAME;
+
+/// Hard ceiling on the cumulative ATTEMPTED face-landmark points
+/// visited per frame across all detections × all 13 named regions.
+/// Symmetric with `MAX_TOTAL_MASK_ATTEMPTS_PER_FRAME`: a corrupted
+/// observation set where every region's points fail
+/// `vision_point_to_schema`'s finite check (or where the parent
+/// detection later fails the bbox / min_region_count gates) would
+/// otherwise let the helper walk up to
+/// `4096 * 13 * MAX_LANDMARK_POINTS` raw points without the
+/// per-frame emission budget ever decreasing. Sized as
+/// `4 * MAX_FACE_LANDMARK_POINTS_PER_FRAME` so a successful frame
+/// can tolerate non-finite/dropped points before the attempt cap
+/// trips (codex R17 F1).
+#[cfg(target_os = "macos")]
+const MAX_FACE_LANDMARK_ATTEMPTS_PER_FRAME: usize = 4 * MAX_FACE_LANDMARK_POINTS_PER_FRAME;
 
 /// Hard ceiling on the cumulative face-landmark points emitted per
 /// frame across all detections × all 13 named regions × all points.
@@ -1331,16 +1360,23 @@ impl VisionAnalyzer {
     let opts = self.opts.face_landmarks();
 
     let mut detections = Vec::with_capacity(results.len().min(MAX_VISION_RESULTS_PER_FRAME));
-    // Per-frame cumulative point budget — bounds the
-    // detection × region × point product against the worst-case
-    // (4096 × 13 × MAX_LANDMARK_POINTS) explosion codex R13
-    // surfaced. Threaded into `extract_face_landmark_regions`
-    // (and through to `push_face_landmark_region`); the helper
-    // stops appending points once the remaining budget is
-    // exhausted.
+    // Per-frame budgets:
+    // - `total_points_remaining` — emission budget; tentative-
+    //   committed (decremented in a shadow during region extraction
+    //   and applied to the master only when the detection survives
+    //   every gate).
+    // - `total_landmark_attempts` — attempt budget; immediately
+    //   committed every time `push_face_landmark_region` visits a
+    //   region's slice, regardless of whether the parent detection
+    //   ultimately survives. Bounds the FAILURE-PATH work that the
+    //   emission budget alone could not catch (codex R17 F1, same
+    //   policy as `MAX_TOTAL_MASK_ATTEMPTS_PER_FRAME`).
     let mut total_points_remaining: usize = MAX_FACE_LANDMARK_POINTS_PER_FRAME;
+    let mut total_landmark_attempts: usize = 0;
     for obs in results.iter().take(MAX_VISION_RESULTS_PER_FRAME) {
-      if total_points_remaining == 0 {
+      if total_points_remaining == 0
+        || total_landmark_attempts >= MAX_FACE_LANDMARK_ATTEMPTS_PER_FRAME
+      {
         break;
       }
       let Some(landmarks) = (unsafe { obs.landmarks() }) else {
@@ -1360,15 +1396,24 @@ impl VisionAnalyzer {
       // `(faceBBox.x + p.x * faceBBox.width,
       //   faceBBox.y + p.y * faceBBox.height)`.
       let face_rect_vision = unsafe { obs.boundingBox() }.standardize();
+      // Validate the face bbox BEFORE walking landmarks so an
+      // obviously-invalid observation does not spend the landmark
+      // attempt budget (codex R17 F1 sub-rec). Re-using the same
+      // schema-conversion guard the post-extraction commit uses.
+      if vision_bbox_to_schema(face_rect_vision).is_none() {
+        continue;
+      }
 
-      // Tentative budget — commit point-budget consumption ONLY
-      // after the detection survives every gate (region count +
-      // bbox conversion). A face dropped downstream must not
-      // consume the per-frame landmark budget and starve later
-      // valid faces (codex R14 F3).
+      // Tentative emission budget — commit point-budget consumption
+      // ONLY after the detection survives every gate. Attempt budget
+      // is committed immediately by the helper.
       let mut tentative_remaining = total_points_remaining;
-      let regions =
-        extract_face_landmark_regions(&landmarks, face_rect_vision, &mut tentative_remaining);
+      let regions = extract_face_landmark_regions(
+        &landmarks,
+        face_rect_vision,
+        &mut tentative_remaining,
+        &mut total_landmark_attempts,
+      );
       if regions.len() < opts.min_region_count() {
         continue;
       }
@@ -2285,6 +2330,7 @@ fn extract_face_landmark_regions(
   landmarks: &VNFaceLandmarks2D,
   face_bbox_vision: CGRect,
   total_points_remaining: &mut usize,
+  total_landmark_attempts: &mut usize,
 ) -> Vec<FaceLandmarkRegion> {
   let mut regions = Vec::new();
   for (name, region) in [
@@ -2302,7 +2348,9 @@ fn extract_face_landmark_regions(
     ("leftPupil", unsafe { landmarks.leftPupil() }),
     ("rightPupil", unsafe { landmarks.rightPupil() }),
   ] {
-    if *total_points_remaining == 0 {
+    if *total_points_remaining == 0
+      || *total_landmark_attempts >= MAX_FACE_LANDMARK_ATTEMPTS_PER_FRAME
+    {
       break;
     }
     push_face_landmark_region(
@@ -2311,6 +2359,7 @@ fn extract_face_landmark_regions(
       region,
       face_bbox_vision,
       total_points_remaining,
+      total_landmark_attempts,
     );
   }
   regions
@@ -2323,8 +2372,11 @@ fn push_face_landmark_region(
   region: Option<Retained<VNFaceLandmarkRegion2D>>,
   face_bbox_vision: CGRect,
   total_points_remaining: &mut usize,
+  total_landmark_attempts: &mut usize,
 ) {
-  if *total_points_remaining == 0 {
+  if *total_points_remaining == 0
+    || *total_landmark_attempts >= MAX_FACE_LANDMARK_ATTEMPTS_PER_FRAME
+  {
     return;
   }
   let Some(region) = region else {
@@ -2355,11 +2407,22 @@ fn push_face_landmark_region(
   // exposing the full slice to subsequent code would let
   // from_raw_parts trust more elements than we'll read (codex
   // R14 F4). The cap is `point_count.min(remaining_budget)` —
-  // already validated against MAX_LANDMARK_POINTS above.
-  let region_cap = point_count.min(*total_points_remaining);
+  // already validated against MAX_LANDMARK_POINTS above. Also
+  // bound by the remaining attempt budget so we never visit more
+  // points than the frame can afford to walk.
+  let attempts_remaining =
+    MAX_FACE_LANDMARK_ATTEMPTS_PER_FRAME.saturating_sub(*total_landmark_attempts);
+  let region_cap = point_count
+    .min(*total_points_remaining)
+    .min(attempts_remaining);
   if region_cap == 0 {
     return;
   }
+  // Charge the ATTEMPT budget for every point we're about to walk,
+  // up front and unconditionally. Whether the points later survive
+  // finite-checks or the parent detection survives its gates, the
+  // walk itself is bounded by this budget (codex R17 F1).
+  *total_landmark_attempts = total_landmark_attempts.saturating_add(region_cap);
   // SAFETY: `points_ptr` points at `point_count` valid `CGPoint`s
   // (Vision API contract). `region_cap <= point_count` and
   // `region_cap <= MAX_LANDMARK_POINTS` (verified via
