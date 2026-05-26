@@ -284,6 +284,21 @@ const MAX_TOTAL_MASKS_PER_FRAME: usize = 256;
 #[cfg(target_os = "macos")]
 const MAX_TOTAL_MASK_BYTES_PER_FRAME: usize = 256 * 1024 * 1024;
 
+/// Hard ceiling on the cumulative ATTEMPTED mask generations per
+/// frame, summed across both mask extractors. The emission-only
+/// counters (count, bytes) only increment after a successful copy
+/// and push; a corrupted Vision result whose generate-copy-u32-fit
+/// gates all fail would otherwise drive unbounded
+/// `generateMaskForInstances_error` calls (each forcing Vision to
+/// compute/allocate a mask buffer) while the emission counters
+/// stay below their caps. The attempt budget bounds the
+/// failure-path work itself (codex R15). 4096 matches
+/// `MAX_VISION_RESULTS_PER_FRAME` — one attempt per outer
+/// observation on average, generous for any realistic workload
+/// while still defending the worker.
+#[cfg(target_os = "macos")]
+const MAX_TOTAL_MASK_ATTEMPTS_PER_FRAME: usize = 4096;
+
 /// Hard ceiling on the cumulative face-landmark points emitted per
 /// frame across all detections × all 13 named regions × all points.
 /// Apple's typical output is at most a few faces × ~76 points each,
@@ -1121,16 +1136,24 @@ impl VisionAnalyzer {
       let handler = unsafe { VNSequenceRequestHandler::new() };
       self.requests.perform(&handler, &ns_data)?;
 
-      // Shared mask budget — both `extract_person_instance_masks`
+      // Shared mask budgets — both `extract_person_instance_masks`
       // and `extract_person_segmentation_masks` charge against the
-      // SAME per-frame totals so the cumulative cap is enforced
-      // across both surfaces, not per-extractor (codex R14 F1).
+      // SAME per-frame totals (count, bytes, AND attempts) so the
+      // cap is enforced across both surfaces and across both the
+      // success and failure paths (codex R14 F1 + R15).
       let mut mask_total_bytes: usize = 0;
       let mut mask_total_count: usize = 0;
-      let instance_masks =
-        self.extract_person_instance_masks(&mut mask_total_bytes, &mut mask_total_count);
-      let segmentation_masks =
-        self.extract_person_segmentation_masks(&mut mask_total_bytes, &mut mask_total_count);
+      let mut mask_total_attempts: usize = 0;
+      let instance_masks = self.extract_person_instance_masks(
+        &mut mask_total_bytes,
+        &mut mask_total_count,
+        &mut mask_total_attempts,
+      );
+      let segmentation_masks = self.extract_person_segmentation_masks(
+        &mut mask_total_bytes,
+        &mut mask_total_count,
+        &mut mask_total_attempts,
+      );
 
       Ok(
         Keyframe::default()
@@ -1642,6 +1665,7 @@ impl VisionAnalyzer {
     &self,
     total_mask_bytes: &mut usize,
     total_mask_count: &mut usize,
+    total_mask_attempts: &mut usize,
   ) -> Vec<PersonInstanceMaskDetection> {
     let Some(results) = (unsafe { self.requests.person_instance_mask.results() }) else {
       return Vec::new();
@@ -1681,9 +1705,11 @@ impl VisionAnalyzer {
         }
         visited += 1;
         // Per-frame budget check: stop the entire extraction once
-        // either ceiling is reached, not just the inner loop.
+        // any ceiling is reached (success-path counters OR the
+        // failure-path attempt counter from codex R15).
         if *total_mask_count >= MAX_TOTAL_MASKS_PER_FRAME
           || *total_mask_bytes >= MAX_TOTAL_MASK_BYTES_PER_FRAME
+          || *total_mask_attempts >= MAX_TOTAL_MASK_ATTEMPTS_PER_FRAME
         {
           break 'outer;
         }
@@ -1696,6 +1722,12 @@ impl VisionAnalyzer {
           continue;
         };
 
+        // Charge the per-frame attempt budget BEFORE the
+        // expensive Vision call. Even if generation fails (Apple
+        // returns Err), it still costs Vision time + intermediate
+        // alloc, so the failure path must be frame-budgeted
+        // (codex R15 F1).
+        *total_mask_attempts = total_mask_attempts.saturating_add(1);
         let selected_instances = NSIndexSet::indexSetWithIndex(instance_index);
         let Ok(mask_buffer) =
           (unsafe { observation.generateMaskForInstances_error(&selected_instances) })
@@ -1736,6 +1768,7 @@ impl VisionAnalyzer {
     &self,
     total_mask_bytes: &mut usize,
     total_mask_count: &mut usize,
+    total_mask_attempts: &mut usize,
   ) -> Vec<PersonSegmentationMask> {
     let Some(results) = (unsafe { self.requests.person_segmentation.results() }) else {
       return Vec::new();
@@ -1750,6 +1783,7 @@ impl VisionAnalyzer {
     for observation in results.iter().take(MAX_VISION_RESULTS_PER_FRAME) {
       if *total_mask_count >= MAX_TOTAL_MASKS_PER_FRAME
         || *total_mask_bytes >= MAX_TOTAL_MASK_BYTES_PER_FRAME
+        || *total_mask_attempts >= MAX_TOTAL_MASK_ATTEMPTS_PER_FRAME
       {
         break;
       }
@@ -1759,6 +1793,12 @@ impl VisionAnalyzer {
         continue;
       };
 
+      // Charge the per-frame attempt budget before pulling the
+      // pixel buffer and running the copy. Even a failing copy
+      // path costs FFI traversal + bounded alloc, so the failure
+      // path must be frame-budgeted (codex R15 F1, same policy as
+      // the instance-mask extractor).
+      *total_mask_attempts = total_mask_attempts.saturating_add(1);
       let pixel_buffer = unsafe { observation.pixelBuffer() };
       // Pre-allocation budget check: refuse the mask before alloc
       // if it would overshoot the per-frame cumulative budget.
