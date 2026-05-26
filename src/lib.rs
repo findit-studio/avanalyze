@@ -88,18 +88,24 @@ unsafe impl Encode for SimdFloat4x4 {
 
 // ----- Vision → mediaschema coordinate conversion ---------------------------
 
-/// Clamp a finite `f32` into `[0.0, 1.0]`. Non-finite inputs collapse to
-/// `0.0` — Vision occasionally yields `NaN` for off-image rectangles
-/// and mediaschema's `NormCoord` rejects non-finite values, so we
-/// sanitise rather than propagate.
+/// Clamp a finite `f32` into `[0.0, 1.0]`. Callers MUST filter
+/// non-finite inputs before invoking this helper — passing `NaN` /
+/// `±Inf` is a regression (collapsing them to `0.0` here previously
+/// fabricated edge-aligned coordinates that downstream validators
+/// accepted as real detections). The `debug_assert!` catches the
+/// regression in debug builds without changing release behaviour
+/// (`f32::clamp(0.0, 1.0)` on `NaN` returns `NaN`, and on `±Inf`
+/// returns the appropriate edge — both of which the domain
+/// `NormCoord::try_new` will reject downstream, so we still
+/// degrade safely rather than panicking).
 #[cfg(target_os = "macos")]
 #[inline]
 fn clamp01(value: f32) -> f32 {
-  if value.is_finite() {
-    value.clamp(0.0, 1.0)
-  } else {
-    0.0
-  }
+  debug_assert!(
+    value.is_finite(),
+    "clamp01 expects finite input; got {value}"
+  );
+  value.clamp(0.0, 1.0)
 }
 
 /// Convert a Vision-framework normalized bounding box (lower-left
@@ -130,6 +136,15 @@ fn vision_bbox_to_schema(rect: CGRect) -> Option<BoundingBox> {
   let raw_width = rect.size.width as f32;
   let raw_height = rect.size.height as f32;
 
+  // Front-load the non-finite check: any `NaN` / `±Inf` in the raw
+  // rectangle means the box is geometrically meaningless. Drop it
+  // instead of letting `clamp01` (which used to collapse non-finite
+  // to `0.0`) fabricate an edge-aligned rectangle that downstream
+  // validation would accept.
+  if !(raw_x.is_finite() && raw_y.is_finite() && raw_width.is_finite() && raw_height.is_finite()) {
+    return None;
+  }
+
   // Intersect with the unit square. Compute right/bottom in raw space,
   // then clamp the four edges so we never end up with `x + width > 1`.
   let left = clamp01(raw_x);
@@ -151,10 +166,24 @@ fn vision_bbox_to_schema(rect: CGRect) -> Option<BoundingBox> {
 /// `NormCoord` doc-comment in mediaschema). 3-D joints
 /// (`BodyPose3DJoint`) are model-space metres and are NOT flipped or
 /// clamped.
+///
+/// Returns `None` when either input coordinate is non-finite. A `NaN`
+/// or `±Inf` from a glitched Vision observation is geometrically
+/// meaningless and previously sanitised to `0.0` via `clamp01`, which
+/// fabricated edge-aligned coordinates indistinguishable from real
+/// detections. The caller decides whether a single bad point drops
+/// the entire detection (e.g. a document quad without all four
+/// corners) or just the offending point (e.g. one bad joint among
+/// many).
 #[cfg(target_os = "macos")]
 #[inline]
-fn vision_point_to_schema(x: f64, y: f64) -> (f32, f32) {
-  (clamp01(x as f32), clamp01((1.0 - y) as f32))
+fn vision_point_to_schema(x: f64, y: f64) -> Option<(f32, f32)> {
+  let x32 = x as f32;
+  let flipped_y = (1.0 - y) as f32;
+  if !x32.is_finite() || !flipped_y.is_finite() {
+    return None;
+  }
+  Some((clamp01(x32), clamp01(flipped_y)))
 }
 
 /// Derive an axis-aligned bounding box from the min/max of a pose's
@@ -994,8 +1023,13 @@ impl VisionAnalyzer {
 
         // Vision normalized points are lower-left origin; flip y for the
         // top-left schema convention before recording the joint or
-        // deriving the bbox.
-        let (x, y) = vision_point_to_schema(unsafe { point.x() }, unsafe { point.y() });
+        // deriving the bbox. A non-finite raw coordinate is dropped at
+        // the source — partial-joint lists are valid for body pose so
+        // we skip just this joint, not the whole pose.
+        let Some((x, y)) = vision_point_to_schema(unsafe { point.x() }, unsafe { point.y() })
+        else {
+          continue;
+        };
         let Some(confidence) = sanitize_confidence(
           unsafe { point.confidence() },
           self.opts.body_pose().min_joint_confidence(),
@@ -1128,8 +1162,13 @@ impl VisionAnalyzer {
         }
 
         // Vision normalized points are lower-left origin; flip y for
-        // the top-left schema convention.
-        let (x, y) = vision_point_to_schema(unsafe { point.x() }, unsafe { point.y() });
+        // the top-left schema convention. A non-finite raw coordinate
+        // is dropped at the source — partial-joint hand lists are
+        // valid so we skip only this joint.
+        let Some((x, y)) = vision_point_to_schema(unsafe { point.x() }, unsafe { point.y() })
+        else {
+          continue;
+        };
         let Some(confidence) = sanitize_confidence(
           unsafe { point.confidence() },
           self.opts.hand_pose().min_joint_confidence(),
@@ -1312,8 +1351,13 @@ impl VisionAnalyzer {
         }
 
         // Vision normalized points are lower-left origin; flip y for
-        // the top-left schema convention.
-        let (x, y) = vision_point_to_schema(unsafe { point.x() }, unsafe { point.y() });
+        // the top-left schema convention. A non-finite raw coordinate
+        // is dropped at the source — partial-joint animal-pose lists
+        // are valid so we skip only this joint.
+        let Some((x, y)) = vision_point_to_schema(unsafe { point.x() }, unsafe { point.y() })
+        else {
+          continue;
+        };
         let Some(confidence) = sanitize_confidence(
           unsafe { point.confidence() },
           self.opts.animal_pose().min_joint_confidence(),
@@ -1483,22 +1527,29 @@ impl VisionAnalyzer {
       // system, so each corner's `y` must be flipped to land in the
       // top-left schema convention. The naming still matches afterwards
       // (the corner with the smallest `y` is still the top edge).
-      let top_left = vision_point_to_schema(
-        unsafe { observation.topLeft() }.x,
-        unsafe { observation.topLeft() }.y,
-      );
-      let top_right = vision_point_to_schema(
-        unsafe { observation.topRight() }.x,
-        unsafe { observation.topRight() }.y,
-      );
-      let bottom_left = vision_point_to_schema(
-        unsafe { observation.bottomLeft() }.x,
-        unsafe { observation.bottomLeft() }.y,
-      );
-      let bottom_right = vision_point_to_schema(
-        unsafe { observation.bottomRight() }.x,
-        unsafe { observation.bottomRight() }.y,
-      );
+      // A non-finite corner means the quad is geometrically meaningless
+      // — drop the whole detection rather than fabricate edge-aligned
+      // corners that downstream validation would accept as real.
+      let (Some(top_left), Some(top_right), Some(bottom_left), Some(bottom_right)) = (
+        vision_point_to_schema(
+          unsafe { observation.topLeft() }.x,
+          unsafe { observation.topLeft() }.y,
+        ),
+        vision_point_to_schema(
+          unsafe { observation.topRight() }.x,
+          unsafe { observation.topRight() }.y,
+        ),
+        vision_point_to_schema(
+          unsafe { observation.bottomLeft() }.x,
+          unsafe { observation.bottomLeft() }.y,
+        ),
+        vision_point_to_schema(
+          unsafe { observation.bottomRight() }.x,
+          unsafe { observation.bottomRight() }.y,
+        ),
+      ) else {
+        continue;
+      };
 
       // Even after per-corner clamping, the resulting quad can be
       // degenerate (coincident corners, zero shoelace area, or
@@ -1654,11 +1705,13 @@ fn push_face_landmark_region(
   let points = unsafe { std::slice::from_raw_parts(points_ptr, point_count) };
   let points = points
     .iter()
-    .map(|point| {
+    .filter_map(|point| {
       // Vision normalized landmark points are lower-left origin; flip
-      // y for the top-left schema convention.
-      let (x, y) = vision_point_to_schema(point.x, point.y);
-      FaceLandmarkPoint::new(x, y)
+      // y for the top-left schema convention. A non-finite raw point
+      // is dropped at the source — partial-point landmark regions are
+      // still meaningful so we skip only the offending point.
+      let (x, y) = vision_point_to_schema(point.x, point.y)?;
+      Some(FaceLandmarkPoint::new(x, y))
     })
     .collect::<Vec<_>>();
   if points.is_empty() {
@@ -1684,6 +1737,14 @@ fn map_body_pose_3d_height_estimation(
 /// Copy a Vision mask `CVPixelBuffer` into a packed `Bytes` payload plus
 /// a normalized bounding box of the foreground.
 ///
+/// The returned payload is **always** 8 bits per pixel
+/// (`width * height` bytes); Vision's two supported source formats
+/// (`OneComponent32Float`, `OneComponent8`) are both normalised to
+/// canonical u8 at the boundary so downstream consumers don't have
+/// to disambiguate from the [`Dimensions`] metadata alone. f32 input
+/// is mapped `v` → `(v.clamp(0.0, 1.0) * 255.0).round() as u8` with
+/// non-finite values collapsing to `0` (background).
+///
 /// Returns `None` when the buffer is unlockable, has zero extent, a null
 /// base address, an unsupported pixel format, fails one of the
 /// stride/size sanity checks, or contains no foreground pixels (an
@@ -1700,6 +1761,20 @@ fn copy_instance_mask_buffer(
   copy_instance_mask_buffer_locked(guard.buffer())
 }
 
+/// Internal worker that runs the locked copy and assembles the wire
+/// payload. The caller is responsible for holding the
+/// [`CVPixelBufferLockGuard`].
+///
+/// The returned payload is **always** 8 bits per pixel
+/// (`width * height` bytes) regardless of the source pixel format.
+/// Vision can emit either `kCVPixelFormatType_OneComponent32Float`
+/// (4 bytes/pixel) or `kCVPixelFormatType_OneComponent8`
+/// (1 byte/pixel); both are normalised to the canonical u8 wire
+/// representation so downstream consumers don't have to disambiguate
+/// from the [`Dimensions`] metadata alone. The f32 → u8 quantisation
+/// is `(v.clamp(0.0, 1.0) * 255.0).round() as u8` with non-finite
+/// inputs collapsed to `0` (background); see
+/// [`process_mask_bytes_f32`] for the per-pixel logic.
 #[cfg(target_os = "macos")]
 #[allow(non_upper_case_globals)]
 fn copy_instance_mask_buffer_locked(
@@ -1764,13 +1839,18 @@ fn copy_instance_mask_buffer_locked(
   ))
 }
 
-/// Walk an `OneComponent32Float` mask, copy it tightly packed, and
-/// derive a normalized foreground bbox. Returns `None` for an
+/// Walk an `OneComponent32Float` mask, quantise each pixel to 8 bits,
+/// and derive a normalized foreground bbox. Returns `None` for an
 /// all-zero mask so the caller skips emitting a detection.
 ///
 /// The result is a `(bbox, packed_bytes)` pair where `packed_bytes`
-/// has length `width * height * size_of::<f32>()`. Bytes are
-/// little-endian per Vision's expected wire format.
+/// has length `width * height` — i.e. one **u8** per pixel, NOT four
+/// `f32` little-endian bytes. Vision emits f32 mask values in
+/// `[0.0, 1.0]`; we map `v` → `(v.clamp(0.0, 1.0) * 255.0).round() as
+/// u8`. Non-finite values (`NaN`, `±Inf`) collapse to `0`
+/// (background), matching Vision's documented "non-finite = no
+/// confidence in foreground" convention and keeping the wire payload
+/// canonically 8-bit per pixel across both source pixel formats.
 #[cfg(target_os = "macos")]
 fn process_mask_bytes_f32(
   width: usize,
@@ -1778,8 +1858,8 @@ fn process_mask_bytes_f32(
   bytes_per_row: usize,
   src: &[u8],
 ) -> Option<(BoundingBox, Vec<u8>)> {
-  let row_pixel_bytes = width.checked_mul(core::mem::size_of::<f32>())?;
-  let packed_len = row_pixel_bytes.checked_mul(height)?;
+  let src_row_pixel_bytes = width.checked_mul(core::mem::size_of::<f32>())?;
+  let packed_len = width.checked_mul(height)?;
   let mut packed = vec![0u8; packed_len];
 
   let mut min_x = usize::MAX;
@@ -1790,20 +1870,27 @@ fn process_mask_bytes_f32(
 
   for row in 0..height {
     let src_start = row.checked_mul(bytes_per_row)?;
-    let src_end = src_start.checked_add(row_pixel_bytes)?;
+    let src_end = src_start.checked_add(src_row_pixel_bytes)?;
     let src_row = src.get(src_start..src_end)?;
-    let dst_start = row.checked_mul(row_pixel_bytes)?;
-    let dst_end = dst_start.checked_add(row_pixel_bytes)?;
+    let dst_start = row.checked_mul(width)?;
+    let dst_end = dst_start.checked_add(width)?;
     let dst_row = packed.get_mut(dst_start..dst_end)?;
     for col in 0..width {
       let pixel_start = col.checked_mul(4)?;
       let pixel_end = pixel_start.checked_add(4)?;
       let bytes: [u8; 4] = src_row.get(pixel_start..pixel_end)?.try_into().ok()?;
       let value = f32::from_le_bytes(bytes);
-      dst_row
-        .get_mut(pixel_start..pixel_end)?
-        .copy_from_slice(&bytes);
-      if value > 0.0 {
+      // f32 mask in `[0.0, 1.0]` → u8 mask in `[0, 255]`. Non-finite
+      // values (`NaN`, `±Inf`) collapse to `0` (background) — Vision
+      // documents non-finite as "no confidence", which is the same
+      // semantic as background in the u8 representation.
+      let quantised: u8 = if value.is_finite() {
+        (value.clamp(0.0, 1.0) * 255.0).round() as u8
+      } else {
+        0
+      };
+      *dst_row.get_mut(col)? = quantised;
+      if quantised > 0 {
         has_foreground = true;
         min_x = min_x.min(col);
         min_y = min_y.min(row);
@@ -2085,7 +2172,7 @@ mod macos_tests {
   /// downstream validation accepts it.
   #[test]
   fn vision_point_to_schema_flips_y_only() {
-    let (x, y) = vision_point_to_schema(0.25, 0.75);
+    let (x, y) = vision_point_to_schema(0.25, 0.75).expect("finite point");
     assert!((x - 0.25).abs() < 1e-6);
     assert!((y - 0.25).abs() < 1e-6);
   }
@@ -2093,18 +2180,63 @@ mod macos_tests {
   /// Out-of-range Vision points clamp to `[0, 1]`.
   #[test]
   fn vision_point_to_schema_clamps_out_of_range() {
-    let (x, y) = vision_point_to_schema(1.2, -0.3);
+    let (x, y) = vision_point_to_schema(1.2, -0.3).expect("finite point");
     assert_eq!(x, 1.0);
     // `y = 1.0 - (-0.3) = 1.3` → clamped to 1.0.
     assert_eq!(y, 1.0);
   }
 
-  /// Non-finite Vision points sanitise to `0.0`.
+  /// Non-finite Vision points are rejected at the source: a `NaN`,
+  /// `+Inf`, or `-Inf` in either component returns `None` so the
+  /// caller can decide whether to drop the point or the whole
+  /// detection. Previously the helper collapsed the bad component to
+  /// `0.0` via `clamp01`, which fabricated edge-aligned coordinates
+  /// that the domain validator could not distinguish from real
+  /// detections.
   #[test]
-  fn vision_point_to_schema_sanitises_nan() {
-    let (x, y) = vision_point_to_schema(f64::NAN, 0.5);
-    assert_eq!(x, 0.0);
-    assert_eq!(y, 0.5);
+  fn vision_point_to_schema_rejects_non_finite() {
+    assert!(vision_point_to_schema(f64::NAN, 0.5).is_none());
+    assert!(vision_point_to_schema(0.5, f64::NAN).is_none());
+    assert!(vision_point_to_schema(f64::INFINITY, 0.5).is_none());
+    assert!(vision_point_to_schema(0.5, f64::INFINITY).is_none());
+    assert!(vision_point_to_schema(f64::NEG_INFINITY, 0.5).is_none());
+    assert!(vision_point_to_schema(0.5, f64::NEG_INFINITY).is_none());
+    // Finite path still works.
+    assert!(vision_point_to_schema(0.1, 0.2).is_some());
+  }
+
+  /// A document quad with even one non-finite corner must be dropped
+  /// in its entirety — a quad is geometrically meaningless without
+  /// all four corners. This test mirrors the per-detection pattern
+  /// the extractor uses (`let (Some(tl), Some(tr), Some(bl),
+  /// Some(br)) = (...) else { continue; }`): if any corner returns
+  /// `None`, the whole quad is rejected. Partial-corner emission
+  /// would be a regression.
+  #[test]
+  fn document_quad_with_non_finite_corner_is_dropped() {
+    // Three good corners + one NaN corner — overall the quad must
+    // be dropped. We exercise each corner position to confirm the
+    // "any None drops the whole quad" semantics.
+    let good = (0.1_f64, 0.1_f64);
+    let bad = (f64::NAN, 0.5_f64);
+
+    for (tl, tr, bl, br) in [
+      (bad, good, good, good),
+      (good, bad, good, good),
+      (good, good, bad, good),
+      (good, good, good, bad),
+    ] {
+      let result = (
+        vision_point_to_schema(tl.0, tl.1),
+        vision_point_to_schema(tr.0, tr.1),
+        vision_point_to_schema(bl.0, bl.1),
+        vision_point_to_schema(br.0, br.1),
+      );
+      assert!(
+        !matches!(result, (Some(_), Some(_), Some(_), Some(_))),
+        "quad with non-finite corner survived: {result:?}",
+      );
+    }
   }
 
   /// `normalized_bbox_from_pixel_bounds` must NOT flip the y axis —
@@ -2157,20 +2289,78 @@ mod macos_tests {
     assert_eq!(packed, src);
   }
 
-  /// A 32-fp mask with one foreground pixel must round-trip both the
-  /// bbox and the f32 little-endian payload.
+  /// A 32-fp mask with one foreground pixel quantises to a single u8
+  /// in the canonical 8-bit-per-pixel wire payload. `0.75 * 255 =
+  /// 191.25 → 191` after `round()`. The packed buffer is `width *
+  /// height` bytes, NOT `width * height * size_of::<f32>()`, since
+  /// the f32 source is normalised to u8 at the boundary.
   #[test]
   fn single_pixel_32fp_mask_round_trip() {
     let mut src = vec![0u8; 4 * 4 * 4];
     let value: f32 = 0.75;
     let bytes = value.to_le_bytes();
     // Row 1, column 2 — 4 bytes per pixel, 16 bytes per row.
-    let offset = 16 + 8;
-    src[offset..offset + 4].copy_from_slice(&bytes);
+    let src_offset = 16 + 8;
+    src[src_offset..src_offset + 4].copy_from_slice(&bytes);
     let (bbox, packed) = process_mask_bytes_f32(4, 4, 16, &src).expect("foreground produces Some");
     assert!((bbox.x - 0.5).abs() < 1e-6, "x: {}", bbox.x);
     assert!((bbox.y - 0.25).abs() < 1e-6, "y: {}", bbox.y);
-    assert_eq!(&packed[offset..offset + 4], &bytes);
+    // Canonical 8-bit payload: 4×4 = 16 bytes.
+    assert_eq!(packed.len(), 4 * 4);
+    // Row 1, column 2 — 4 bytes per row in the u8 output, so offset = 4 + 2.
+    let dst_offset = 4 + 2;
+    assert_eq!(packed[dst_offset], 191, "0.75 → 191 after u8 quantisation");
+    // Every other byte stays at 0 (background).
+    for (idx, &b) in packed.iter().enumerate() {
+      if idx != dst_offset {
+        assert_eq!(b, 0, "background pixel {idx} must be 0");
+      }
+    }
+  }
+
+  /// f32 mask values at the canonical interior {0.0, 0.5, 1.0} plus a
+  /// `NaN` background pixel must quantise to {0, 128, 255, 0} in the
+  /// u8 wire payload. Pins the brief's documented mapping.
+  #[test]
+  fn f32_mask_quantises_canonical_values_and_nan() {
+    // 4×1 row: [0.0, 0.5, 1.0, NaN].
+    let mut src = vec![0u8; 4 * 4];
+    src[0..4].copy_from_slice(&0.0_f32.to_le_bytes());
+    src[4..8].copy_from_slice(&0.5_f32.to_le_bytes());
+    src[8..12].copy_from_slice(&1.0_f32.to_le_bytes());
+    src[12..16].copy_from_slice(&f32::NAN.to_le_bytes());
+    let (_, packed) = process_mask_bytes_f32(4, 1, 16, &src).expect("foreground present");
+    assert_eq!(packed.len(), 4, "canonical 8-bit-per-pixel payload");
+    assert_eq!(packed[0], 0, "0.0 → 0");
+    // 0.5 * 255 = 127.5; `round()` ties-to-even on .5 in Rust uses
+    // banker's rounding... actually `f32::round()` is half-away-
+    // from-zero: 127.5 → 128.
+    assert_eq!(packed[1], 128, "0.5 → 128");
+    assert_eq!(packed[2], 255, "1.0 → 255");
+    assert_eq!(packed[3], 0, "NaN → 0 (background)");
+  }
+
+  /// f32 mask values outside `[0, 1]` (e.g. a glitched Vision frame
+  /// with negative or super-saturated mask probabilities) must clamp
+  /// to the endpoints in the u8 output rather than wrap or silently
+  /// produce garbage. `+Inf` and `-Inf` collapse to `0` (background)
+  /// like `NaN`.
+  #[test]
+  fn f32_mask_quantises_out_of_range_and_infinity() {
+    // 4×1 row: [-0.5, 1.5, +Inf, -Inf].
+    let mut src = vec![0u8; 4 * 4];
+    src[0..4].copy_from_slice(&(-0.5_f32).to_le_bytes());
+    src[4..8].copy_from_slice(&1.5_f32.to_le_bytes());
+    src[8..12].copy_from_slice(&f32::INFINITY.to_le_bytes());
+    src[12..16].copy_from_slice(&f32::NEG_INFINITY.to_le_bytes());
+    // Foreground = packed[1] (1.5 clamps to 255). The rest collapse
+    // to 0 (background), so the mask is technically a single-pixel
+    // foreground at column 1.
+    let (_, packed) = process_mask_bytes_f32(4, 1, 16, &src).expect("foreground at col 1");
+    assert_eq!(packed[0], 0, "-0.5 clamps to 0");
+    assert_eq!(packed[1], 255, "1.5 clamps to 255");
+    assert_eq!(packed[2], 0, "+Inf → 0 (background)");
+    assert_eq!(packed[3], 0, "-Inf → 0 (background)");
   }
 
   /// A stride wider than `width * bytes_per_pixel` (the buffer has
