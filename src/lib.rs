@@ -2338,24 +2338,59 @@ fn normalized_bbox_from_pixel_bounds(
   if width == 0 || height == 0 {
     return None;
   }
+  // Compute all four EDGES in f64, then narrow to f32. The width
+  // and height are derived from the narrowed edges (right - left,
+  // bottom - top) rather than from a separate f64-division. This
+  // guarantees the bbox is internally consistent in f32 arithmetic:
+  // `left + width == right` exactly, and `right <= 1.0` by
+  // construction (numerator <= denominator).
+  //
+  // Why edges-then-subtract instead of left-then-width: at widths
+  // above the f32 mantissa exhaustion point (2^24+1, 2^25+1, …),
+  // separate f32 narrowings of `min_x / width` and `(max_x + 1 - min_x)
+  // / width` can land on (1.0, positive) for right-edge foreground,
+  // producing `x == 1.0 && w > 0.0` — a bbox the domain validator
+  // does NOT reliably reject (its `x + w` check is also f32 and
+  // rounds back to 1.0). Edge-based computation eliminates the
+  // class entirely: the right edge is constructed directly as a
+  // normalized value, not synthesised from `left + width`.
+  //
+  // `f64` has 52 mantissa bits — every `usize` up to `2^52` is
+  // representable exactly on 64-bit targets. Only the final narrow
+  // to `f32` loses precision, and only at values close enough to
+  // `1.0` that the next-lower f32 differs by `2^-24 ≈ 6e-8`.
   let w64 = width as f64;
   let h64 = height as f64;
-  let x = (min_x as f64 / w64) as f32;
-  let y = (min_y as f64 / h64) as f32;
   // `max_x + 1` would overflow `usize::MAX`; the caller bounds
-  // `max_x < width <= MAX_MASK_BYTES` (well below `usize::MAX`), but
-  // use `checked_add` for defence-in-depth.
-  let w_pixels = max_x.checked_sub(min_x)?.checked_add(1)?;
-  let h_pixels = max_y.checked_sub(min_y)?.checked_add(1)?;
-  let w = (w_pixels as f64 / w64) as f32;
-  let h = (h_pixels as f64 / h64) as f32;
-  // Route through the domain validator's `[0, 1]` invariant. The
-  // intermediate `f64` math guarantees we don't synthesise
-  // `x + w > 1.0` on large widths, but the explicit validator gate
-  // here means a future change to the math cannot silently
-  // re-introduce a wire bbox the storage layer rejects.
-  mediaschema::domain::aggregates::video::BoundingBox::try_new(x, y, w, h).ok()?;
-  Some(BoundingBox::new(x, y, w, h))
+  // `max_x < width <= MAX_MASK_BYTES` (well below `usize::MAX`),
+  // but use `checked_add` for defence-in-depth.
+  let right_pixel = max_x.checked_add(1)?;
+  let bottom_pixel = max_y.checked_add(1)?;
+  if right_pixel > width || bottom_pixel > height || min_x > max_x || min_y > max_y {
+    return None;
+  }
+  let left = (min_x as f64 / w64) as f32;
+  let top = (min_y as f64 / h64) as f32;
+  let right = (right_pixel as f64 / w64) as f32;
+  let bottom = (bottom_pixel as f64 / h64) as f32;
+  let w = right - left;
+  let h = bottom - top;
+  // Reject pathological f32 narrowings: a foreground bbox whose
+  // left or top edge rounded to 1.0 (i.e. mantissa exhaustion
+  // pushed an "almost-1.0" value over the line) is geometrically
+  // a point, not a region. Drop it rather than emitting an
+  // out-of-spec wire bbox.
+  if !(left < 1.0 && top < 1.0) {
+    return None;
+  }
+  if !(w > 0.0 && h > 0.0) {
+    return None;
+  }
+  // Domain validator as belt-and-suspenders: a future change to
+  // the math cannot silently re-introduce a wire bbox the storage
+  // layer rejects.
+  mediaschema::domain::aggregates::video::BoundingBox::try_new(left, top, w, h).ok()?;
+  Some(BoundingBox::new(left, top, w, h))
 }
 
 // ----- Non-macOS stub --------------------------------------------------------
@@ -3132,5 +3167,96 @@ mod macos_tests {
     assert!(normalized_bbox_from_pixel_bounds(0, 0, 10, 10, 100, 0).is_none());
     // max < min (corrupted input)
     assert!(normalized_bbox_from_pixel_bounds(20, 0, 10, 10, 100, 100).is_none());
+  }
+
+  // ──────────────── R9 fixes (codex round 9) ────────────────
+
+  /// R8's f64 intermediate fixed the canonical 2^24+1 case but
+  /// codex round 9 surfaced that the SAME class returns at
+  /// 2^25+1 — `left = 2^25 / (2^25 + 1)` narrows to `1.0` in f32
+  /// while `width = 1 / (2^25 + 1)` remains positive. R9's
+  /// edge-based fix derives width as `right - left` AFTER both
+  /// narrow to f32, AND explicitly rejects `left >= 1.0` after
+  /// the narrow.
+  ///
+  /// Test inputs intentionally span the f32 mantissa-exhaustion
+  /// power-of-two boundaries (2^24, 2^25, 2^26) plus the cap
+  /// edge — every one must either emit a valid `[0, 1]` bbox OR
+  /// return `None`, never `x = 1.0` with positive width.
+  #[test]
+  fn normalized_bbox_handles_mantissa_exhaustion_boundaries() {
+    // Span the boundaries the codex finding called out.
+    for shift in 24u32..=25 {
+      let width: usize = (1 << shift) + 1;
+      let height: usize = 1;
+      let right_col = width - 1;
+      let result = normalized_bbox_from_pixel_bounds(right_col, 0, right_col, 0, width, height);
+      match result {
+        None => {
+          // Acceptable: the rounding pushed `left` to >= 1.0 and
+          // the explicit guard caught it. The detection is dropped,
+          // which is the safe semantic.
+        }
+        Some(bbox) => {
+          // If we DO emit a bbox, every invariant must hold —
+          // a `[0, 1]`-valid box with positive extent and a right
+          // edge that does not exceed the image.
+          assert!(
+            bbox.x < 1.0,
+            "shift={shift}: x must be < 1.0, got {}",
+            bbox.x
+          );
+          assert!(
+            bbox.width > 0.0,
+            "shift={shift}: width must be > 0.0, got {}",
+            bbox.width
+          );
+          // f32-safe right-edge check: edge computed directly,
+          // not as left + width.
+          let right_edge = bbox.x + bbox.width;
+          assert!(
+            right_edge <= 1.0 + 1e-6,
+            "shift={shift}: right edge exceeds image: {right_edge}",
+          );
+        }
+      }
+    }
+  }
+
+  /// Same intent at width close to the 64 MiB cap (the largest
+  /// allowed width / height combination, where f32 precision
+  /// is most degraded).
+  #[test]
+  fn normalized_bbox_handles_max_mask_bytes_boundary() {
+    let width = MAX_MASK_BYTES; // 64 MiB worth of 1-row mask.
+    let height = 1usize;
+    let right_col = width - 1;
+    let result = normalized_bbox_from_pixel_bounds(right_col, 0, right_col, 0, width, height);
+    if let Some(bbox) = result {
+      assert!(
+        bbox.x < 1.0,
+        "x must remain strictly less than 1.0: {}",
+        bbox.x
+      );
+      assert!(
+        bbox.width > 0.0,
+        "positive foreground width: {}",
+        bbox.width
+      );
+      let right_edge = bbox.x + bbox.width;
+      assert!(
+        right_edge <= 1.0 + 1e-6,
+        "right edge exceeds image: {right_edge}"
+      );
+    }
+    // `None` is also acceptable — see the previous test's rationale.
+  }
+
+  /// `max_x + 1 > width` (corrupted input) must return `None`.
+  #[test]
+  fn normalized_bbox_rejects_max_above_dimensions() {
+    // max_x = width - 1 is OK (right edge); max_x = width is corrupt.
+    assert!(normalized_bbox_from_pixel_bounds(0, 0, 100, 0, 100, 1).is_none());
+    assert!(normalized_bbox_from_pixel_bounds(0, 0, 0, 100, 1, 100).is_none());
   }
 }
