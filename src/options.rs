@@ -3,7 +3,6 @@
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-
 macro_rules! default_options {
   ($($name:ident),+$(,)?) => {
     $(

@@ -40,8 +40,10 @@ objc2-foundation = { version = "0.3", features = ["NSArray", "NSString", "NSData
 objc2-core-video = { version = "0.3", features = ["CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVReturn"] }
 objc2-vision = { version = "0.3", features = [
   "objc2-core-foundation",
+  "objc2-core-video",
   "alloc",
   "VNRequest", "VNRequestHandler", "VNObservation",
+  "VNStatefulRequest",
   "VNClassifyImageRequest",
   "VNDetectFaceRectanglesRequest",
   "VNDetectFaceLandmarksRequest",
@@ -49,8 +51,10 @@ objc2-vision = { version = "0.3", features = [
   "VNDetectFaceCaptureQualityRequest",
   "VNDetectHumanRectanglesRequest",
   "VNRecognizeAnimalsRequest",
+  "VNDetectAnimalBodyPoseRequest",
   "VNDetectHumanBodyPoseRequest",
   "VNDetectHumanBodyPose3DRequest",
+  "VNDetectHumanHandPoseRequest",
   "VNGeneratePersonInstanceMaskRequest",
   "VNGeneratePersonSegmentationRequest",
   "VNGeometry", "VNRecognizedPoint3D", "VNHumanBodyRecognizedPoint3D",

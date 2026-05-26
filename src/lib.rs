@@ -16,14 +16,13 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use bytes::Bytes;
-use mediaschema::domain::ErrorCode;
 use mediaschema::{
   Aesthetics, AnimalAnalysis, BarcodeDetection, BodyPose3DDetection, BodyPose3DHeightEstimation,
   BodyPose3DJoint, BodyPoseDetection, BodyPoseJoint, BoundingBox, ClassificationDetection,
   Dimensions, DocumentSegment, ErrorInfo, FaceDetection, FaceLandmarkPoint, FaceLandmarkRegion,
   FaceLandmarksDetection, FeaturePrint, HandChirality, HandPoseDetection, HorizonInfo,
   HumanAnalysis, Id, Keyframe, PersonInstanceMaskDetection, PersonSegmentationMask, SaliencyRegion,
-  SubjectDetection, TextDetection,
+  SubjectDetection, TextDetection, domain::ErrorCode,
 };
 
 use wire_ext::*;
@@ -34,8 +33,9 @@ use objc2::{
   encode::{Encode, Encoding},
   rc::Retained,
 };
+use objc2_core_foundation::CGRect;
 use objc2_core_video::{
-  CVPixelBufferGetBaseAddress, CVPixelBufferGetBytesPerRow, CVPixelBufferGetHeight,
+  CVPixelBuffer, CVPixelBufferGetBaseAddress, CVPixelBufferGetBytesPerRow, CVPixelBufferGetHeight,
   CVPixelBufferGetPixelFormatType, CVPixelBufferGetWidth, CVPixelBufferLockBaseAddress,
   CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress, kCVPixelFormatType_OneComponent8,
   kCVPixelFormatType_OneComponent32Float, kCVReturnSuccess,
@@ -67,6 +67,84 @@ unsafe impl Encode for SimdFloat4x4 {
   // Clang reports @encode(simd_float4x4) as "{?=[4]}" because the vector element
   // encoding is intentionally opaque.
   const ENCODING: Encoding = Encoding::Struct("?", &[Encoding::Array(4, &Encoding::Unknown)]);
+}
+
+// ----- Vision → mediaschema coordinate conversion ---------------------------
+
+/// Convert a Vision-framework normalized bounding box (lower-left origin,
+/// y grows up) into the mediaschema convention (top-left origin, y grows
+/// down). The schema documents `apple-vision convention: floats in
+/// [0.0, 1.0], origin top-left` (see `mediaschema::domain ... NormCoord`),
+/// while `VNObservation::boundingBox` is documented as a normalized rect
+/// in image coordinates where (0,0) is the lower-left corner.
+///
+/// Vision passes its rect through `standardize()` so the size is positive;
+/// the lower edge of the box in Vision space is `origin.y`, and the upper
+/// edge is `origin.y + size.height`. In schema space the upper edge maps
+/// to `1.0 - (origin.y + size.height)` (the new top y), and width/height
+/// are preserved.
+#[inline]
+fn vision_bbox_to_schema(rect: CGRect) -> BoundingBox {
+  let x = rect.origin.x as f32;
+  let y = (1.0 - (rect.origin.y + rect.size.height)) as f32;
+  let width = rect.size.width as f32;
+  let height = rect.size.height as f32;
+  BoundingBox::new(x, y, width, height)
+}
+
+/// Flip a Vision normalized point's y axis to match mediaschema's top-left
+/// origin. `BoundingBox`, `Point2D`, `BodyPoseJoint` (2-D), `FaceLandmarkPoint`,
+/// and `DocumentSegment` corners all share the top-left convention (see
+/// `NormCoord` doc-comment in mediaschema). 3-D joints (`BodyPose3DJoint`)
+/// are model-space metres and are NOT flipped.
+#[inline]
+fn vision_point_to_schema(x: f64, y: f64) -> (f32, f32) {
+  (x as f32, (1.0 - y) as f32)
+}
+
+// ----- CVPixelBuffer RAII lock ----------------------------------------------
+
+/// RAII guard that holds a `CVPixelBufferLockBaseAddress` lock for the
+/// lifetime of the guard. `Drop` unlocks even on panic-unwind so the
+/// buffer cannot be left in a locked state by a panicking slice index.
+struct CVPixelBufferLockGuard<'a> {
+  buffer: &'a CVPixelBuffer,
+  flags: CVPixelBufferLockFlags,
+}
+
+impl<'a> CVPixelBufferLockGuard<'a> {
+  /// Acquire a lock on `buffer` with `flags`. Returns `None` if Core
+  /// Video refused the lock; on success the guard's `Drop` is
+  /// responsible for releasing it.
+  #[inline]
+  fn lock(buffer: &'a CVPixelBuffer, flags: CVPixelBufferLockFlags) -> Option<Self> {
+    // SAFETY: `buffer` is a valid `CVPixelBuffer`; `flags` is a valid
+    // `CVPixelBufferLockFlags`. The function is documented as safe to
+    // call from any thread.
+    let rc = unsafe { CVPixelBufferLockBaseAddress(buffer, flags) };
+    if rc == kCVReturnSuccess {
+      Some(Self { buffer, flags })
+    } else {
+      None
+    }
+  }
+
+  /// Borrow the locked buffer.
+  #[inline]
+  fn buffer(&self) -> &CVPixelBuffer {
+    self.buffer
+  }
+}
+
+impl Drop for CVPixelBufferLockGuard<'_> {
+  fn drop(&mut self) {
+    // SAFETY: the corresponding lock was acquired successfully in
+    // `lock`; calling unlock with matching flags is required by Core
+    // Video. We ignore the return code — even if unlock fails, the
+    // buffer is going away with us and there's nothing the caller can
+    // do about it.
+    let _ = unsafe { CVPixelBufferUnlockBaseAddress(self.buffer, self.flags) };
+  }
 }
 
 // #[derive(Debug, Clone, Copy)]
@@ -349,14 +427,23 @@ unsafe impl Encode for SimdFloat4x4 {
 //   reply(Reply::new(scene_id, results, errors));
 // }
 
-/// Apple vision analyzer
-#[derive(Debug, Clone)]
+/// Apple Vision analyzer — one per worker thread.
+///
+/// Construct one [`VisionAnalyzer`] per worker thread via
+/// [`VisionAnalyzer::new`]. The analyzer owns retained `VNRequest`
+/// Objective-C objects that carry per-call state across
+/// `performRequests` / `results()`, so they are *not* safe to share
+/// across threads or clone. The upcoming service-framework layer
+/// constructs one fresh analyzer per worker rather than cloning a
+/// single shared instance — `Clone` is intentionally not implemented to
+/// make that contract a compile-time error.
+#[derive(Debug)]
 pub struct VisionAnalyzer {
   opts: ServiceOptions,
   requests: VisionRequests,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct VisionRequests {
   classify: Retained<VNClassifyImageRequest>,
   face_rectangles: Retained<VNDetectFaceRectanglesRequest>,
@@ -659,12 +746,7 @@ impl VisionAnalyzer {
 
       faces.push(
         FaceDetection::default()
-          .with_bbox(BoundingBox::new(
-            bbox.origin.x as f32,
-            bbox.origin.y as f32,
-            bbox.size.width as f32,
-            bbox.size.height as f32,
-          ))
+          .with_bbox(vision_bbox_to_schema(bbox))
           .with_confidence(confidence)
           .with_capture_quality(capture_quality)
           .with_roll(unsafe { obs.roll() }.map(|v| v.floatValue()).unwrap_or(0.0))
@@ -696,12 +778,7 @@ impl VisionAnalyzer {
       let bbox = unsafe { obs.boundingBox() }.standardize();
       faces.push(
         FaceDetection::default()
-          .with_bbox(BoundingBox::new(
-            bbox.origin.x as f32,
-            bbox.origin.y as f32,
-            bbox.size.width as f32,
-            bbox.size.height as f32,
-          ))
+          .with_bbox(vision_bbox_to_schema(bbox))
           .with_confidence(confidence)
           .with_roll(unsafe { obs.roll() }.map(|v| v.floatValue()).unwrap_or(0.0))
           .with_yaw(unsafe { obs.yaw() }.map(|v| v.floatValue()).unwrap_or(0.0))
@@ -739,12 +816,7 @@ impl VisionAnalyzer {
 
       let bbox = unsafe { obs.boundingBox() }.standardize();
       detections.push(FaceLandmarksDetection::new(
-        BoundingBox::new(
-          bbox.origin.x as f32,
-          bbox.origin.y as f32,
-          bbox.size.width as f32,
-          bbox.size.height as f32,
-        ),
+        vision_bbox_to_schema(bbox),
         confidence,
         regions,
       ));
@@ -770,12 +842,7 @@ impl VisionAnalyzer {
       humans.push(SubjectDetection::new(
         SmolStr::from("person"),
         confidence,
-        BoundingBox::new(
-          bbox.origin.x as f32,
-          bbox.origin.y as f32,
-          bbox.size.width as f32,
-          bbox.size.height as f32,
-        ),
+        vision_bbox_to_schema(bbox),
       ));
     }
 
@@ -808,8 +875,10 @@ impl VisionAnalyzer {
           continue;
         }
 
-        let x = unsafe { point.x() } as f32;
-        let y = unsafe { point.y() } as f32;
+        // Vision normalized points are lower-left origin; flip y for the
+        // top-left schema convention before recording the joint or
+        // deriving the bbox.
+        let (x, y) = vision_point_to_schema(unsafe { point.x() }, unsafe { point.y() });
         let confidence = unsafe { point.confidence() };
         if confidence < self.opts.body_pose().min_joint_confidence() {
           continue;
@@ -935,8 +1004,9 @@ impl VisionAnalyzer {
           continue;
         }
 
-        let x = unsafe { point.x() } as f32;
-        let y = unsafe { point.y() } as f32;
+        // Vision normalized points are lower-left origin; flip y for
+        // the top-left schema convention.
+        let (x, y) = vision_point_to_schema(unsafe { point.x() }, unsafe { point.y() });
         let confidence = unsafe { point.confidence() };
         if confidence < self.opts.hand_pose().min_joint_confidence() {
           continue;
@@ -1072,12 +1142,7 @@ impl VisionAnalyzer {
               animals.push(SubjectDetection::new(
                 id,
                 confidence,
-                BoundingBox::new(
-                  bbox.origin.x as f32,
-                  bbox.origin.y as f32,
-                  bbox.size.width as f32,
-                  bbox.size.height as f32,
-                ),
+                vision_bbox_to_schema(bbox),
               ));
             }
           }
@@ -1117,8 +1182,9 @@ impl VisionAnalyzer {
           continue;
         }
 
-        let x = unsafe { point.x() } as f32;
-        let y = unsafe { point.y() } as f32;
+        // Vision normalized points are lower-left origin; flip y for
+        // the top-left schema convention.
+        let (x, y) = vision_point_to_schema(unsafe { point.x() }, unsafe { point.y() });
         let confidence = unsafe { point.confidence() };
         if confidence < self.opts.animal_pose().min_joint_confidence() {
           continue;
@@ -1174,12 +1240,7 @@ impl VisionAnalyzer {
           text_detections.push(TextDetection::new(
             text,
             candidate.confidence(),
-            BoundingBox::new(
-              bbox.origin.x as f32,
-              bbox.origin.y as f32,
-              bbox.size.width as f32,
-              bbox.size.height as f32,
-            ),
+            vision_bbox_to_schema(bbox),
           ));
         }
       }
@@ -1209,12 +1270,7 @@ impl VisionAnalyzer {
             s,
             symbology,
             confidence,
-            BoundingBox::new(
-              bbox.origin.x as f32,
-              bbox.origin.y as f32,
-              bbox.size.width as f32,
-              bbox.size.height as f32,
-            ),
+            vision_bbox_to_schema(bbox),
           ));
         }
       }
@@ -1257,15 +1313,7 @@ impl VisionAnalyzer {
         }
 
         let bbox = unsafe { object.boundingBox() }.standardize();
-        regions.push(SaliencyRegion::new(
-          BoundingBox::new(
-            bbox.origin.x as f32,
-            bbox.origin.y as f32,
-            bbox.size.width as f32,
-            bbox.size.height as f32,
-          ),
-          confidence,
-        ));
+        regions.push(SaliencyRegion::new(vision_bbox_to_schema(bbox), confidence));
       }
     }
     regions
@@ -1303,6 +1351,11 @@ impl VisionAnalyzer {
         continue;
       }
 
+      // Vision's named corners ("topLeft" etc.) refer to image-space
+      // orientation but use the framework's lower-left-origin coordinate
+      // system, so each corner's `y` must be flipped to land in the
+      // top-left schema convention. The naming still matches afterwards
+      // (the corner with the smallest `y` is still the top edge).
       let top_left = unsafe { observation.topLeft() };
       let top_right = unsafe { observation.topRight() };
       let bottom_left = unsafe { observation.bottomLeft() };
@@ -1310,10 +1363,10 @@ impl VisionAnalyzer {
 
       segments.push(
         DocumentSegment::default()
-          .with_top_left((top_left.x as f32, top_left.y as f32))
-          .with_top_right((top_right.x as f32, top_right.y as f32))
-          .with_bottom_left((bottom_left.x as f32, bottom_left.y as f32))
-          .with_bottom_right((bottom_right.x as f32, bottom_right.y as f32))
+          .with_top_left(vision_point_to_schema(top_left.x, top_left.y))
+          .with_top_right(vision_point_to_schema(top_right.x, top_right.y))
+          .with_bottom_left(vision_point_to_schema(bottom_left.x, bottom_left.y))
+          .with_bottom_right(vision_point_to_schema(bottom_right.x, bottom_right.y))
           .with_confidence(confidence),
       );
     }
@@ -1437,7 +1490,12 @@ fn push_face_landmark_region(
   let points = unsafe { std::slice::from_raw_parts(points_ptr, point_count) };
   let points = points
     .iter()
-    .map(|point| FaceLandmarkPoint::new(point.x as f32, point.y as f32))
+    .map(|point| {
+      // Vision normalized landmark points are lower-left origin; flip
+      // y for the top-left schema convention.
+      let (x, y) = vision_point_to_schema(point.x, point.y);
+      FaceLandmarkPoint::new(x, y)
+    })
     .collect::<Vec<_>>();
   if points.is_empty() {
     return;
@@ -1458,22 +1516,24 @@ fn map_body_pose_3d_height_estimation(
   }
 }
 
+/// Copy a Vision mask `CVPixelBuffer` into a packed `Bytes` payload plus
+/// a normalized bounding box of the foreground.
+///
+/// Returns `None` when the buffer is unlockable, has zero extent, a null
+/// base address, an unsupported pixel format, or fails one of the stride
+/// /size sanity checks. The lock is held via [`CVPixelBufferLockGuard`]
+/// for the duration of the copy and is released by `Drop` on every exit
+/// path — including a panic — so the buffer cannot be left locked.
 fn copy_instance_mask_buffer(
-  pixel_buffer: &objc2_core_video::CVPixelBuffer,
+  pixel_buffer: &CVPixelBuffer,
 ) -> Option<(BoundingBox, Dimensions, Bytes)> {
-  let lock_flags = CVPixelBufferLockFlags::ReadOnly;
-  if unsafe { CVPixelBufferLockBaseAddress(pixel_buffer, lock_flags) } != kCVReturnSuccess {
-    return None;
-  }
-
-  let result = copy_instance_mask_buffer_locked(pixel_buffer);
-  let _ = unsafe { CVPixelBufferUnlockBaseAddress(pixel_buffer, lock_flags) };
-  result
+  let guard = CVPixelBufferLockGuard::lock(pixel_buffer, CVPixelBufferLockFlags::ReadOnly)?;
+  copy_instance_mask_buffer_locked(guard.buffer())
 }
 
 #[allow(non_upper_case_globals)]
 fn copy_instance_mask_buffer_locked(
-  pixel_buffer: &objc2_core_video::CVPixelBuffer,
+  pixel_buffer: &CVPixelBuffer,
 ) -> Option<(BoundingBox, Dimensions, Bytes)> {
   let width = CVPixelBufferGetWidth(pixel_buffer);
   let height = CVPixelBufferGetHeight(pixel_buffer);
@@ -1488,9 +1548,24 @@ fn copy_instance_mask_buffer_locked(
     return None;
   }
 
+  // Total foreground-mask byte count cannot overflow `usize`, and the
+  // stride must be wide enough to hold one row of pixels of the
+  // expected size — otherwise our row-slice indexing would read past
+  // the end of the buffer.
+  let bytes_per_pixel: usize = match pixel_format {
+    kCVPixelFormatType_OneComponent32Float => core::mem::size_of::<f32>(),
+    kCVPixelFormatType_OneComponent8 => 1,
+    _ => return None,
+  };
+  let row_pixel_bytes = width.checked_mul(bytes_per_pixel)?;
+  if bytes_per_row < row_pixel_bytes {
+    return None;
+  }
+  let packed_len = row_pixel_bytes.checked_mul(height)?;
+
   match pixel_format {
     kCVPixelFormatType_OneComponent32Float => {
-      let mut packed = vec![0u8; width * height * core::mem::size_of::<f32>()];
+      let mut packed = vec![0u8; packed_len];
       let mut min_x = usize::MAX;
       let mut min_y = usize::MAX;
       let mut max_x = 0usize;
@@ -1498,13 +1573,27 @@ fn copy_instance_mask_buffer_locked(
       let mut has_foreground = false;
 
       for row in 0..height {
-        let src_row = unsafe { base_address.add(row * bytes_per_row) };
+        // SAFETY: `base_address` points at a buffer of at least
+        // `bytes_per_row * height` bytes (Core Video contract), and
+        // `row * bytes_per_row` fits in `usize` because `bytes_per_row
+        // * height >= row_pixel_bytes * height = packed_len`, which we
+        // verified does not overflow.
+        let src_row_ptr = unsafe { base_address.add(row.checked_mul(bytes_per_row)?) };
+        // `bytes_per_row / 4` is the maximum number of `f32` elements
+        // we can safely read from a row; we only ever index up to
+        // `width`, which we already verified fits in the row.
         let src_f32 =
-          unsafe { std::slice::from_raw_parts(src_row as *const f32, bytes_per_row / 4) };
-        let dst_row = &mut packed[row * width * 4..(row + 1) * width * 4];
+          unsafe { std::slice::from_raw_parts(src_row_ptr as *const f32, bytes_per_row / 4) };
+        let dst_start = row.checked_mul(row_pixel_bytes)?;
+        let dst_end = dst_start.checked_add(row_pixel_bytes)?;
+        let dst_row = packed.get_mut(dst_start..dst_end)?;
         for col in 0..width {
           let value = *src_f32.get(col)?;
-          dst_row[col * 4..(col + 1) * 4].copy_from_slice(&value.to_le_bytes());
+          let dst_pixel_start = col.checked_mul(4)?;
+          let dst_pixel_end = dst_pixel_start.checked_add(4)?;
+          dst_row
+            .get_mut(dst_pixel_start..dst_pixel_end)?
+            .copy_from_slice(&value.to_le_bytes());
           if value > 0.0 {
             has_foreground = true;
             min_x = min_x.min(col);
@@ -1531,7 +1620,7 @@ fn copy_instance_mask_buffer_locked(
       ))
     }
     kCVPixelFormatType_OneComponent8 => {
-      let mut packed = vec![0u8; width * height];
+      let mut packed = vec![0u8; packed_len];
       let mut min_x = usize::MAX;
       let mut min_y = usize::MAX;
       let mut max_x = 0usize;
@@ -1539,11 +1628,14 @@ fn copy_instance_mask_buffer_locked(
       let mut has_foreground = false;
 
       for row in 0..height {
-        let src_row = unsafe {
-          std::slice::from_raw_parts(base_address.add(row * bytes_per_row), bytes_per_row)
-        };
-        let dst_row = &mut packed[row * width..(row + 1) * width];
-        dst_row.copy_from_slice(&src_row[..width]);
+        // SAFETY: `base_address` points at a buffer of at least
+        // `bytes_per_row * height` bytes (Core Video contract).
+        let src_row_ptr = unsafe { base_address.add(row.checked_mul(bytes_per_row)?) };
+        let src_row = unsafe { std::slice::from_raw_parts(src_row_ptr, bytes_per_row) };
+        let dst_start = row.checked_mul(width)?;
+        let dst_end = dst_start.checked_add(width)?;
+        let dst_row = packed.get_mut(dst_start..dst_end)?;
+        dst_row.copy_from_slice(src_row.get(..width)?);
         for (col, value) in dst_row.iter().copied().enumerate() {
           if value > 0 {
             has_foreground = true;
@@ -1574,6 +1666,12 @@ fn copy_instance_mask_buffer_locked(
   }
 }
 
+/// Convert the foreground pixel bounds of a `CVPixelBuffer` mask into a
+/// normalized [`BoundingBox`] in the top-left schema convention.
+///
+/// `CVPixelBuffer` rows are stored top-to-bottom in memory (row 0 is the
+/// top of the image), so the natural mapping `min_y / height` is already
+/// top-left and no y-flip is needed here.
 fn normalized_bbox_from_pixel_bounds(
   min_x: usize,
   min_y: usize,
@@ -1583,9 +1681,86 @@ fn normalized_bbox_from_pixel_bounds(
   height: usize,
 ) -> BoundingBox {
   let x = min_x as f32 / width as f32;
-  let y = 1.0 - ((max_y + 1) as f32 / height as f32);
+  let y = min_y as f32 / height as f32;
   let w = (max_x + 1 - min_x) as f32 / width as f32;
   let h = (max_y + 1 - min_y) as f32 / height as f32;
   BoundingBox::new(x, y, w, h)
 }
 
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use objc2_core_foundation::{CGPoint, CGRect, CGSize};
+
+  /// `vision_bbox_to_schema` must flip y. A Vision rect of
+  /// `(0.1, 0.2, 0.3, 0.4)` (lower-left origin) maps to
+  /// `(0.1, 1.0 - (0.2 + 0.4), 0.3, 0.4)` = `(0.1, 0.4, 0.3, 0.4)`
+  /// in the schema's top-left convention.
+  #[test]
+  fn vision_bbox_to_schema_flips_y() {
+    let rect = CGRect::new(CGPoint::new(0.1, 0.2), CGSize::new(0.3, 0.4));
+    let bbox = vision_bbox_to_schema(rect);
+    assert!((bbox.x - 0.1).abs() < 1e-6, "x: {}", bbox.x);
+    assert!((bbox.y - 0.4).abs() < 1e-6, "y: {}", bbox.y);
+    assert!((bbox.width - 0.3).abs() < 1e-6, "w: {}", bbox.width);
+    assert!((bbox.height - 0.4).abs() < 1e-6, "h: {}", bbox.height);
+  }
+
+  /// `vision_bbox_to_schema` rejecting the y-flip (i.e. the old
+  /// behaviour of passing `origin.y` straight through) would still
+  /// yield a "valid"-looking rectangle but in the wrong half of the
+  /// image. Lock the flipped result against the domain's validating
+  /// `BoundingBox::try_new` to ensure the components still satisfy the
+  /// `[0, 1]` invariant after the flip.
+  #[test]
+  fn vision_bbox_to_schema_full_image_round_trip() {
+    let rect = CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(1.0, 1.0));
+    let bbox = vision_bbox_to_schema(rect);
+    assert_eq!(bbox.x, 0.0);
+    assert_eq!(bbox.y, 0.0);
+    assert_eq!(bbox.width, 1.0);
+    assert_eq!(bbox.height, 1.0);
+    mediaschema::domain::aggregates::video::BoundingBox::try_new(
+      bbox.x,
+      bbox.y,
+      bbox.width,
+      bbox.height,
+    )
+    .expect("full-image bbox stays valid after flip");
+  }
+
+  /// 2D points flip y; 3D coords (model-space metres) do not.
+  #[test]
+  fn vision_point_to_schema_flips_y_only() {
+    let (x, y) = vision_point_to_schema(0.25, 0.75);
+    assert!((x - 0.25).abs() < 1e-6);
+    assert!((y - 0.25).abs() < 1e-6);
+  }
+
+  /// `normalized_bbox_from_pixel_bounds` must NOT flip the y axis —
+  /// `CVPixelBuffer` rows are top-to-bottom, so row 0 is the top edge
+  /// and the natural mapping `min_y / height` is already in top-left
+  /// convention.
+  #[test]
+  fn pixel_bounds_to_normalized_bbox_does_not_flip() {
+    // A 100x100 mask with the foreground rectangle in rows 10..=29,
+    // columns 5..=24. The expected normalized bbox is
+    // `(5/100, 10/100, 20/100, 20/100)` in top-left convention.
+    let bbox = normalized_bbox_from_pixel_bounds(5, 10, 24, 29, 100, 100);
+    assert!((bbox.x - 0.05).abs() < 1e-6);
+    assert!((bbox.y - 0.10).abs() < 1e-6);
+    assert!((bbox.width - 0.20).abs() < 1e-6);
+    assert!((bbox.height - 0.20).abs() < 1e-6);
+  }
+
+  /// Regression: `HumanAnalysis::with_body_poses_3d` previously dropped
+  /// its input on the floor. The wire `HumanAnalysis.body_poses_3d` field
+  /// has existed since the mediaschema mono-consolidation, so the setter
+  /// must persist the provided detections.
+  #[test]
+  fn body_poses_3d_survives_through_human_analysis() {
+    let pose = BodyPose3DDetection::default();
+    let analysis = HumanAnalysis::new().with_body_poses_3d(vec![pose]);
+    assert_eq!(analysis.body_poses_3d.len(), 1);
+  }
+}

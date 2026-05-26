@@ -730,9 +730,8 @@ impl HumanAnalysisExt for HumanAnalysis {
     self
   }
   #[inline(always)]
-  fn with_body_poses_3d(self, body_poses_3d: Vec<BodyPose3DDetection>) -> Self {
-    // Wire HumanAnalysis has no field for 3D poses; ignore for now.
-    let _ = body_poses_3d;
+  fn with_body_poses_3d(mut self, body_poses_3d: Vec<BodyPose3DDetection>) -> Self {
+    self.body_poses_3d = body_poses_3d;
     self
   }
   #[inline(always)]
