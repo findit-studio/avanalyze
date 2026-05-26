@@ -39,7 +39,7 @@ use objc2::{
   rc::Retained,
 };
 #[cfg(target_os = "macos")]
-use objc2_core_foundation::CGRect;
+use objc2_core_foundation::{CGPoint, CGRect};
 #[cfg(target_os = "macos")]
 use objc2_core_video::{
   CVPixelBuffer, CVPixelBufferGetBaseAddress, CVPixelBufferGetBytesPerRow, CVPixelBufferGetHeight,
@@ -184,6 +184,62 @@ fn vision_point_to_schema(x: f64, y: f64) -> Option<(f32, f32)> {
     return None;
   }
   Some((clamp01(x32), clamp01(flipped_y)))
+}
+
+/// Reject non-finite Vision-derived scalars. `NaN` / `±Inf` from
+/// glitched Vision observations would otherwise enter the wire as
+/// valid-looking detections and later trip downstream validation or
+/// silently fail-open through `<` / `>` comparisons (since every
+/// comparison against `NaN` is `false`). Callers convert `None` into
+/// either a structured "drop the containing detection" decision or a
+/// concrete default (typically `0.0`) — the choice depends on whether
+/// the scalar is required geometry/score (drop) or an optional pose
+/// angle (default).
+#[cfg(target_os = "macos")]
+#[inline]
+fn finite_f32(v: f32) -> Option<f32> {
+  if v.is_finite() { Some(v) } else { None }
+}
+
+/// Upper bound on a single mask payload (post-packing, 8 bits per
+/// pixel) before we refuse to allocate. 64 MiB covers any sane image
+/// resolution Apple Vision returns today (8K = ~33 MiB at 8 bits per
+/// pixel) and prevents a runaway / corrupted `width * height` from
+/// driving the worker process into the allocator's abort path.
+#[cfg(target_os = "macos")]
+const MAX_MASK_BYTES: usize = 64 * 1024 * 1024;
+
+/// Allocate a zero-initialised packed mask buffer with bounded
+/// `try_reserve_exact`. Returns `None` on either bound violation or
+/// allocator failure — both surface to the caller as a dropped mask
+/// detection rather than aborting the process.
+#[cfg(target_os = "macos")]
+fn try_alloc_packed_mask(packed_len: usize) -> Option<Vec<u8>> {
+  if packed_len > MAX_MASK_BYTES {
+    return None;
+  }
+  let mut packed: Vec<u8> = Vec::new();
+  packed.try_reserve_exact(packed_len).ok()?;
+  packed.resize(packed_len, 0u8);
+  Some(packed)
+}
+
+/// Project a face-bbox-relative landmark point into the image's
+/// normalized coordinate space (Vision lower-left) using Apple's
+/// documented convention: landmark points are normalized within the
+/// face's normalized bounding box, NOT directly within the image.
+/// `VNImagePointForFaceLandmarkPoint(p, faceBBox, w, h)` performs
+/// `imageX = faceBBox.x + p.x * faceBBox.width;
+/// imageY = faceBBox.y + p.y * faceBBox.height` (lower-left). Callers
+/// then route through [`vision_point_to_schema`] for the schema-side
+/// top-left flip + `[0, 1]` clamp + finite check.
+#[cfg(target_os = "macos")]
+#[inline]
+fn project_landmark_to_image(point: CGPoint, face_bbox_vision: CGRect) -> CGPoint {
+  CGPoint {
+    x: face_bbox_vision.origin.x + point.x * face_bbox_vision.size.width,
+    y: face_bbox_vision.origin.y + point.y * face_bbox_vision.size.height,
+  }
 }
 
 /// Derive an axis-aligned bounding box from the min/max of a pose's
@@ -877,7 +933,11 @@ impl VisionAnalyzer {
       };
       let capture_quality = unsafe { obs.faceCaptureQuality() }
         .map(|q| q.floatValue())
+        .and_then(finite_f32)
         .unwrap_or(0.0);
+      // NaN was previously fail-open here: `NaN < threshold` is false, so any
+      // non-finite quality slipped past the gate. `finite_f32` collapses it to
+      // 0.0 above, which now fails closed against any non-zero threshold.
       if capture_quality < opts.min_capture_quality() {
         continue;
       }
@@ -890,11 +950,22 @@ impl VisionAnalyzer {
           .with_bbox(bbox)
           .with_confidence(confidence)
           .with_capture_quality(capture_quality)
-          .with_roll(unsafe { obs.roll() }.map(|v| v.floatValue()).unwrap_or(0.0))
-          .with_yaw(unsafe { obs.yaw() }.map(|v| v.floatValue()).unwrap_or(0.0))
+          .with_roll(
+            unsafe { obs.roll() }
+              .map(|v| v.floatValue())
+              .and_then(finite_f32)
+              .unwrap_or(0.0),
+          )
+          .with_yaw(
+            unsafe { obs.yaw() }
+              .map(|v| v.floatValue())
+              .and_then(finite_f32)
+              .unwrap_or(0.0),
+          )
           .with_pitch(
             unsafe { obs.pitch() }
               .map(|v| v.floatValue())
+              .and_then(finite_f32)
               .unwrap_or(0.0),
           ),
       );
@@ -924,11 +995,22 @@ impl VisionAnalyzer {
         FaceDetection::default()
           .with_bbox(bbox)
           .with_confidence(confidence)
-          .with_roll(unsafe { obs.roll() }.map(|v| v.floatValue()).unwrap_or(0.0))
-          .with_yaw(unsafe { obs.yaw() }.map(|v| v.floatValue()).unwrap_or(0.0))
+          .with_roll(
+            unsafe { obs.roll() }
+              .map(|v| v.floatValue())
+              .and_then(finite_f32)
+              .unwrap_or(0.0),
+          )
+          .with_yaw(
+            unsafe { obs.yaw() }
+              .map(|v| v.floatValue())
+              .and_then(finite_f32)
+              .unwrap_or(0.0),
+          )
           .with_pitch(
             unsafe { obs.pitch() }
               .map(|v| v.floatValue())
+              .and_then(finite_f32)
               .unwrap_or(0.0),
           ),
       );
@@ -954,12 +1036,21 @@ impl VisionAnalyzer {
         continue;
       };
 
-      let regions = extract_face_landmark_regions(&landmarks);
+      // Capture the face's Vision-coordinate bbox BEFORE the
+      // schema-side flip+clamp so we can project landmark points
+      // through it. Vision returns landmark points normalized to the
+      // face bbox (not the image), per
+      // `VNImagePointForFaceLandmarkPoint(p, faceBBox, w, h)` =
+      // `(faceBBox.x + p.x * faceBBox.width,
+      //   faceBBox.y + p.y * faceBBox.height)`.
+      let face_rect_vision = unsafe { obs.boundingBox() }.standardize();
+
+      let regions = extract_face_landmark_regions(&landmarks, face_rect_vision);
       if regions.len() < opts.min_region_count() {
         continue;
       }
 
-      let Some(bbox) = vision_bbox_to_schema(unsafe { obs.boundingBox() }.standardize()) else {
+      let Some(bbox) = vision_bbox_to_schema(face_rect_vision) else {
         continue;
       };
       detections.push(FaceLandmarksDetection::new(bbox, confidence, regions));
@@ -1118,9 +1209,16 @@ impl VisionAnalyzer {
         };
 
         joints.sort_by(|lhs, rhs| lhs.name().cmp(rhs.name()));
+        // Vision `bodyHeight()` is metres in model space. Non-finite
+        // (NaN/Inf) would otherwise enter the wire and trip downstream
+        // schema/storage validation. Substitute 0.0 — the wire schema
+        // treats 0.0 as "no estimate"; the accompanying
+        // `heightEstimation` enum already carries the
+        // measured/reference/unknown signal.
+        let body_height = finite_f32(unsafe { obs.bodyHeight() }).unwrap_or(0.0);
         body_poses.push(BodyPose3DDetection::new(
           pose_confidence,
-          unsafe { obs.bodyHeight() },
+          body_height,
           map_body_pose_3d_height_estimation(unsafe { obs.heightEstimation() }),
           joints,
         ));
@@ -1501,7 +1599,13 @@ impl VisionAnalyzer {
       return HorizonInfo::default();
     };
 
-    HorizonInfo::new(unsafe { observation.angle() } as f32, confidence)
+    // Drop the horizon detection entirely if the angle is non-finite —
+    // there is no sensible default for a horizon line and downstream
+    // visualisation would render a bogus tilt.
+    let Some(angle) = finite_f32(unsafe { observation.angle() } as f32) else {
+      return HorizonInfo::default();
+    };
+    HorizonInfo::new(angle, confidence)
   }
 
   fn extract_document_segments(&self) -> Vec<DocumentSegment> {
@@ -1591,7 +1695,12 @@ impl VisionAnalyzer {
     let Some(obs) = results.iter().next() else {
       return Aesthetics::default();
     };
-    let overall_score = unsafe { obs.overallScore() };
+    // `NaN < threshold` would fail open. Force a finite check at the
+    // gate so a glitched aesthetics score collapses to the default
+    // (no detection) instead of being silently admitted to the wire.
+    let Some(overall_score) = finite_f32(unsafe { obs.overallScore() }) else {
+      return Aesthetics::default();
+    };
     if overall_score < self.opts.aesthetics().min_overall_score() {
       return Aesthetics::default();
     }
@@ -1653,32 +1762,96 @@ fn map_hand_chirality(chirality: VNChirality) -> HandChirality {
   }
 }
 
+/// Extract every named face-landmark region, projecting each point
+/// from face-bbox-relative coordinates into image-normalized
+/// coordinates (Vision lower-left) via `face_bbox_vision` before the
+/// caller-side schema flip. Without this projection a non-full-frame
+/// face emits landmarks in the wrong place but still passes `[0, 1]`
+/// validation.
 #[cfg(target_os = "macos")]
-fn extract_face_landmark_regions(landmarks: &VNFaceLandmarks2D) -> Vec<FaceLandmarkRegion> {
+fn extract_face_landmark_regions(
+  landmarks: &VNFaceLandmarks2D,
+  face_bbox_vision: CGRect,
+) -> Vec<FaceLandmarkRegion> {
   let mut regions = Vec::new();
-  push_face_landmark_region(&mut regions, "allPoints", unsafe { landmarks.allPoints() });
-  push_face_landmark_region(&mut regions, "faceContour", unsafe {
-    landmarks.faceContour()
-  });
-  push_face_landmark_region(&mut regions, "leftEye", unsafe { landmarks.leftEye() });
-  push_face_landmark_region(&mut regions, "rightEye", unsafe { landmarks.rightEye() });
-  push_face_landmark_region(&mut regions, "leftEyebrow", unsafe {
-    landmarks.leftEyebrow()
-  });
-  push_face_landmark_region(&mut regions, "rightEyebrow", unsafe {
-    landmarks.rightEyebrow()
-  });
-  push_face_landmark_region(&mut regions, "nose", unsafe { landmarks.nose() });
-  push_face_landmark_region(&mut regions, "noseCrest", unsafe { landmarks.noseCrest() });
-  push_face_landmark_region(&mut regions, "medianLine", unsafe {
-    landmarks.medianLine()
-  });
-  push_face_landmark_region(&mut regions, "outerLips", unsafe { landmarks.outerLips() });
-  push_face_landmark_region(&mut regions, "innerLips", unsafe { landmarks.innerLips() });
-  push_face_landmark_region(&mut regions, "leftPupil", unsafe { landmarks.leftPupil() });
-  push_face_landmark_region(&mut regions, "rightPupil", unsafe {
-    landmarks.rightPupil()
-  });
+  push_face_landmark_region(
+    &mut regions,
+    "allPoints",
+    unsafe { landmarks.allPoints() },
+    face_bbox_vision,
+  );
+  push_face_landmark_region(
+    &mut regions,
+    "faceContour",
+    unsafe { landmarks.faceContour() },
+    face_bbox_vision,
+  );
+  push_face_landmark_region(
+    &mut regions,
+    "leftEye",
+    unsafe { landmarks.leftEye() },
+    face_bbox_vision,
+  );
+  push_face_landmark_region(
+    &mut regions,
+    "rightEye",
+    unsafe { landmarks.rightEye() },
+    face_bbox_vision,
+  );
+  push_face_landmark_region(
+    &mut regions,
+    "leftEyebrow",
+    unsafe { landmarks.leftEyebrow() },
+    face_bbox_vision,
+  );
+  push_face_landmark_region(
+    &mut regions,
+    "rightEyebrow",
+    unsafe { landmarks.rightEyebrow() },
+    face_bbox_vision,
+  );
+  push_face_landmark_region(
+    &mut regions,
+    "nose",
+    unsafe { landmarks.nose() },
+    face_bbox_vision,
+  );
+  push_face_landmark_region(
+    &mut regions,
+    "noseCrest",
+    unsafe { landmarks.noseCrest() },
+    face_bbox_vision,
+  );
+  push_face_landmark_region(
+    &mut regions,
+    "medianLine",
+    unsafe { landmarks.medianLine() },
+    face_bbox_vision,
+  );
+  push_face_landmark_region(
+    &mut regions,
+    "outerLips",
+    unsafe { landmarks.outerLips() },
+    face_bbox_vision,
+  );
+  push_face_landmark_region(
+    &mut regions,
+    "innerLips",
+    unsafe { landmarks.innerLips() },
+    face_bbox_vision,
+  );
+  push_face_landmark_region(
+    &mut regions,
+    "leftPupil",
+    unsafe { landmarks.leftPupil() },
+    face_bbox_vision,
+  );
+  push_face_landmark_region(
+    &mut regions,
+    "rightPupil",
+    unsafe { landmarks.rightPupil() },
+    face_bbox_vision,
+  );
   regions
 }
 
@@ -1687,6 +1860,7 @@ fn push_face_landmark_region(
   regions: &mut Vec<FaceLandmarkRegion>,
   name: &'static str,
   region: Option<Retained<VNFaceLandmarkRegion2D>>,
+  face_bbox_vision: CGRect,
 ) {
   let Some(region) = region else {
     return;
@@ -1706,11 +1880,15 @@ fn push_face_landmark_region(
   let points = points
     .iter()
     .filter_map(|point| {
-      // Vision normalized landmark points are lower-left origin; flip
-      // y for the top-left schema convention. A non-finite raw point
-      // is dropped at the source — partial-point landmark regions are
-      // still meaningful so we skip only the offending point.
-      let (x, y) = vision_point_to_schema(point.x, point.y)?;
+      // Apple's convention: landmark points are normalized within the
+      // face's normalized bbox (NOT the image). Project to image-
+      // normalized Vision coordinates first, THEN route through
+      // `vision_point_to_schema` for the top-left flip + clamp +
+      // finite check. A non-finite raw or projected component drops
+      // only the offending point; partial-point regions are still
+      // meaningful.
+      let projected = project_landmark_to_image(*point, face_bbox_vision);
+      let (x, y) = vision_point_to_schema(projected.x, projected.y)?;
       Some(FaceLandmarkPoint::new(x, y))
     })
     .collect::<Vec<_>>();
@@ -1860,7 +2038,11 @@ fn process_mask_bytes_f32(
 ) -> Option<(BoundingBox, Vec<u8>)> {
   let src_row_pixel_bytes = width.checked_mul(core::mem::size_of::<f32>())?;
   let packed_len = width.checked_mul(height)?;
-  let mut packed = vec![0u8; packed_len];
+  // Bounded allocation: cap at `MAX_MASK_BYTES` and use
+  // `try_reserve_exact` so an oversized or corrupted dimensions value
+  // returns `None` instead of aborting the worker process via the
+  // allocator's OOM path.
+  let mut packed = try_alloc_packed_mask(packed_len)?;
 
   let mut min_x = usize::MAX;
   let mut min_y = usize::MAX;
@@ -1922,7 +2104,8 @@ fn process_mask_bytes_u8(
   src: &[u8],
 ) -> Option<(BoundingBox, Vec<u8>)> {
   let packed_len = width.checked_mul(height)?;
-  let mut packed = vec![0u8; packed_len];
+  // Bounded allocation: see `process_mask_bytes_f32` for the rationale.
+  let mut packed = try_alloc_packed_mask(packed_len)?;
 
   let mut min_x = usize::MAX;
   let mut min_y = usize::MAX;
@@ -2470,5 +2653,98 @@ mod macos_tests {
     let bl = (0.1_f32, 0.9_f32);
     mediaschema::domain::aggregates::video::DocumentSegment::try_new(tl, tr, br, bl, 0.9)
       .expect("well-formed unit quad is valid");
+  }
+
+  // ──────────────── R6 fixes (codex round 6) ────────────────
+
+  /// `finite_f32` returns `Some(v)` only for finite inputs. NaN and
+  /// both infinities collapse to `None`.
+  #[test]
+  fn finite_f32_rejects_non_finite() {
+    assert_eq!(finite_f32(0.0), Some(0.0));
+    assert_eq!(finite_f32(-1.5), Some(-1.5));
+    assert_eq!(finite_f32(1.0), Some(1.0));
+    assert_eq!(finite_f32(f32::NAN), None);
+    assert_eq!(finite_f32(f32::INFINITY), None);
+    assert_eq!(finite_f32(f32::NEG_INFINITY), None);
+  }
+
+  /// `try_alloc_packed_mask` enforces a hard upper bound. A request
+  /// above `MAX_MASK_BYTES` returns `None` immediately without
+  /// touching the allocator, so a corrupted dimensions value cannot
+  /// drive the worker into the allocator's abort path.
+  #[test]
+  fn try_alloc_packed_mask_rejects_oversize() {
+    assert!(try_alloc_packed_mask(MAX_MASK_BYTES).is_some());
+    assert!(try_alloc_packed_mask(MAX_MASK_BYTES + 1).is_none());
+  }
+
+  /// Within the cap, `try_alloc_packed_mask` returns a zero-init
+  /// buffer of the requested length.
+  #[test]
+  fn try_alloc_packed_mask_zero_inits_at_requested_length() {
+    let buf = try_alloc_packed_mask(64).expect("64 byte allocation");
+    assert_eq!(buf.len(), 64);
+    assert!(buf.iter().all(|&b| b == 0));
+  }
+
+  /// `process_mask_bytes_u8` and `process_mask_bytes_f32` propagate
+  /// the bounded allocation: feeding dimensions whose product
+  /// exceeds the cap returns `None` instead of attempting the alloc.
+  /// We pick a dimension product just above `MAX_MASK_BYTES`. The
+  /// source slice need not be filled with content past the cap —
+  /// the function returns at the allocation step before reading any
+  /// pixel.
+  #[test]
+  fn process_mask_bytes_u8_caps_allocation() {
+    // (MAX_MASK_BYTES + 1) bytes of packed output. Choose dims that
+    // multiply to that value.
+    let width = MAX_MASK_BYTES + 1;
+    let height = 1;
+    // Empty src is fine — the function returns before reading it.
+    assert!(process_mask_bytes_u8(width, height, width, &[]).is_none());
+  }
+
+  /// Project a face-bbox-relative landmark point into the image's
+  /// normalized Vision coordinates. A landmark at the face's centre
+  /// (`0.5, 0.5` face-relative) on a face bbox of
+  /// `(origin = (0.2, 0.3), size = (0.4, 0.2))` (Vision lower-left)
+  /// projects to `(0.2 + 0.5 * 0.4, 0.3 + 0.5 * 0.2) = (0.4, 0.4)`.
+  #[test]
+  fn project_landmark_to_image_centres_landmark() {
+    let face = CGRect::new(CGPoint::new(0.2, 0.3), CGSize::new(0.4, 0.2));
+    let projected = project_landmark_to_image(CGPoint::new(0.5, 0.5), face);
+    assert!((projected.x - 0.4).abs() < 1e-9);
+    assert!((projected.y - 0.4).abs() < 1e-9);
+  }
+
+  /// Projection composes with the schema flip. A landmark at the
+  /// face's lower-left corner (`(0, 0)` face-relative) on a non-unit
+  /// face bbox lands at the face's lower-left in image-normalized
+  /// coords. After the schema-side y-flip, the schema-y equals
+  /// `1.0 - (face.origin.y + 0 * face.height)`.
+  #[test]
+  fn project_landmark_then_schema_flip_matches_face_corner() {
+    // Face bbox in Vision lower-left: origin (0.2, 0.3), size 0.4×0.2.
+    // Face's lower-left landmark = (0, 0) face-relative.
+    let face = CGRect::new(CGPoint::new(0.2, 0.3), CGSize::new(0.4, 0.2));
+    let projected = project_landmark_to_image(CGPoint::new(0.0, 0.0), face);
+    let (sx, sy) =
+      vision_point_to_schema(projected.x, projected.y).expect("projected lower-left is finite");
+    assert!((sx - 0.2).abs() < 1e-6, "schema-x: {sx}");
+    // Vision lower-left at face y = 0.3 → schema-y = 1.0 - 0.3 = 0.7.
+    assert!((sy - 0.7).abs() < 1e-6, "schema-y: {sy}");
+  }
+
+  /// A non-finite landmark component drops the offending point at
+  /// the schema-flip stage even when the face bbox is well-formed.
+  /// `project_landmark_to_image` propagates the non-finite component
+  /// (`0.2 + NaN * 0.4 = NaN`) and `vision_point_to_schema` rejects
+  /// it.
+  #[test]
+  fn projected_non_finite_landmark_is_rejected() {
+    let face = CGRect::new(CGPoint::new(0.2, 0.3), CGSize::new(0.4, 0.2));
+    let projected = project_landmark_to_image(CGPoint::new(f64::NAN, 0.5), face);
+    assert!(vision_point_to_schema(projected.x, projected.y).is_none());
   }
 }
