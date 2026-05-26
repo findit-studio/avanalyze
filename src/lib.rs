@@ -42,9 +42,10 @@ use objc2::{
 use objc2_core_foundation::{CGPoint, CGRect};
 #[cfg(target_os = "macos")]
 use objc2_core_video::{
-  CVPixelBuffer, CVPixelBufferGetBaseAddress, CVPixelBufferGetBytesPerRow, CVPixelBufferGetHeight,
-  CVPixelBufferGetPixelFormatType, CVPixelBufferGetWidth, CVPixelBufferLockBaseAddress,
-  CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress, kCVPixelFormatType_OneComponent8,
+  CVPixelBuffer, CVPixelBufferGetBaseAddress, CVPixelBufferGetBytesPerRow,
+  CVPixelBufferGetDataSize, CVPixelBufferGetHeight, CVPixelBufferGetPixelFormatType,
+  CVPixelBufferGetWidth, CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags,
+  CVPixelBufferUnlockBaseAddress, kCVPixelFormatType_OneComponent8,
   kCVPixelFormatType_OneComponent32Float, kCVReturnSuccess,
 };
 #[cfg(target_os = "macos")]
@@ -266,6 +267,22 @@ const MAX_TEXT_CANDIDATES_PER_OBSERVATION: usize = 16;
 /// Hard ceiling on saliency regions per frame.
 #[cfg(target_os = "macos")]
 const MAX_SALIENCY_REGIONS_PER_FRAME: usize = 64;
+
+/// Hard ceiling on the total mask count emitted per frame across
+/// the inner observation × instance loop. Without this, an outer
+/// cap of 4096 observations × an inner cap of 64 instances would
+/// permit 256K mask emissions per frame even though each individual
+/// mask is capped at [`MAX_MASK_BYTES`]. 256 is a generous total
+/// matching realistic Vision output for a single frame.
+#[cfg(target_os = "macos")]
+const MAX_TOTAL_MASKS_PER_FRAME: usize = 256;
+
+/// Hard ceiling on the cumulative mask payload bytes emitted per
+/// frame. Even at the per-mask cap, a worst-case 256 masks × 64 MiB
+/// = 16 GiB would crush the worker. 256 MiB total is generous for
+/// realistic Vision output while bounding the cumulative budget.
+#[cfg(target_os = "macos")]
+const MAX_TOTAL_MASK_BYTES_PER_FRAME: usize = 256 * 1024 * 1024;
 
 /// Upper bound on the byte length of an FFI-sourced `NSString`
 /// before we refuse to convert it to a Rust `SmolStr` / `String`.
@@ -1009,10 +1026,15 @@ impl VisionRequests {
       handler
         .performRequests_onImageData_error(&requests, data)
         .map_err(|e| {
-          apple_vision_error(
-            ErrorCode::AppleVisionRequestFailed,
-            e.localizedDescription().to_string(),
-          )
+          // Route NSError's localizedDescription through the bounded
+          // FFI-string helper so a pathological error message cannot
+          // drive the allocator into the abort path while the worker
+          // is already trying to report a failure.
+          let raw = e.localizedDescription();
+          let message: SmolStr = ffi_nsstring_to_smolstr(&raw).unwrap_or_else(|| {
+            SmolStr::new_static("apple-vision request failed (description elided)")
+          });
+          apple_vision_error(ErrorCode::AppleVisionRequestFailed, message)
         })
     }
   }
@@ -1570,8 +1592,18 @@ impl VisionAnalyzer {
     };
     let opts = self.opts.person_instance_masks();
 
-    let mut masks = Vec::new();
-    for observation in results.iter().take(MAX_VISION_RESULTS_PER_FRAME) {
+    // Per-frame budgets — count AND cumulative payload bytes —
+    // bound the cross-observation × instance product so a corrupted
+    // results array can't emit 4096 × 64 = 256K mask detections
+    // even though each individual mask passes the per-mask cap.
+    let mut masks = Vec::with_capacity(MAX_TOTAL_MASKS_PER_FRAME);
+    let mut total_mask_bytes: usize = 0;
+    'outer: for observation in results.iter().take(MAX_VISION_RESULTS_PER_FRAME) {
+      if masks.len() >= MAX_TOTAL_MASKS_PER_FRAME
+        || total_mask_bytes >= MAX_TOTAL_MASK_BYTES_PER_FRAME
+      {
+        break;
+      }
       let Some(confidence) =
         sanitize_confidence(unsafe { observation.confidence() }, opts.min_confidence())
       else {
@@ -1588,6 +1620,13 @@ impl VisionAnalyzer {
       while instance_index != NSNotFound as usize {
         if emitted >= inner_cap {
           break;
+        }
+        // Per-frame budget check: stop the entire extraction once
+        // either ceiling is reached, not just the inner loop.
+        if masks.len() >= MAX_TOTAL_MASKS_PER_FRAME
+          || total_mask_bytes >= MAX_TOTAL_MASK_BYTES_PER_FRAME
+        {
+          break 'outer;
         }
 
         let selected_instances = NSIndexSet::indexSetWithIndex(instance_index);
@@ -1611,6 +1650,7 @@ impl VisionAnalyzer {
           continue;
         };
 
+        total_mask_bytes = total_mask_bytes.saturating_add(data.len());
         masks.push(PersonInstanceMaskDetection::new(
           bbox,
           confidence,
@@ -1633,8 +1673,18 @@ impl VisionAnalyzer {
     };
     let opts = self.opts.person_segmentation_masks();
 
-    let mut masks = Vec::with_capacity(results.len().min(MAX_VISION_RESULTS_PER_FRAME));
+    // Per-frame budgets bound this extractor the same way as
+    // `extract_person_instance_masks`: a single saturated outer
+    // results array cannot push past MAX_TOTAL_MASKS_PER_FRAME or
+    // MAX_TOTAL_MASK_BYTES_PER_FRAME.
+    let mut masks = Vec::with_capacity(MAX_TOTAL_MASKS_PER_FRAME);
+    let mut total_mask_bytes: usize = 0;
     for observation in results.iter().take(MAX_VISION_RESULTS_PER_FRAME) {
+      if masks.len() >= MAX_TOTAL_MASKS_PER_FRAME
+        || total_mask_bytes >= MAX_TOTAL_MASK_BYTES_PER_FRAME
+      {
+        break;
+      }
       let Some(confidence) =
         sanitize_confidence(unsafe { observation.confidence() }, opts.min_confidence())
       else {
@@ -1646,6 +1696,7 @@ impl VisionAnalyzer {
         continue;
       };
 
+      total_mask_bytes = total_mask_bytes.saturating_add(data.len());
       masks.push(PersonSegmentationMask::new(
         bbox, confidence, dimensions, data,
       ));
@@ -1862,14 +1913,25 @@ impl VisionAnalyzer {
       return Vec::new();
     };
 
-    let mut regions = Vec::new();
-    for observation in observations.iter().take(MAX_VISION_RESULTS_PER_FRAME) {
+    // `total_cap` is the per-FRAME (not per-observation) cap.
+    // Outer × inner emission must not exceed it. Track running
+    // count across observations and stop the outer loop when the
+    // budget is exhausted; `.iter().take(remaining)` on the inner
+    // loop further bounds each observation's contribution.
+    let total_cap = opts.max_regions().min(MAX_SALIENCY_REGIONS_PER_FRAME);
+    let mut regions = Vec::with_capacity(total_cap);
+    'outer: for observation in observations.iter().take(MAX_VISION_RESULTS_PER_FRAME) {
+      if regions.len() >= total_cap {
+        break;
+      }
       let Some(objects) = (unsafe { observation.salientObjects() }) else {
         continue;
       };
-      // Bound the inner cap: user-configured AND hard per-frame ceiling.
-      let region_cap = opts.max_regions().min(MAX_SALIENCY_REGIONS_PER_FRAME);
-      for object in objects.iter().take(region_cap) {
+      let remaining = total_cap - regions.len();
+      for object in objects.iter().take(remaining) {
+        if regions.len() >= total_cap {
+          break 'outer;
+        }
         let Some(confidence) =
           sanitize_confidence(unsafe { object.confidence() }, opts.min_confidence())
         else {
@@ -2325,11 +2387,25 @@ fn copy_instance_mask_buffer_locked(
   // the allocator's abort path.
   validate_mask_dims_for_slice(width, height, total_src_len)?;
 
-  // SAFETY: `base_address` points at a buffer of at least
-  // `bytes_per_row * height` bytes (Core Video contract); the buffer
-  // is locked by the surrounding `CVPixelBufferLockGuard`. The
-  // pre-validation above satisfies the `from_raw_parts` contract
-  // (`total_src_len <= isize::MAX`) regardless of what Core Video
+  // FFI-truth check: `total_src_len = bytes_per_row * height` is
+  // derived from the buffer's own metadata, but `CVPixelBufferGetDataSize`
+  // reports the actual ALLOCATED size of the buffer's data plane.
+  // A malformed buffer with valid `base_address` but inconsistent
+  // stride/height metadata could otherwise let `from_raw_parts`
+  // create an overlong slice (UB on the row reads). Reject if the
+  // computed length exceeds the buffer's reported data size.
+  let data_size: usize = CVPixelBufferGetDataSize(pixel_buffer);
+  if total_src_len > data_size {
+    return None;
+  }
+
+  // SAFETY: `base_address` points at a buffer whose allocated size
+  // is `CVPixelBufferGetDataSize(pixel_buffer)` (verified just above
+  // to be at least `total_src_len`); the buffer is locked by the
+  // surrounding `CVPixelBufferLockGuard`. The pre-validation
+  // satisfies the `from_raw_parts` contract
+  // (`total_src_len <= isize::MAX` AND
+  // `total_src_len <= data_size`) regardless of what Core Video
   // reports for the dimensions; the downstream bounded allocator
   // re-checks `width * height` against `MAX_MASK_BYTES`.
   let src = unsafe { std::slice::from_raw_parts(base_address, total_src_len) };
