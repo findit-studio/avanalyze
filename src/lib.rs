@@ -76,7 +76,20 @@ struct SimdFloat4([f32; 4]);
 
 #[cfg(target_vendor = "apple")]
 unsafe impl Encode for SimdFloat4 {
-  const ENCODING: Encoding = Encoding::Unknown;
+  // `simd_float4` is an `__attribute__((__ext_vector_type__))` type;
+  // Clang intentionally emits NO `@encode` for ext-vector elements, so
+  // the matching Rust-side encoding is [`Encoding::None`] (formats as
+  // empty string), NOT [`Encoding::Unknown`] (formats as `?`).
+  //
+  // objc2-encode's `Encoding::None` docstring explicitly calls this
+  // out as the SIMD-vector case. The previous `Encoding::Unknown`
+  // made the wrapping struct render as `{?=[4?]}`, while Vision's
+  // `-[VNHumanBodyRecognizedPoint3D position]` returns `{?=[4]}`
+  // (Clang refuses to emit an inner element character) — every
+  // msg_send for that selector failed verification on macOS 26.x,
+  // and the surrounding `catch_unwind` silently swallowed the
+  // panic so 3-D pose detections were always dropped to zero.
+  const ENCODING: Encoding = Encoding::None;
 }
 
 #[cfg(target_vendor = "apple")]
@@ -88,9 +101,14 @@ struct SimdFloat4x4 {
 
 #[cfg(target_vendor = "apple")]
 unsafe impl Encode for SimdFloat4x4 {
-  // Clang reports @encode(simd_float4x4) as "{?=[4]}" because the vector element
-  // encoding is intentionally opaque.
-  const ENCODING: Encoding = Encoding::Struct("?", &[Encoding::Array(4, &Encoding::Unknown)]);
+  // Apple's `simd_float4x4` is a struct-of-vectors. Clang reports
+  // `@encode(simd_float4x4)` as `{?=[4]}` — outer struct with no name
+  // wrapping an array of 4 whose element type Clang refuses to encode
+  // (the element is itself an ext-vector, see [`SimdFloat4`] above).
+  // The matching Rust encoding therefore uses `Array(4, &None)` so
+  // the inner array element formats to an empty string, producing the
+  // literal `[4]` Clang emits.
+  const ENCODING: Encoding = Encoding::Struct("?", &[Encoding::Array(4, &Encoding::None)]);
 }
 
 // ----- Vision → mediaschema coordinate conversion ---------------------------
@@ -670,286 +688,6 @@ impl Drop for CVPixelBufferLockGuard<'_> {
   }
 }
 
-// #[derive(Debug, Clone, Copy)]
-// pub struct Service(());
-
-// impl ThreadService for Service {
-//   type Input = Request;
-//   type Options = ServiceOptions;
-//   type SpawnError = SpawnError;
-//   type Handle = ThreadHandles<Self::Input>;
-
-//   #[cfg_attr(not(tarpaulin), inline(always))]
-//   fn name() -> &'static str {
-//     "apple-vision"
-//   }
-
-//   fn health_spec(options: &Self::Options) -> ThreadServiceHealthSpec {
-//     ThreadServiceHealthSpec::new(options.num_workers.max(1), ServiceHealthConfig::default())
-//   }
-
-//   #[cfg_attr(not(tarpaulin), inline(always))]
-//   fn spawn(
-//     options: Self::Options,
-//     ctx: ThreadServiceContext,
-//   ) -> Result<Self::Handle, Self::SpawnError>
-//   where
-//     Self: Sized,
-//     Self::Handle: findit_service::MessageHandle<Self::Input>,
-//   {
-//     let (tx, rx) = unbounded::<Self::Input>();
-//     let (shutdown, health_reporter, health_handle, health_config) = ctx.into_parts();
-//     let mut handles = Vec::with_capacity(options.num_workers);
-
-//     for idx in 0..options.num_workers {
-//       let rx = rx.clone();
-//       let shutdown = shutdown.clone();
-//       let opts = options.clone();
-//       let health = health_reporter.clone();
-//       let handle = std::thread::Builder::new()
-//         .name(format!("{}-{idx}", Self::name()))
-//         .spawn(move || {
-//           run_apple_vision_worker(
-//             Self::name(),
-//             idx,
-//             rx,
-//             shutdown,
-//             opts,
-//             health,
-//             health_config.heartbeat_interval(),
-//           )
-//         })
-//         .map_err(|error| SpawnError::io("failed to spawn worker thread", error))?;
-//       handles.push(handle);
-//     }
-
-//     Ok(ThreadHandles::with_named_service_health(
-//       Self::name(),
-//       tx,
-//       handles,
-//       Some(health_handle),
-//     ))
-//   }
-// }
-
-// impl ProviderIdentifier for Service {
-//   const KEY: ProviderKey = ProviderKey::internal_after(
-//     Lifecycle::Video(VideoLifecycle::KeyframeExtract),
-//     Lifecycle::Video(VideoLifecycle::VisionAnalysis),
-//     "apple-vision",
-//   );
-//   const IMPLEMENTATION_HASH: u64 = 0;
-// }
-
-// impl ProviderThreadService for Service {
-//   const KIND: ProviderKind = ProviderKind::Standard;
-
-//   type LifecycleInput = Request;
-//   type LifecycleOutput = Reply;
-// }
-
-// /// Messages sent from processor tasks to the Apple Vision service.
-// pub struct Request {
-//   video_id: Id,
-//   scene_id: Id,
-//   keyframes: Arc<[Identified<Bytes>]>,
-//   reply: Callback,
-// }
-
-// impl Request {
-//   #[cfg_attr(not(tarpaulin), inline(always))]
-//   pub fn new(
-//     video_id: Id,
-//     scene_id: Id,
-//     keyframes: Arc<[Identified<Bytes>]>,
-//     reply: Callback,
-//   ) -> Self {
-//     Self {
-//       video_id,
-//       scene_id,
-//       keyframes,
-//       reply,
-//     }
-//   }
-
-//   #[cfg_attr(not(tarpaulin), inline(always))]
-//   pub const fn video_id(&self) -> Id {
-//     self.video_id
-//   }
-
-//   #[cfg_attr(not(tarpaulin), inline(always))]
-//   pub fn set_video_id(&mut self, video_id: Id) -> &mut Self {
-//     self.video_id = video_id;
-//     self
-//   }
-
-//   #[cfg_attr(not(tarpaulin), inline(always))]
-//   pub fn with_video_id(mut self, video_id: Id) -> Self {
-//     self.set_video_id(video_id);
-//     self
-//   }
-
-//   #[cfg_attr(not(tarpaulin), inline(always))]
-//   pub const fn scene_id(&self) -> Id {
-//     self.scene_id
-//   }
-
-//   #[cfg_attr(not(tarpaulin), inline(always))]
-//   pub fn set_scene_id(&mut self, scene_id: Id) -> &mut Self {
-//     self.scene_id = scene_id;
-//     self
-//   }
-
-//   #[cfg_attr(not(tarpaulin), inline(always))]
-//   pub fn with_scene_id(mut self, scene_id: Id) -> Self {
-//     self.set_scene_id(scene_id);
-//     self
-//   }
-
-//   #[cfg_attr(not(tarpaulin), inline(always))]
-//   pub fn keyframes(&self) -> &[Identified<Bytes>] {
-//     &self.keyframes
-//   }
-
-//   #[cfg_attr(not(tarpaulin), inline(always))]
-//   pub fn set_keyframes(&mut self, keyframes: Arc<[Identified<Bytes>]>) -> &mut Self {
-//     self.keyframes = keyframes;
-//     self
-//   }
-
-//   #[cfg_attr(not(tarpaulin), inline(always))]
-//   pub fn with_keyframes(mut self, keyframes: Arc<[Identified<Bytes>]>) -> Self {
-//     self.set_keyframes(keyframes);
-//     self
-//   }
-
-//   #[cfg_attr(not(tarpaulin), inline(always))]
-//   pub fn reply(&self) -> &Callback {
-//     &self.reply
-//   }
-
-//   #[cfg_attr(not(tarpaulin), inline(always))]
-//   pub fn set_reply(&mut self, reply: Callback) -> &mut Self {
-//     self.reply = reply;
-//     self
-//   }
-
-//   #[cfg_attr(not(tarpaulin), inline(always))]
-//   pub fn with_reply(mut self, reply: Callback) -> Self {
-//     self.set_reply(reply);
-//     self
-//   }
-
-//   #[cfg_attr(not(tarpaulin), inline(always))]
-//   pub fn into_parts(self) -> (Id, Id, Arc<[Identified<Bytes>]>, Callback) {
-//     (self.video_id, self.scene_id, self.keyframes, self.reply)
-//   }
-// }
-
-// pub struct Reply {
-//   scene_id: Id,
-//   results: Vec<Keyframe>,
-//   errors: Vec<ErrorInfo>,
-// }
-
-// impl Reply {
-//   #[cfg_attr(not(tarpaulin), inline(always))]
-//   pub fn new(scene_id: Id, results: Vec<Keyframe>, errors: Vec<ErrorInfo>) -> Self {
-//     Self {
-//       scene_id,
-//       results,
-//       errors,
-//     }
-//   }
-
-//   #[cfg_attr(not(tarpaulin), inline(always))]
-//   pub const fn scene_id(&self) -> Id {
-//     self.scene_id
-//   }
-
-//   #[cfg_attr(not(tarpaulin), inline(always))]
-//   pub fn set_scene_id(&mut self, scene_id: Id) -> &mut Self {
-//     self.scene_id = scene_id;
-//     self
-//   }
-
-//   #[cfg_attr(not(tarpaulin), inline(always))]
-//   pub fn with_scene_id(mut self, scene_id: Id) -> Self {
-//     self.set_scene_id(scene_id);
-//     self
-//   }
-
-//   #[cfg_attr(not(tarpaulin), inline(always))]
-//   pub fn results(&self) -> &[Keyframe] {
-//     &self.results
-//   }
-
-//   #[cfg_attr(not(tarpaulin), inline(always))]
-//   pub fn set_results(&mut self, results: Vec<Keyframe>) -> &mut Self {
-//     self.results = results;
-//     self
-//   }
-
-//   #[cfg_attr(not(tarpaulin), inline(always))]
-//   pub fn with_results(mut self, results: Vec<Keyframe>) -> Self {
-//     self.set_results(results);
-//     self
-//   }
-
-//   #[cfg_attr(not(tarpaulin), inline(always))]
-//   pub fn errors(&self) -> &[ErrorInfo] {
-//     &self.errors
-//   }
-
-//   #[cfg_attr(not(tarpaulin), inline(always))]
-//   pub fn set_errors(&mut self, errors: Vec<ErrorInfo>) -> &mut Self {
-//     self.errors = errors;
-//     self
-//   }
-
-//   #[cfg_attr(not(tarpaulin), inline(always))]
-//   pub fn with_errors(mut self, errors: Vec<ErrorInfo>) -> Self {
-//     self.set_errors(errors);
-//     self
-//   }
-
-//   #[cfg_attr(not(tarpaulin), inline(always))]
-//   pub fn into_parts(self) -> (Id, Vec<Keyframe>, Vec<ErrorInfo>) {
-//     (self.scene_id, self.results, self.errors)
-//   }
-// }
-
-// fn handle_message(worker_id: usize, analyzer: &VisionAnalyzer, request: Request) {
-//   let (video_id, scene_id, keyframes, reply) = request.into_parts();
-//   let svc = Service::name();
-
-//   #[cfg(feature = "tracing")]
-//   tracing::info!(service = svc, worker = worker_id, video_id = %video_id, scene_id = %scene_id, "analyzing scene");
-
-//   let mut results = Vec::with_capacity(keyframes.len());
-//   let mut errors = Vec::new();
-
-//   for keyframe in keyframes.iter() {
-//     match analyzer.analyze_keyframe(scene_id, keyframe.id(), keyframe.data()) {
-//       Ok(r) => results.push(r),
-//       Err(e) => {
-//         #[cfg(feature = "tracing")]
-//         tracing::warn!(
-//           service = svc,
-//           worker = worker_id,
-//           video_id = %video_id,
-//           keyframe_id = %keyframe.id(),
-//           err = %e,
-//           "Apple Vision analysis failed"
-//         );
-//         errors.push(apple_vision_keyframe_error(keyframe.id(), e));
-//       }
-//     }
-//   }
-
-//   reply(Reply::new(scene_id, results, errors));
-// }
-
 /// Apple Vision analyzer — one per worker thread.
 ///
 /// Construct one [`VisionAnalyzer`] per worker thread via
@@ -999,18 +737,6 @@ fn apple_vision_error(code: ErrorCode, message: impl Into<SmolStr>) -> ErrorInfo
 #[cfg(not(target_vendor = "apple"))]
 fn apple_vision_error(code: ErrorCode, message: &'static str) -> ErrorInfo {
   ErrorInfo::new(code, message)
-}
-
-// Used by the (currently commented) service-framework `handle_message` plumbing
-// — kept here so we don't have to rewrite the error path when the service
-// block is re-enabled.
-#[cfg(target_vendor = "apple")]
-#[allow(dead_code)]
-fn apple_vision_keyframe_error(keyframe_id: Id, error: ErrorInfo) -> ErrorInfo {
-  apple_vision_error(
-    error.code(),
-    SmolStr::from(format!("keyframe {}: {}", keyframe_id, error.message())),
-  )
 }
 
 #[cfg(target_vendor = "apple")]
@@ -3754,5 +3480,18 @@ mod macos_tests {
     // max_x = width - 1 is OK (right edge); max_x = width is corrupt.
     assert!(normalized_bbox_from_pixel_bounds(0, 0, 100, 0, 100, 1).is_none());
     assert!(normalized_bbox_from_pixel_bounds(0, 0, 0, 100, 1, 100).is_none());
+  }
+
+  /// Regression pin: `SimdFloat4x4::ENCODING` must format as
+  /// `{?=[4]}` to match Clang's `@encode(simd_float4x4)` and the
+  /// runtime metadata of `-[VNHumanBodyRecognizedPoint3D position]`.
+  /// The previous `Encoding::Unknown` element rendered as `{?=[4?]}`
+  /// and silently broke every msg_send for that selector under
+  /// `catch_unwind`. Pinning the string here so a future objc2
+  /// upgrade or accidental edit surfaces as a test failure.
+  #[test]
+  fn simd_float4x4_encoding_matches_clang_at_encode() {
+    assert_eq!(SimdFloat4::ENCODING.to_string(), "");
+    assert_eq!(SimdFloat4x4::ENCODING.to_string(), "{?=[4]}");
   }
 }

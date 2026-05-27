@@ -997,10 +997,28 @@ const fn default_num_workers() -> usize {
   1
 }
 
+// Mirror the `with_workers` / `set_workers` 0 -> 1 coercion at the serde
+// boundary so a `{"num_workers": 0}` config can't silently produce a
+// zero-worker service.
+#[cfg(feature = "serde")]
+fn deserialize_num_workers<'de, D>(deserializer: D) -> Result<usize, D::Error>
+where
+  D: serde::Deserializer<'de>,
+{
+  let n = usize::deserialize(deserializer)?;
+  Ok(if n == 0 { 1 } else { n })
+}
+
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct ServiceOptions {
-  #[cfg_attr(feature = "serde", serde(default = "default_num_workers"))]
+  #[cfg_attr(
+    feature = "serde",
+    serde(
+      default = "default_num_workers",
+      deserialize_with = "deserialize_num_workers"
+    )
+  )]
   num_workers: usize,
   #[cfg_attr(feature = "serde", serde(default))]
   classifications: AppleVisionClassificationOptions,
