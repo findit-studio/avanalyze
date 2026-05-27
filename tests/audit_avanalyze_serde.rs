@@ -144,14 +144,13 @@ mod serde_tests {
   }
 
   #[test]
-  fn serde_num_workers_zero_not_coerced_in_serde() {
-    // serde deserialization bypasses the with_workers() coercion
+  fn serde_num_workers_zero_coerced_to_one() {
+    // `{"num_workers": 0}` must produce the same value as `with_workers(0)`
+    // (coerced to 1) — a custom `deserialize_with` mirrors the runtime
+    // setter contract at the serde boundary.
     let json = r#"{"num_workers": 0}"#;
     let o: ServiceOptions = serde_json::from_str(json).expect("zero workers json");
-    // Note: serde sets the raw value 0, the coercion only happens via with_workers()
-    // This is a design consideration - serde deserialization may produce num_workers=0
-    // which contradicts the with_workers() coercion. This is a potential finding.
-    assert_eq!(o.num_workers(), 0, "serde bypasses the 0->1 coercion");
+    assert_eq!(o.num_workers(), 1, "0 must be coerced to 1");
   }
 
   // ── Serde with extreme values ───────────────────────────────
