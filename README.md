@@ -18,14 +18,21 @@ Long-running Apple Vision.framework worker that analyses keyframes and emits
 single [`VisionAnalyzer`] owns one of every supported request kind
 (face / body-pose / body-pose-3D / hand-pose / classification /
 saliency / aesthetics / barcode / text / horizon / animal / animal-body-pose
-/ person-segmentation / person-instance-mask / document-segmentation /
-feature-print) at fixed, pinned revisions, and `analyze_keyframe(...)`
-runs them all against a single JPEG and packages the results into one
-[`mediaschema::Keyframe`].
+/ person-segmentation / person-instance-mask / document-segmentation)
+at fixed, pinned revisions, and `analyze_keyframe(...)` runs them all
+against a single JPEG and packages the results into one
+[`mediaschema::domain::Keyframe`].
 
-The output is **wire-shape** — the same proto-generated structs the
-indexer stores, so the engine writes straight through with no
-adapter layer.
+The output is the **validated domain shape** — `Keyframe<Uuid7>` with
+`try_new`-style detection value objects (`BoundingBox`, `Confidence`,
+`NormCoord`, …). Serialisation to the wire / sqlx / mongodb backends
+happens inside `mediaschema`, not at the engine boundary.
+
+Note: `feature_print` detections previously emitted by Apple's
+`VNGenerateImageFeaturePrintRequest` are no longer part of the
+keyframe payload — feature embeddings live in LanceDB keyed by the
+keyframe id under the locked schema, so they are produced by a
+separate downstream stage rather than at the Vision-engine boundary.
 
 ## Requirements
 

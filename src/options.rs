@@ -33,7 +33,6 @@ default_options!(
   AppleVisionHorizonOptions,
   AppleVisionDocumentSegmentationOptions,
   AppleVisionAestheticsOptions,
-  AppleVisionFeaturePrintOptions,
   AppleVisionPersonInstanceMaskOptions,
   AppleVisionPersonSegmentationOptions,
   ServiceOptions,
@@ -889,43 +888,6 @@ impl AppleVisionAestheticsOptions {
 }
 
 #[cfg_attr(not(tarpaulin), inline(always))]
-const fn default_feature_print_min_element_count() -> usize {
-  1
-}
-
-#[derive(Debug, Clone, Copy)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct AppleVisionFeaturePrintOptions {
-  min_element_count: usize,
-}
-
-impl AppleVisionFeaturePrintOptions {
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn new() -> Self {
-    Self {
-      min_element_count: default_feature_print_min_element_count(),
-    }
-  }
-
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn with_min_element_count(mut self, min_element_count: usize) -> Self {
-    self.set_min_element_count(min_element_count);
-    self
-  }
-
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn set_min_element_count(&mut self, min_element_count: usize) -> &mut Self {
-    self.min_element_count = min_element_count;
-    self
-  }
-
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn min_element_count(&self) -> usize {
-    self.min_element_count
-  }
-}
-
-#[cfg_attr(not(tarpaulin), inline(always))]
 const fn default_person_instance_mask_min_confidence() -> f32 {
   0.1
 }
@@ -1075,8 +1037,6 @@ pub struct ServiceOptions {
   #[cfg_attr(feature = "serde", serde(default))]
   aesthetics: AppleVisionAestheticsOptions,
   #[cfg_attr(feature = "serde", serde(default))]
-  feature_print: AppleVisionFeaturePrintOptions,
-  #[cfg_attr(feature = "serde", serde(default))]
   person_instance_masks: AppleVisionPersonInstanceMaskOptions,
   #[cfg_attr(feature = "serde", serde(default))]
   person_segmentation_masks: AppleVisionPersonSegmentationOptions,
@@ -1104,7 +1064,6 @@ impl ServiceOptions {
       horizon: AppleVisionHorizonOptions::new(),
       document_segments: AppleVisionDocumentSegmentationOptions::new(),
       aesthetics: AppleVisionAestheticsOptions::new(),
-      feature_print: AppleVisionFeaturePrintOptions::new(),
       person_instance_masks: AppleVisionPersonInstanceMaskOptions::new(),
       person_segmentation_masks: AppleVisionPersonSegmentationOptions::new(),
     }
@@ -1295,16 +1254,6 @@ impl ServiceOptions {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn aesthetics_mut(&mut self) -> &mut AppleVisionAestheticsOptions {
     &mut self.aesthetics
-  }
-
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn feature_print(&self) -> AppleVisionFeaturePrintOptions {
-    self.feature_print
-  }
-
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn feature_print_mut(&mut self) -> &mut AppleVisionFeaturePrintOptions {
-    &mut self.feature_print
   }
 
   #[cfg_attr(not(tarpaulin), inline(always))]

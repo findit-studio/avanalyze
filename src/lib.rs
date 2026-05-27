@@ -18,18 +18,28 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 
 #[cfg(target_vendor = "apple")]
 use bytes::Bytes;
+use mediaframe::frame::Dimensions;
 #[cfg(target_vendor = "apple")]
-use mediaschema::{
+use mediaschema::domain::aggregates::video::{
   Aesthetics, AnimalAnalysis, BarcodeDetection, BodyPose3DDetection, BodyPose3DHeightEstimation,
-  BodyPose3DJoint, BodyPoseDetection, BodyPoseJoint, BoundingBox, ClassificationDetection,
-  Dimensions, DocumentSegment, FaceDetection, FaceLandmarkPoint, FaceLandmarkRegion,
-  FaceLandmarksDetection, FeaturePrint, HandChirality, HandPoseDetection, HorizonInfo,
-  HumanAnalysis, PersonInstanceMaskDetection, PersonSegmentationMask, SaliencyRegion,
+  BodyPose3DJoint, BodyPoseDetection, BodyPoseJoint, BoundingBox, Detection, DocumentSegment,
+  FaceDetection, FaceLandmarkRegion, FaceLandmarksDetection, HandChirality, HandPoseDetection,
+  HorizonInfo, HumanAnalysis, PersonInstanceMaskDetection, PersonSegmentationMask, SaliencyRegion,
   SubjectDetection, TextDetection,
 };
-use mediaschema::{ErrorInfo, Id, Keyframe, domain::ErrorCode};
+use mediaschema::domain::{ErrorCode, ErrorInfo, Keyframe, KeyframeExtractor, Uuid7};
+use mediatime::Timestamp;
 
-use wire_ext::*;
+// The domain `Keyframe` is generic over its `Id` type; avanalyze
+// specialises on `Uuid7` (mediaschema's domain identifier). `Id` was
+// previously a wire-record alias for `Bytes`; under the domain
+// migration it becomes the typed `Uuid7`.
+//
+// Held as a doc alias rather than a re-export so the (commented)
+// service-framework block keeps compiling against the new identifier
+// type without a churn-only rename.
+#[cfg(target_vendor = "apple")]
+type Id = Uuid7;
 
 // use tracing::{info, warn};
 
@@ -58,10 +68,6 @@ use smol_str::{SmolStr, StrExt, ToSmolStr};
 pub use options::*;
 
 mod options;
-// `wire_ext` is platform-independent — it bridges mediaschema wire
-// types to richer ergonomic builders. Both the macOS Vision engine and
-// the non-macOS stub use `ErrorInfoExt::new` to construct errors.
-mod wire_ext;
 
 #[cfg(target_vendor = "apple")]
 #[repr(C, align(16))]
@@ -157,7 +163,11 @@ fn vision_bbox_to_schema(rect: CGRect) -> Option<BoundingBox> {
   if width <= 0.0 || height <= 0.0 {
     return None;
   }
-  Some(BoundingBox::new(left, top, width, height))
+  // The clamp logic above guarantees the validating-ctor invariants
+  // (finite, `[0, 1]`, positive extent, `left + width <= 1.0`); a
+  // failure here would be a regression in the upstream guards, not a
+  // real Vision input.
+  BoundingBox::try_new(left, top, width, height).ok()
 }
 
 /// Flip a Vision normalized point's y axis to match mediaschema's
@@ -209,13 +219,6 @@ fn finite_f32(v: f32) -> Option<f32> {
 /// driving the worker process into the allocator's abort path.
 #[cfg(target_vendor = "apple")]
 const MAX_MASK_BYTES: usize = 64 * 1024 * 1024;
-
-/// Upper bound on a single Vision FeaturePrint payload. Apple's
-/// VNFeaturePrintObservation typically returns ~2 KiB per request;
-/// 64 MiB is a generous upper bound against a corrupted or
-/// adversarial `NSData` length.
-#[cfg(target_vendor = "apple")]
-const MAX_FEATURE_PRINT_BYTES: usize = 64 * 1024 * 1024;
 
 /// Upper bound on the number of landmark points per face-landmark
 /// region. Vision's `allPoints` is ~76 points; per-feature regions
@@ -431,7 +434,14 @@ fn effective_results_cap(user_max: usize) -> usize {
 /// Returns `None` on either violation; the caller propagates that
 /// `None` so the detection is dropped rather than triggering UB or
 /// the allocator's abort path.
+///
+/// Currently exercised only by the unit-test suite — the last
+/// in-engine caller (the FeaturePrint copy path) was removed when
+/// the `feature_print` field migrated to LanceDB. The helper is
+/// retained because future FFI byte-slice surfaces will need the
+/// same precondition gate.
 #[cfg(target_vendor = "apple")]
+#[allow(dead_code)]
 #[inline]
 fn validate_raw_slice_bytes(byte_len: usize, max_bytes: usize) -> Option<()> {
   if byte_len > max_bytes {
@@ -515,7 +525,7 @@ fn sanitize_body_height_pair(
 ) -> (f32, BodyPose3DHeightEstimation) {
   match finite_f32(raw_height) {
     Some(finite) => (finite, measured_or_reference),
-    None => (0.0, BODY_POSE_3D_HEIGHT_ESTIMATION_UNKNOWN),
+    None => (0.0, BodyPose3DHeightEstimation::Unknown),
   }
 }
 
@@ -587,7 +597,11 @@ fn pose_bbox_from_joint_bounds(
   if width <= 0.0 || height <= 0.0 {
     return None;
   }
-  Some(BoundingBox::new(min_x, min_y, width, height))
+  // Joints are sanitised individually upstream (each goes through
+  // `vision_point_to_schema` which clamps to `[0, 1]`), so the
+  // derived bbox should satisfy the domain invariants. Drop on the
+  // off-chance the validator rejects.
+  BoundingBox::try_new(min_x, min_y, width, height).ok()
 }
 
 /// Validate a raw Vision `confidence` value against the configured
@@ -975,21 +989,27 @@ struct VisionRequests {
   horizon: Retained<VNDetectHorizonRequest>,
   document_segments: Retained<VNDetectDocumentSegmentationRequest>,
   aesthetics: Retained<VNCalculateImageAestheticsScoresRequest>,
-  feature_print: Retained<VNGenerateImageFeaturePrintRequest>,
 }
 
-fn apple_vision_error(code: ErrorCode, message: impl Into<String>) -> ErrorInfo {
-  ErrorInfo::new(code, message.into())
+#[cfg(target_vendor = "apple")]
+fn apple_vision_error(code: ErrorCode, message: impl Into<SmolStr>) -> ErrorInfo {
+  ErrorInfo::new(code, message)
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn apple_vision_error(code: ErrorCode, message: &'static str) -> ErrorInfo {
+  ErrorInfo::new(code, message)
 }
 
 // Used by the (currently commented) service-framework `handle_message` plumbing
 // — kept here so we don't have to rewrite the error path when the service
 // block is re-enabled.
+#[cfg(target_vendor = "apple")]
 #[allow(dead_code)]
 fn apple_vision_keyframe_error(keyframe_id: Id, error: ErrorInfo) -> ErrorInfo {
   apple_vision_error(
     error.code(),
-    format!("keyframe {:?}: {}", keyframe_id, error.message()),
+    SmolStr::from(format!("keyframe {}: {}", keyframe_id, error.message())),
   )
 }
 
@@ -1062,9 +1082,6 @@ impl VisionRequests {
       let aesthetics = VNCalculateImageAestheticsScoresRequest::new();
       aesthetics.setRevision(VNCalculateImageAestheticsScoresRequestRevision1);
 
-      let feature_print = VNGenerateImageFeaturePrintRequest::new();
-      feature_print.setRevision(VNGenerateImageFeaturePrintRequestRevision2);
-
       Self {
         classify,
         face_rectangles,
@@ -1085,7 +1102,6 @@ impl VisionRequests {
         horizon,
         document_segments,
         aesthetics,
-        feature_print,
       }
     }
   }
@@ -1112,7 +1128,6 @@ impl VisionRequests {
         Retained::cast_unchecked::<VNRequest>(self.horizon.clone()),
         Retained::cast_unchecked::<VNRequest>(self.document_segments.clone()),
         Retained::cast_unchecked::<VNRequest>(self.aesthetics.clone()),
-        Retained::cast_unchecked::<VNRequest>(self.feature_print.clone()),
       ]);
 
       handler
@@ -1169,7 +1184,6 @@ impl VisionAnalyzer {
         horizon_rev = self.requests.horizon.revision(),
         document_segments_rev = self.requests.document_segments.revision(),
         aesthetics_rev = self.requests.aesthetics.revision(),
-        feature_print_rev = self.requests.feature_print.revision(),
         "initialized pinned Apple Vision request revisions"
       );
     }
@@ -1179,12 +1193,21 @@ impl VisionAnalyzer {
   /// the supplied JPEG bytes and gather the resulting detections into a
   /// fully-populated [`Keyframe`].
   ///
-  /// `scene_id` and `keyframe_id` are attached verbatim to the returned
-  /// `Keyframe`; the engine does not derive or generate identifiers itself.
+  /// `scene_id`, `keyframe_id`, `pts`, `dimensions`, and `extractor` are
+  /// supplied by the caller and attached verbatim to the returned
+  /// `Keyframe`; the engine does not derive or generate identifiers or
+  /// frame metadata itself. The widened signature (vs. the pre-domain
+  /// shape that only took the two ids) is required by
+  /// `mediaschema::Keyframe::try_new`, which enforces non-nil ids,
+  /// positive `Dimensions`, a `pts` `Timestamp`, and a
+  /// `KeyframeExtractor` tag at construction time.
   pub fn analyze_keyframe(
     &self,
     scene_id: Id,
     keyframe_id: Id,
+    pts: Timestamp,
+    dimensions: Dimensions,
+    extractor: KeyframeExtractor,
     jpeg_data: &[u8],
   ) -> Result<Keyframe, ErrorInfo> {
     // Input-byte budget — refuse oversized payloads BEFORE
@@ -1197,6 +1220,17 @@ impl VisionAnalyzer {
         SmolStr::new_static("input image exceeds MAX_INPUT_IMAGE_BYTES"),
       ));
     }
+    // Construct the keyframe shell BEFORE running Vision so the
+    // domain `try_new` invariants (non-nil ids + positive
+    // dimensions) surface as structured `ErrorInfo` before we
+    // perform the expensive image work.
+    let keyframe =
+      Keyframe::try_new(keyframe_id, scene_id, pts, dimensions, extractor).map_err(|e| {
+        apple_vision_error(
+          ErrorCode::AppleVisionRequestFailed,
+          SmolStr::from(format!("keyframe construction failed: {e}")),
+        )
+      })?;
     objc2::rc::autoreleasepool(|_| {
       let ns_data = NSData::with_bytes(jpeg_data);
       let handler = unsafe { VNSequenceRequestHandler::new() };
@@ -1222,9 +1256,7 @@ impl VisionAnalyzer {
       );
 
       Ok(
-        Keyframe::default()
-          .with_id(keyframe_id)
-          .with_scene_id(scene_id)
+        keyframe
           .with_classifications(self.extract_classifications())
           .with_humans(
             HumanAnalysis::new()
@@ -1249,13 +1281,12 @@ impl VisionAnalyzer {
           .with_objectness_saliency(self.extract_objectness_saliency())
           .with_horizon(self.extract_horizon())
           .with_document_segments(self.extract_document_segments())
-          .with_feature_print(self.extract_feature_print())
           .with_aesthetics(self.extract_aesthetics()),
       )
     })
   }
 
-  fn extract_classifications(&self) -> Vec<ClassificationDetection> {
+  fn extract_classifications(&self) -> Vec<Detection> {
     let opts = self.opts.classifications();
     let Some(results) = (unsafe { self.requests.classify.results() }) else {
       return Vec::new();
@@ -1281,8 +1312,10 @@ impl VisionAnalyzer {
         continue;
       };
       let label = normalize_classification_label(label);
-      if !label.is_empty() {
-        tags.push(ClassificationDetection::new(label, confidence));
+      if !label.is_empty()
+        && let Ok(detection) = Detection::try_new(label, confidence)
+      {
+        tags.push(detection);
       }
     }
 
@@ -1316,30 +1349,22 @@ impl VisionAnalyzer {
       let Some(bbox) = vision_bbox_to_schema(unsafe { obs.boundingBox() }.standardize()) else {
         continue;
       };
-      faces.push(
-        FaceDetection::default()
-          .with_bbox(bbox)
-          .with_confidence(confidence)
-          .with_capture_quality(capture_quality)
-          .with_roll(
-            unsafe { obs.roll() }
-              .map(|v| v.floatValue())
-              .and_then(finite_f32)
-              .unwrap_or(0.0),
-          )
-          .with_yaw(
-            unsafe { obs.yaw() }
-              .map(|v| v.floatValue())
-              .and_then(finite_f32)
-              .unwrap_or(0.0),
-          )
-          .with_pitch(
-            unsafe { obs.pitch() }
-              .map(|v| v.floatValue())
-              .and_then(finite_f32)
-              .unwrap_or(0.0),
-          ),
-      );
+      let roll = unsafe { obs.roll() }
+        .map(|v| v.floatValue())
+        .and_then(finite_f32)
+        .unwrap_or(0.0);
+      let yaw = unsafe { obs.yaw() }
+        .map(|v| v.floatValue())
+        .and_then(finite_f32)
+        .unwrap_or(0.0);
+      let pitch = unsafe { obs.pitch() }
+        .map(|v| v.floatValue())
+        .and_then(finite_f32)
+        .unwrap_or(0.0);
+      if let Ok(face) = FaceDetection::try_new(bbox, confidence, capture_quality, roll, yaw, pitch)
+      {
+        faces.push(face);
+      }
     }
 
     faces
@@ -1362,29 +1387,23 @@ impl VisionAnalyzer {
       let Some(bbox) = vision_bbox_to_schema(unsafe { obs.boundingBox() }.standardize()) else {
         continue;
       };
-      faces.push(
-        FaceDetection::default()
-          .with_bbox(bbox)
-          .with_confidence(confidence)
-          .with_roll(
-            unsafe { obs.roll() }
-              .map(|v| v.floatValue())
-              .and_then(finite_f32)
-              .unwrap_or(0.0),
-          )
-          .with_yaw(
-            unsafe { obs.yaw() }
-              .map(|v| v.floatValue())
-              .and_then(finite_f32)
-              .unwrap_or(0.0),
-          )
-          .with_pitch(
-            unsafe { obs.pitch() }
-              .map(|v| v.floatValue())
-              .and_then(finite_f32)
-              .unwrap_or(0.0),
-          ),
-      );
+      let roll = unsafe { obs.roll() }
+        .map(|v| v.floatValue())
+        .and_then(finite_f32)
+        .unwrap_or(0.0);
+      let yaw = unsafe { obs.yaw() }
+        .map(|v| v.floatValue())
+        .and_then(finite_f32)
+        .unwrap_or(0.0);
+      let pitch = unsafe { obs.pitch() }
+        .map(|v| v.floatValue())
+        .and_then(finite_f32)
+        .unwrap_or(0.0);
+      // `face_rectangles` carries no capture quality from Vision —
+      // default to 0.0 (the type does not range-validate it).
+      if let Ok(face) = FaceDetection::try_new(bbox, confidence, 0.0, roll, yaw, pitch) {
+        faces.push(face);
+      }
     }
 
     faces
@@ -1458,9 +1477,15 @@ impl VisionAnalyzer {
       let Some(bbox) = vision_bbox_to_schema(face_rect_vision) else {
         continue;
       };
+      let Ok(detection) = FaceLandmarksDetection::try_new(bbox, confidence, regions) else {
+        // The confidence has already been sanitised; a failure here
+        // would be a domain-validator regression rather than real
+        // Vision input — skip rather than abort the frame.
+        continue;
+      };
       // Commit the budget — the detection is being pushed.
       total_points_remaining = tentative_remaining;
-      detections.push(FaceLandmarksDetection::new(bbox, confidence, regions));
+      detections.push(detection);
     }
 
     detections
@@ -1483,11 +1508,10 @@ impl VisionAnalyzer {
       let Some(bbox) = vision_bbox_to_schema(unsafe { obs.boundingBox() }.standardize()) else {
         continue;
       };
-      humans.push(SubjectDetection::new(
-        SmolStr::from("person"),
-        confidence,
-        bbox,
-      ));
+      let Ok(detection) = Detection::try_new(SmolStr::new_static("person"), confidence) else {
+        continue;
+      };
+      humans.push(SubjectDetection::new(detection, bbox));
     }
 
     humans
@@ -1550,7 +1574,10 @@ impl VisionAnalyzer {
         max_x = max_x.max(x);
         max_y = max_y.max(y);
 
-        joints.push(BodyPoseJoint::new(name, x, y, confidence));
+        let Ok(joint) = BodyPoseJoint::try_new(name, x, y, confidence) else {
+          continue;
+        };
+        joints.push(joint);
       }
 
       if joints.is_empty() {
@@ -1572,7 +1599,9 @@ impl VisionAnalyzer {
       };
 
       joints.sort_by(|lhs, rhs| lhs.name().cmp(rhs.name()));
-      body_poses.push(BodyPoseDetection::new(bbox, pose_confidence, joints));
+      if let Ok(pose) = BodyPoseDetection::try_new(bbox, pose_confidence, joints) {
+        body_poses.push(pose);
+      }
     }
 
     body_poses
@@ -1625,7 +1654,10 @@ impl VisionAnalyzer {
             continue;
           };
 
-          joints.push(BodyPose3DJoint::new(name, x, y, z, confidence));
+          let Ok(joint) = BodyPose3DJoint::try_new(name, x, y, z, confidence) else {
+            continue;
+          };
+          joints.push(joint);
         }
 
         if joints.is_empty() {
@@ -1644,12 +1676,11 @@ impl VisionAnalyzer {
           map_body_pose_3d_height_estimation(unsafe { obs.heightEstimation() });
         let (body_height, height_estimation) =
           sanitize_body_height_pair(unsafe { obs.bodyHeight() }, mapped_estimation);
-        body_poses.push(BodyPose3DDetection::new(
-          pose_confidence,
-          body_height,
-          height_estimation,
-          joints,
-        ));
+        if let Ok(pose) =
+          BodyPose3DDetection::try_new(pose_confidence, body_height, height_estimation, joints)
+        {
+          body_poses.push(pose);
+        }
       }
 
       body_poses
@@ -1717,7 +1748,10 @@ impl VisionAnalyzer {
         max_x = max_x.max(x);
         max_y = max_y.max(y);
 
-        joints.push(BodyPoseJoint::new(name, x, y, confidence));
+        let Ok(joint) = BodyPoseJoint::try_new(name, x, y, confidence) else {
+          continue;
+        };
+        joints.push(joint);
       }
 
       if joints.is_empty() {
@@ -1732,12 +1766,14 @@ impl VisionAnalyzer {
       };
 
       joints.sort_by(|lhs, rhs| lhs.name().cmp(rhs.name()));
-      hand_poses.push(HandPoseDetection::new(
+      if let Ok(pose) = HandPoseDetection::try_new(
         bbox,
         pose_confidence,
         map_hand_chirality(unsafe { obs.chirality() }),
         joints,
-      ));
+      ) {
+        hand_poses.push(pose);
+      }
     }
 
     hand_poses
@@ -1829,15 +1865,25 @@ impl VisionAnalyzer {
           continue;
         };
 
-        *total_mask_bytes = total_mask_bytes.saturating_add(data.len());
-        *total_mask_count = total_mask_count.saturating_add(1);
-        masks.push(PersonInstanceMaskDetection::new(
+        let data_len = data.len();
+        match PersonInstanceMaskDetection::try_new(
           bbox,
           confidence,
           wire_instance_index,
           dimensions,
           data,
-        ));
+        ) {
+          Ok(mask) => {
+            *total_mask_bytes = total_mask_bytes.saturating_add(data_len);
+            *total_mask_count = total_mask_count.saturating_add(1);
+            masks.push(mask);
+          }
+          Err(_) => {
+            // Validator rejected — `dimensions` already verified
+            // > 0 and `data` non-empty before reaching here, so
+            // this only triggers on a future invariant addition.
+          }
+        }
 
         instance_index = instances.indexGreaterThanIndex(instance_index);
       }
@@ -1891,11 +1937,12 @@ impl VisionAnalyzer {
         continue;
       };
 
-      *total_mask_bytes = total_mask_bytes.saturating_add(data.len());
-      *total_mask_count = total_mask_count.saturating_add(1);
-      masks.push(PersonSegmentationMask::new(
-        bbox, confidence, dimensions, data,
-      ));
+      let data_len = data.len();
+      if let Ok(mask) = PersonSegmentationMask::try_new(bbox, confidence, dimensions, data) {
+        *total_mask_bytes = total_mask_bytes.saturating_add(data_len);
+        *total_mask_count = total_mask_count.saturating_add(1);
+        masks.push(mask);
+      }
     }
 
     masks
@@ -1932,8 +1979,9 @@ impl VisionAnalyzer {
           };
           if !id.is_empty()
             && let Some(bbox) = vision_bbox_to_schema(obs.boundingBox().standardize())
+            && let Ok(detection) = Detection::try_new(id, confidence)
           {
-            animals.push(SubjectDetection::new(id, confidence, bbox));
+            animals.push(SubjectDetection::new(detection, bbox));
           }
         }
       }
@@ -2001,7 +2049,10 @@ impl VisionAnalyzer {
         max_x = max_x.max(x);
         max_y = max_y.max(y);
 
-        joints.push(BodyPoseJoint::new(name, x, y, confidence));
+        let Ok(joint) = BodyPoseJoint::try_new(name, x, y, confidence) else {
+          continue;
+        };
+        joints.push(joint);
       }
 
       if joints.is_empty() {
@@ -2016,7 +2067,9 @@ impl VisionAnalyzer {
       };
 
       joints.sort_by(|lhs, rhs| lhs.name().cmp(rhs.name()));
-      body_poses.push(BodyPoseDetection::new(bbox, pose_confidence, joints));
+      if let Ok(pose) = BodyPoseDetection::try_new(bbox, pose_confidence, joints) {
+        body_poses.push(pose);
+      }
     }
 
     body_poses
@@ -2060,8 +2113,10 @@ impl VisionAnalyzer {
         let Some(confidence) = sanitize_confidence(candidate.confidence(), 0.0) else {
           continue;
         };
-        if let Some(bbox) = vision_bbox_to_schema(unsafe { obs.boundingBox() }.standardize()) {
-          text_detections.push(TextDetection::new(text, confidence, bbox));
+        if let Some(bbox) = vision_bbox_to_schema(unsafe { obs.boundingBox() }.standardize())
+          && let Ok(detection) = TextDetection::try_new(text, confidence, bbox)
+        {
+          text_detections.push(detection);
         }
       }
     }
@@ -2094,7 +2149,9 @@ impl VisionAnalyzer {
           let Some(symbology) = ffi_nsstring_to_smolstr(&raw_sym) else {
             continue;
           };
-          barcodes.push(BarcodeDetection::new(s, symbology, confidence, bbox));
+          if let Ok(barcode) = BarcodeDetection::try_new(s, symbology, confidence, bbox) {
+            barcodes.push(barcode);
+          }
         }
       }
     }
@@ -2153,33 +2210,40 @@ impl VisionAnalyzer {
         else {
           continue;
         };
-        regions.push(SaliencyRegion::new(bbox, confidence));
+        let Ok(region) = SaliencyRegion::try_new(bbox, confidence) else {
+          continue;
+        };
+        regions.push(region);
       }
     }
     regions
   }
 
   fn extract_horizon(&self) -> HorizonInfo {
+    // Domain `HorizonInfo` has no `Default` impl — `try_new(0.0, 0.0)`
+    // is the canonical "no detection" sentinel (both arguments are
+    // trivially in-range, so the `try_new` cannot fail).
+    let empty = HorizonInfo::try_new(0.0, 0.0).expect("zero confidence + zero angle is in range");
     let Some(results) = (unsafe { self.requests.horizon.results() }) else {
-      return HorizonInfo::default();
+      return empty;
     };
     let Some(observation) = results.iter().next() else {
-      return HorizonInfo::default();
+      return empty;
     };
     let Some(confidence) = sanitize_confidence(
       unsafe { observation.confidence() },
       self.opts.horizon().min_confidence(),
     ) else {
-      return HorizonInfo::default();
+      return empty;
     };
 
     // Drop the horizon detection entirely if the angle is non-finite —
     // there is no sensible default for a horizon line and downstream
     // visualisation would render a bogus tilt.
     let Some(angle) = finite_f32(unsafe { observation.angle() } as f32) else {
-      return HorizonInfo::default();
+      return empty;
     };
-    HorizonInfo::new(angle, confidence)
+    HorizonInfo::try_new(angle, confidence).unwrap_or(empty)
   }
 
   fn extract_document_segments(&self) -> Vec<DocumentSegment> {
@@ -2235,95 +2299,42 @@ impl VisionAnalyzer {
       // Even after per-corner clamping, the resulting quad can be
       // degenerate (coincident corners, zero shoelace area, or
       // self-intersecting) when Vision returned an off-screen segment
-      // or near-collinear corners. mediaschema's domain
-      // `DocumentSegment::try_new` runs the same geometry guards
-      // (collapsed corners, zero area, bow-tie / inconsistent winding)
-      // that downstream consumers will apply, so we validate via that
-      // constructor and only emit the wire segment on success.
-      if mediaschema::domain::aggregates::video::DocumentSegment::try_new(
-        top_left,
-        top_right,
-        bottom_right,
-        bottom_left,
-        confidence,
-      )
-      .is_err()
-      {
+      // or near-collinear corners. `DocumentSegment::try_new` runs the
+      // full geometry guards (collapsed corners, zero area, bow-tie /
+      // inconsistent winding); a failure means the quad is not a real
+      // document detection and the segment is dropped.
+      let Ok(segment) =
+        DocumentSegment::try_new(top_left, top_right, bottom_right, bottom_left, confidence)
+      else {
         continue;
-      }
-
-      segments.push(
-        DocumentSegment::default()
-          .with_top_left(top_left)
-          .with_top_right(top_right)
-          .with_bottom_left(bottom_left)
-          .with_bottom_right(bottom_right)
-          .with_confidence(confidence),
-      );
+      };
+      segments.push(segment);
     }
 
     segments
   }
 
   fn extract_aesthetics(&self) -> Aesthetics {
+    // Domain `Aesthetics` has no `Default` impl — `new(0.0, false)`
+    // is the canonical "no detection" sentinel.
+    let empty = Aesthetics::new(0.0, false);
     let Some(results) = (unsafe { self.requests.aesthetics.results() }) else {
-      return Aesthetics::default();
+      return empty;
     };
     let Some(obs) = results.iter().next() else {
-      return Aesthetics::default();
+      return empty;
     };
     // `NaN < threshold` would fail open. Force a finite check at the
     // gate so a glitched aesthetics score collapses to the default
     // (no detection) instead of being silently admitted to the wire.
     let Some(overall_score) = finite_f32(unsafe { obs.overallScore() }) else {
-      return Aesthetics::default();
+      return empty;
     };
     if overall_score < self.opts.aesthetics().min_overall_score() {
-      return Aesthetics::default();
+      return empty;
     }
 
     Aesthetics::new(overall_score, unsafe { obs.isUtility() })
-  }
-
-  fn extract_feature_print(&self) -> FeaturePrint {
-    let Some(results) = (unsafe { self.requests.feature_print.results() }) else {
-      return FeaturePrint::default();
-    };
-    let Some(obs) = results.iter().next() else {
-      return FeaturePrint::default();
-    };
-    let count = unsafe { obs.elementCount() };
-    if count < self.opts.feature_print().min_element_count() {
-      return FeaturePrint::default();
-    }
-
-    let ns_data = unsafe { obs.data() };
-    let len = ns_data.len();
-    if len == 0 {
-      return FeaturePrint::default();
-    }
-    // Pre-validate the raw-slice preconditions (cap + isize::MAX)
-    // BEFORE the unsafe slice construction. Same policy as
-    // `validate_mask_dims_for_slice` for `CVPixelBuffer` payloads.
-    if validate_raw_slice_bytes(len, MAX_FEATURE_PRINT_BYTES).is_none() {
-      return FeaturePrint::default();
-    }
-    let ptr: *const std::ffi::c_void = unsafe { objc2::msg_send![&*ns_data, bytes] };
-    if ptr.is_null() {
-      return FeaturePrint::default();
-    }
-    // Fallible copy: `to_vec` allocates infallibly; switch to
-    // `try_reserve_exact` so an allocator failure on a borderline-
-    // legal payload returns a default detection instead of aborting
-    // the worker process.
-    let src = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
-    let mut data: Vec<u8> = Vec::new();
-    if data.try_reserve_exact(len).is_err() {
-      return FeaturePrint::default();
-    }
-    data.extend_from_slice(src);
-    let element_type = u32::try_from(unsafe { obs.elementType() }.0).unwrap_or_default();
-    FeaturePrint::new(Bytes::from(data), element_type)
   }
 }
 
@@ -2350,9 +2361,9 @@ fn extract_body_pose_3d_coordinates(
 #[cfg(target_vendor = "apple")]
 fn map_hand_chirality(chirality: VNChirality) -> HandChirality {
   match chirality {
-    VNChirality::Left => HAND_CHIRALITY_LEFT,
-    VNChirality::Right => HAND_CHIRALITY_RIGHT,
-    _ => HAND_CHIRALITY_UNKNOWN,
+    VNChirality::Left => HandChirality::Left,
+    VNChirality::Right => HandChirality::Right,
+    _ => HandChirality::Unknown,
   }
 }
 
@@ -2466,7 +2477,12 @@ fn push_face_landmark_region(
   // `validate_raw_slice_elems::<CGPoint>` above), so the slice
   // length fits both the FFI buffer and the `isize::MAX` contract.
   let points = unsafe { std::slice::from_raw_parts(points_ptr, region_cap) };
-  let mut emitted_points: Vec<FaceLandmarkPoint> = Vec::with_capacity(region_cap);
+  // Domain `FaceLandmarkRegion::try_new` stores points as
+  // `(NormCoord, NormCoord)` pairs — pass raw `(f32, f32)` tuples
+  // and let the validator handle the wrap. Every point is already
+  // sanitised through `vision_point_to_schema` (finite + clamped to
+  // `[0, 1]`), so the validator's `NormCoord::try_new` cannot reject.
+  let mut emitted_points: Vec<(f32, f32)> = Vec::with_capacity(region_cap);
   for point in points.iter() {
     // Apple's convention: landmark points are normalized within the
     // face's normalized bbox (NOT the image). Project to image-
@@ -2477,17 +2493,21 @@ fn push_face_landmark_region(
     // meaningful.
     let projected = project_landmark_to_image(*point, face_bbox_vision);
     if let Some((x, y)) = vision_point_to_schema(projected.x, projected.y) {
-      emitted_points.push(FaceLandmarkPoint::new(x, y));
+      emitted_points.push((x, y));
     }
   }
   if emitted_points.is_empty() {
     return;
   }
+  let emitted_len = emitted_points.len();
+  let Ok(region) = FaceLandmarkRegion::try_new(name, emitted_points) else {
+    return;
+  };
   // Decrement the shared budget by the number of points actually
   // emitted (finite-rejected points don't consume budget).
-  *total_points_remaining = total_points_remaining.saturating_sub(emitted_points.len());
+  *total_points_remaining = total_points_remaining.saturating_sub(emitted_len);
 
-  regions.push(FaceLandmarkRegion::new(name, emitted_points));
+  regions.push(region);
 }
 
 #[cfg(target_vendor = "apple")]
@@ -2495,11 +2515,11 @@ fn map_body_pose_3d_height_estimation(
   estimation: VNHumanBodyPose3DObservationHeightEstimation,
 ) -> BodyPose3DHeightEstimation {
   if estimation == VNHumanBodyPose3DObservationHeightEstimation::Measured {
-    BODY_POSE_3D_HEIGHT_ESTIMATION_MEASURED
+    BodyPose3DHeightEstimation::Measured
   } else if estimation == VNHumanBodyPose3DObservationHeightEstimation::Reference {
-    BODY_POSE_3D_HEIGHT_ESTIMATION_REFERENCE
+    BodyPose3DHeightEstimation::Reference
   } else {
-    BODY_POSE_3D_HEIGHT_ESTIMATION_UNKNOWN
+    BodyPose3DHeightEstimation::Unknown
   }
 }
 
@@ -2848,11 +2868,9 @@ fn normalized_bbox_from_pixel_bounds(
   if !(w > 0.0 && h > 0.0) {
     return None;
   }
-  // Domain validator as belt-and-suspenders: a future change to
-  // the math cannot silently re-introduce a wire bbox the storage
-  // layer rejects.
-  mediaschema::domain::aggregates::video::BoundingBox::try_new(left, top, w, h).ok()?;
-  Some(BoundingBox::new(left, top, w, h))
+  // The validating `try_new` IS the domain bbox — no wire fork to
+  // re-check.
+  BoundingBox::try_new(left, top, w, h).ok()
 }
 
 // ----- Non-macOS stub --------------------------------------------------------
@@ -2889,8 +2907,11 @@ impl VisionAnalyzer {
   /// `_jpeg_data` is ignored.
   pub fn analyze_keyframe(
     &self,
-    _scene_id: Id,
-    _keyframe_id: Id,
+    _scene_id: Uuid7,
+    _keyframe_id: Uuid7,
+    _pts: Timestamp,
+    _dimensions: Dimensions,
+    _extractor: KeyframeExtractor,
     _jpeg_data: &[u8],
   ) -> Result<Keyframe, ErrorInfo> {
     Err(apple_vision_error(
@@ -2902,19 +2923,21 @@ impl VisionAnalyzer {
 
 #[cfg(test)]
 mod tests {
-  use super::*;
+  use mediaschema::domain::aggregates::video::{
+    BodyPose3DDetection, BodyPose3DHeightEstimation, HumanAnalysis,
+  };
 
   /// Regression: `HumanAnalysis::with_body_poses_3d` previously dropped
-  /// its input on the floor. The wire `HumanAnalysis.body_poses_3d`
-  /// field has existed since the mediaschema mono-consolidation, so
-  /// the setter must persist the provided detections. Platform-
-  /// independent — the wire builder does not depend on Vision.
+  /// its input on the floor in the wire-types era. The locked domain
+  /// builder must still persist the supplied detections. Platform-
+  /// independent — the builder does not depend on Vision.
   #[test]
   fn body_poses_3d_survives_through_human_analysis() {
-    use mediaschema::{BodyPose3DDetection, HumanAnalysis};
-    let pose = BodyPose3DDetection::default();
+    let pose =
+      BodyPose3DDetection::try_new(0.5, 0.0, BodyPose3DHeightEstimation::Unknown, Vec::new())
+        .expect("validating ctor on canonical inputs");
     let analysis = HumanAnalysis::new().with_body_poses_3d(vec![pose]);
-    assert_eq!(analysis.body_poses_3d.len(), 1);
+    assert_eq!(analysis.body_poses_3d_slice().len(), 1);
   }
 
   /// Non-macOS `VisionAnalyzer` stub must report an Apple-Vision
@@ -2922,10 +2945,20 @@ mod tests {
   #[cfg(not(target_vendor = "apple"))]
   #[test]
   fn non_macos_stub_reports_unavailable() {
-    use mediaschema::{Id, domain::ErrorCode};
+    use super::*;
+    use core::num::NonZeroU32;
+    use mediatime::Timebase;
     let analyzer = VisionAnalyzer::new(ServiceOptions::new());
+    let tb = Timebase::new(1, NonZeroU32::new(1000).expect("nonzero den"));
     let err = analyzer
-      .analyze_keyframe(Id::default(), Id::default(), &[])
+      .analyze_keyframe(
+        Uuid7::new(),
+        Uuid7::new(),
+        Timestamp::new(0, tb),
+        Dimensions::new(320, 180),
+        KeyframeExtractor::Manual,
+        &[],
+      )
       .expect_err("stub must return Err");
     assert_eq!(err.code(), ErrorCode::AppleVisionFailed);
   }
@@ -2945,10 +2978,10 @@ mod macos_tests {
   fn vision_bbox_to_schema_flips_y() {
     let rect = CGRect::new(CGPoint::new(0.1, 0.2), CGSize::new(0.3, 0.4));
     let bbox = vision_bbox_to_schema(rect).expect("in-range rect must clamp to itself");
-    assert!((bbox.x - 0.1).abs() < 1e-6, "x: {}", bbox.x);
-    assert!((bbox.y - 0.4).abs() < 1e-6, "y: {}", bbox.y);
-    assert!((bbox.width - 0.3).abs() < 1e-6, "w: {}", bbox.width);
-    assert!((bbox.height - 0.4).abs() < 1e-6, "h: {}", bbox.height);
+    assert!((bbox.x() - 0.1).abs() < 1e-6, "x: {}", bbox.x());
+    assert!((bbox.y() - 0.4).abs() < 1e-6, "y: {}", bbox.y());
+    assert!((bbox.width() - 0.3).abs() < 1e-6, "w: {}", bbox.width());
+    assert!((bbox.height() - 0.4).abs() < 1e-6, "h: {}", bbox.height());
   }
 
   /// Lock the flipped full-image result against the validating domain
@@ -2958,11 +2991,11 @@ mod macos_tests {
   fn vision_bbox_to_schema_full_image_round_trip() {
     let rect = CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(1.0, 1.0));
     let bbox = vision_bbox_to_schema(rect).expect("unit rect must clamp to itself");
-    assert_eq!(bbox.x, 0.0);
-    assert_eq!(bbox.y, 0.0);
-    assert_eq!(bbox.width, 1.0);
-    assert_eq!(bbox.height, 1.0);
-    DomainBoundingBox::try_new(bbox.x, bbox.y, bbox.width, bbox.height)
+    assert_eq!(bbox.x(), 0.0);
+    assert_eq!(bbox.y(), 0.0);
+    assert_eq!(bbox.width(), 1.0);
+    assert_eq!(bbox.height(), 1.0);
+    DomainBoundingBox::try_new(bbox.x(), bbox.y(), bbox.width(), bbox.height())
       .expect("full-image bbox stays valid after flip");
   }
 
@@ -2976,12 +3009,12 @@ mod macos_tests {
     let rect = CGRect::new(CGPoint::new(0.8, 0.4), CGSize::new(0.5, 0.2));
     let bbox = vision_bbox_to_schema(rect).expect("partial overlap must produce a bbox");
     // Clamped right edge is 1.0 → width = 0.2 (1.0 - 0.8).
-    assert!((bbox.x - 0.8).abs() < 1e-6, "x: {}", bbox.x);
-    assert!((bbox.width - 0.2).abs() < 1e-6, "w: {}", bbox.width);
+    assert!((bbox.x() - 0.8).abs() < 1e-6, "x: {}", bbox.x());
+    assert!((bbox.width() - 0.2).abs() < 1e-6, "w: {}", bbox.width());
     // y in schema space: 1.0 - (0.4 + 0.2) = 0.4 (in-range, no clamp).
-    assert!((bbox.y - 0.4).abs() < 1e-6, "y: {}", bbox.y);
-    assert!((bbox.height - 0.2).abs() < 1e-6, "h: {}", bbox.height);
-    DomainBoundingBox::try_new(bbox.x, bbox.y, bbox.width, bbox.height)
+    assert!((bbox.y() - 0.4).abs() < 1e-6, "y: {}", bbox.y());
+    assert!((bbox.height() - 0.2).abs() < 1e-6, "h: {}", bbox.height());
+    DomainBoundingBox::try_new(bbox.x(), bbox.y(), bbox.width(), bbox.height())
       .expect("clamped bbox satisfies the [0,1] invariant");
   }
 
@@ -2996,11 +3029,11 @@ mod macos_tests {
     let rect = CGRect::new(CGPoint::new(0.1, -0.1), CGSize::new(0.3, 0.4));
     let bbox = vision_bbox_to_schema(rect).expect("partial overlap must produce a bbox");
     // Bottom clamped to 1.0 → height = 1.0 - 0.7 = 0.3.
-    assert!((bbox.x - 0.1).abs() < 1e-6, "x: {}", bbox.x);
-    assert!((bbox.y - 0.7).abs() < 1e-6, "y: {}", bbox.y);
-    assert!((bbox.width - 0.3).abs() < 1e-6, "w: {}", bbox.width);
-    assert!((bbox.height - 0.3).abs() < 1e-6, "h: {}", bbox.height);
-    DomainBoundingBox::try_new(bbox.x, bbox.y, bbox.width, bbox.height)
+    assert!((bbox.x() - 0.1).abs() < 1e-6, "x: {}", bbox.x());
+    assert!((bbox.y() - 0.7).abs() < 1e-6, "y: {}", bbox.y());
+    assert!((bbox.width() - 0.3).abs() < 1e-6, "w: {}", bbox.width());
+    assert!((bbox.height() - 0.3).abs() < 1e-6, "h: {}", bbox.height());
+    DomainBoundingBox::try_new(bbox.x(), bbox.y(), bbox.width(), bbox.height())
       .expect("clamped bbox satisfies the [0,1] invariant");
   }
 
@@ -3126,10 +3159,10 @@ mod macos_tests {
     // columns 5..=24. The expected normalized bbox is
     // `(5/100, 10/100, 20/100, 20/100)` in top-left convention.
     let bbox = normalized_bbox_from_pixel_bounds(5, 10, 24, 29, 100, 100).expect("valid bbox");
-    assert!((bbox.x - 0.05).abs() < 1e-6);
-    assert!((bbox.y - 0.10).abs() < 1e-6);
-    assert!((bbox.width - 0.20).abs() < 1e-6);
-    assert!((bbox.height - 0.20).abs() < 1e-6);
+    assert!((bbox.x() - 0.05).abs() < 1e-6);
+    assert!((bbox.y() - 0.10).abs() < 1e-6);
+    assert!((bbox.width() - 0.20).abs() < 1e-6);
+    assert!((bbox.height() - 0.20).abs() < 1e-6);
   }
 
   /// An all-zero 8-bit mask must yield `None` so the caller skips the
@@ -3158,10 +3191,10 @@ mod macos_tests {
     // Row 1, column 2 — stride 4.
     src[6] = 0xFF;
     let (bbox, packed) = process_mask_bytes_u8(4, 4, 4, &src).expect("foreground produces Some");
-    assert!((bbox.x - 0.5).abs() < 1e-6, "x: {}", bbox.x);
-    assert!((bbox.y - 0.25).abs() < 1e-6, "y: {}", bbox.y);
-    assert!((bbox.width - 0.25).abs() < 1e-6, "w: {}", bbox.width);
-    assert!((bbox.height - 0.25).abs() < 1e-6, "h: {}", bbox.height);
+    assert!((bbox.x() - 0.5).abs() < 1e-6, "x: {}", bbox.x());
+    assert!((bbox.y() - 0.25).abs() < 1e-6, "y: {}", bbox.y());
+    assert!((bbox.width() - 0.25).abs() < 1e-6, "w: {}", bbox.width());
+    assert!((bbox.height() - 0.25).abs() < 1e-6, "h: {}", bbox.height());
     // Packed bytes mirror the input (tight stride === input stride).
     assert_eq!(packed, src);
   }
@@ -3180,8 +3213,8 @@ mod macos_tests {
     let src_offset = 16 + 8;
     src[src_offset..src_offset + 4].copy_from_slice(&bytes);
     let (bbox, packed) = process_mask_bytes_f32(4, 4, 16, &src).expect("foreground produces Some");
-    assert!((bbox.x - 0.5).abs() < 1e-6, "x: {}", bbox.x);
-    assert!((bbox.y - 0.25).abs() < 1e-6, "y: {}", bbox.y);
+    assert!((bbox.x() - 0.5).abs() < 1e-6, "x: {}", bbox.x());
+    assert!((bbox.y() - 0.25).abs() < 1e-6, "y: {}", bbox.y());
     // Canonical 8-bit payload: 4×4 = 16 bytes.
     assert_eq!(packed.len(), 4 * 4);
     // Row 1, column 2 — 4 bytes per row in the u8 output, so offset = 4 + 2.
@@ -3253,10 +3286,10 @@ mod macos_tests {
     assert_eq!(packed.len(), 3 * 2);
     assert_eq!(packed, [1, 0, 0, 0, 0, 1]);
     // Foreground spans cols 0..=2 and rows 0..=1 — bbox is the whole mask.
-    assert!((bbox.x - 0.0).abs() < 1e-6);
-    assert!((bbox.y - 0.0).abs() < 1e-6);
-    assert!((bbox.width - 1.0).abs() < 1e-6);
-    assert!((bbox.height - 1.0).abs() < 1e-6);
+    assert!((bbox.x() - 0.0).abs() < 1e-6);
+    assert!((bbox.y() - 0.0).abs() < 1e-6);
+    assert!((bbox.width() - 1.0).abs() < 1e-6);
+    assert!((bbox.height() - 1.0).abs() < 1e-6);
   }
 
   /// A pose with only one surviving joint cannot derive a non-degenerate
@@ -3287,15 +3320,15 @@ mod macos_tests {
   fn pose_bbox_from_diagonal_joints_is_valid() {
     let bbox =
       pose_bbox_from_joint_bounds(0.1, 0.2, 0.4, 0.6).expect("non-degenerate joints yield Some");
-    assert!((bbox.x - 0.1).abs() < 1e-6);
-    assert!((bbox.y - 0.2).abs() < 1e-6);
-    assert!((bbox.width - 0.3).abs() < 1e-6);
-    assert!((bbox.height - 0.4).abs() < 1e-6);
+    assert!((bbox.x() - 0.1).abs() < 1e-6);
+    assert!((bbox.y() - 0.2).abs() < 1e-6);
+    assert!((bbox.width() - 0.3).abs() < 1e-6);
+    assert!((bbox.height() - 0.4).abs() < 1e-6);
     mediaschema::domain::aggregates::video::BoundingBox::try_new(
-      bbox.x,
-      bbox.y,
-      bbox.width,
-      bbox.height,
+      bbox.x(),
+      bbox.y(),
+      bbox.width(),
+      bbox.height(),
     )
     .expect("pose-derived bbox satisfies domain invariants");
   }
@@ -3480,12 +3513,12 @@ mod macos_tests {
   /// Vision reported. The pair is forwarded unchanged.
   #[test]
   fn sanitize_body_height_pair_finite_preserves_estimation() {
-    let measured = BODY_POSE_3D_HEIGHT_ESTIMATION_MEASURED;
+    let measured = BodyPose3DHeightEstimation::Measured;
     let (h, e) = sanitize_body_height_pair(1.75, measured);
     assert!((h - 1.75).abs() < 1e-6);
     assert_eq!(e, measured);
 
-    let reference = BODY_POSE_3D_HEIGHT_ESTIMATION_REFERENCE;
+    let reference = BodyPose3DHeightEstimation::Reference;
     let (h, e) = sanitize_body_height_pair(0.42, reference);
     assert!((h - 0.42).abs() < 1e-6);
     assert_eq!(e, reference);
@@ -3500,16 +3533,17 @@ mod macos_tests {
   fn sanitize_body_height_pair_non_finite_forces_unknown() {
     for raw in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
       // Even with a Measured input the result must be UNKNOWN.
-      let (h, e) = sanitize_body_height_pair(raw, BODY_POSE_3D_HEIGHT_ESTIMATION_MEASURED);
+      let (h, e) = sanitize_body_height_pair(raw, BodyPose3DHeightEstimation::Measured);
       assert_eq!(h, 0.0, "non-finite must collapse to 0.0 (raw = {raw:?})");
       assert_eq!(
-        e, BODY_POSE_3D_HEIGHT_ESTIMATION_UNKNOWN,
+        e,
+        BodyPose3DHeightEstimation::Unknown,
         "non-finite must force UNKNOWN (raw = {raw:?})",
       );
       // Same for Reference.
-      let (h, e) = sanitize_body_height_pair(raw, BODY_POSE_3D_HEIGHT_ESTIMATION_REFERENCE);
+      let (h, e) = sanitize_body_height_pair(raw, BodyPose3DHeightEstimation::Reference);
       assert_eq!(h, 0.0);
-      assert_eq!(e, BODY_POSE_3D_HEIGHT_ESTIMATION_UNKNOWN);
+      assert_eq!(e, BodyPose3DHeightEstimation::Unknown);
     }
   }
 
@@ -3543,14 +3577,14 @@ mod macos_tests {
   // ──────────────── R8 fixes (codex round 8) ────────────────
 
   /// `validate_raw_slice_bytes` rejects payloads above the cap and
-  /// above `isize::MAX`, in either order.
+  /// above `isize::MAX`, in either order. Re-uses `MAX_MASK_BYTES`
+  /// as a representative caller-side ceiling; the helper is generic
+  /// and the cap value itself is not load-bearing for this test.
   #[test]
   fn validate_raw_slice_bytes_rejects_over_cap() {
-    assert!(validate_raw_slice_bytes(0, MAX_FEATURE_PRINT_BYTES).is_some());
-    assert!(validate_raw_slice_bytes(MAX_FEATURE_PRINT_BYTES, MAX_FEATURE_PRINT_BYTES).is_some());
-    assert!(
-      validate_raw_slice_bytes(MAX_FEATURE_PRINT_BYTES + 1, MAX_FEATURE_PRINT_BYTES).is_none()
-    );
+    assert!(validate_raw_slice_bytes(0, MAX_MASK_BYTES).is_some());
+    assert!(validate_raw_slice_bytes(MAX_MASK_BYTES, MAX_MASK_BYTES).is_some());
+    assert!(validate_raw_slice_bytes(MAX_MASK_BYTES + 1, MAX_MASK_BYTES).is_none());
   }
 
   /// `validate_raw_slice_bytes` rejects `byte_len > isize::MAX` even
@@ -3602,18 +3636,18 @@ mod macos_tests {
     // Without the f64 fix this would have been `x = 1.0`. With the
     // fix `x = (2^24) / (2^24 + 1)` ≈ 0.99999994 (f32).
     assert!(
-      bbox.x < 1.0,
+      bbox.x() < 1.0,
       "x must remain strictly less than 1.0: {}",
-      bbox.x
+      bbox.x()
     );
     assert!(
-      bbox.width > 0.0,
+      bbox.width() > 0.0,
       "positive foreground width: {}",
-      bbox.width
+      bbox.width()
     );
     // `x + width` MUST satisfy the schema `<= 1.0` invariant
     // (in fact equals 1.0 modulo f32 representation).
-    let right_edge = bbox.x + bbox.width;
+    let right_edge = bbox.x() + bbox.width();
     assert!(
       right_edge <= 1.0 + 1e-6,
       "right edge exceeds image: {right_edge}"
@@ -3664,18 +3698,18 @@ mod macos_tests {
           // a `[0, 1]`-valid box with positive extent and a right
           // edge that does not exceed the image.
           assert!(
-            bbox.x < 1.0,
+            bbox.x() < 1.0,
             "shift={shift}: x must be < 1.0, got {}",
-            bbox.x
+            bbox.x()
           );
           assert!(
-            bbox.width > 0.0,
+            bbox.width() > 0.0,
             "shift={shift}: width must be > 0.0, got {}",
-            bbox.width
+            bbox.width()
           );
           // f32-safe right-edge check: edge computed directly,
           // not as left + width.
-          let right_edge = bbox.x + bbox.width;
+          let right_edge = bbox.x() + bbox.width();
           assert!(
             right_edge <= 1.0 + 1e-6,
             "shift={shift}: right edge exceeds image: {right_edge}",
@@ -3696,16 +3730,16 @@ mod macos_tests {
     let result = normalized_bbox_from_pixel_bounds(right_col, 0, right_col, 0, width, height);
     if let Some(bbox) = result {
       assert!(
-        bbox.x < 1.0,
+        bbox.x() < 1.0,
         "x must remain strictly less than 1.0: {}",
-        bbox.x
+        bbox.x()
       );
       assert!(
-        bbox.width > 0.0,
+        bbox.width() > 0.0,
         "positive foreground width: {}",
-        bbox.width
+        bbox.width()
       );
-      let right_edge = bbox.x + bbox.width;
+      let right_edge = bbox.x() + bbox.width();
       assert!(
         right_edge <= 1.0 + 1e-6,
         "right edge exceeds image: {right_edge}"

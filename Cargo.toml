@@ -32,8 +32,16 @@ tracing = { version = "0.1", optional = true }
 # contract, any breaking surface change bumps the `x` in `0.x.y`, so 0.1.*
 # patches are guaranteed additive across Rust API + proto wire + sqlx DDL
 # + mongodb document shape.
-mediaschema = { version = "0.1", default-features = false, features = ["std", "video", "buffa"] }
+#
+# `buffa` deliberately NOT enabled: avanalyze writes against DOMAIN types
+# (validated `try_new`-style aggregates), not the protobuf-generated
+# wire records — engine boundary stays clean, serialization happens
+# inside mediaschema's storage backends.
+mediaschema = { version = "0.1", default-features = false, features = ["std", "video"] }
 mediaframe = { version = "0.1", default-features = false, features = ["std"] }
+# `Keyframe::try_new` requires a `mediatime::Timestamp` parameter; the
+# domain layer re-exports the type but the constructor lives here.
+mediatime = { version = "0.1", default-features = false, features = ["std"] }
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 objc2 = "0.6"
@@ -68,7 +76,6 @@ objc2-vision = { version = "0.3", features = [
   "VNCalculateImageAestheticsScoresRequest",
   "VNDetectHorizonRequest",
   "VNDetectDocumentSegmentationRequest",
-  "VNGenerateImageFeaturePrintRequest",
 ] }
 
 [lints]
