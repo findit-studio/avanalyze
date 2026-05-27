@@ -159,8 +159,7 @@ mod serde_tests {
   #[test]
   fn serde_extreme_confidence_values() {
     let json = r#"{"min_confidence": 0.0}"#;
-    let o: AppleVisionClassificationOptions =
-      serde_json::from_str(json).expect("zero confidence");
+    let o: AppleVisionClassificationOptions = serde_json::from_str(json).expect("zero confidence");
     assert_eq!(o.min_confidence(), 0.0);
   }
 

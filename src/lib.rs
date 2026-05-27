@@ -76,7 +76,20 @@ struct SimdFloat4([f32; 4]);
 
 #[cfg(target_vendor = "apple")]
 unsafe impl Encode for SimdFloat4 {
-  const ENCODING: Encoding = Encoding::Unknown;
+  // `simd_float4` is an `__attribute__((__ext_vector_type__))` type;
+  // Clang intentionally emits NO `@encode` for ext-vector elements, so
+  // the matching Rust-side encoding is [`Encoding::None`] (formats as
+  // empty string), NOT [`Encoding::Unknown`] (formats as `?`).
+  //
+  // objc2-encode's `Encoding::None` docstring explicitly calls this
+  // out as the SIMD-vector case. The previous `Encoding::Unknown`
+  // made the wrapping struct render as `{?=[4?]}`, while Vision's
+  // `-[VNHumanBodyRecognizedPoint3D position]` returns `{?=[4]}`
+  // (Clang refuses to emit an inner element character) — every
+  // msg_send for that selector failed verification on macOS 26.x,
+  // and the surrounding `catch_unwind` silently swallowed the
+  // panic so 3-D pose detections were always dropped to zero.
+  const ENCODING: Encoding = Encoding::None;
 }
 
 #[cfg(target_vendor = "apple")]
@@ -88,9 +101,14 @@ struct SimdFloat4x4 {
 
 #[cfg(target_vendor = "apple")]
 unsafe impl Encode for SimdFloat4x4 {
-  // Clang reports @encode(simd_float4x4) as "{?=[4]}" because the vector element
-  // encoding is intentionally opaque.
-  const ENCODING: Encoding = Encoding::Struct("?", &[Encoding::Array(4, &Encoding::Unknown)]);
+  // Apple's `simd_float4x4` is a struct-of-vectors. Clang reports
+  // `@encode(simd_float4x4)` as `{?=[4]}` — outer struct with no name
+  // wrapping an array of 4 whose element type Clang refuses to encode
+  // (the element is itself an ext-vector, see [`SimdFloat4`] above).
+  // The matching Rust encoding therefore uses `Array(4, &None)` so
+  // the inner array element formats to an empty string, producing the
+  // literal `[4]` Clang emits.
+  const ENCODING: Encoding = Encoding::Struct("?", &[Encoding::Array(4, &Encoding::None)]);
 }
 
 // ----- Vision → mediaschema coordinate conversion ---------------------------
@@ -3754,5 +3772,18 @@ mod macos_tests {
     // max_x = width - 1 is OK (right edge); max_x = width is corrupt.
     assert!(normalized_bbox_from_pixel_bounds(0, 0, 100, 0, 100, 1).is_none());
     assert!(normalized_bbox_from_pixel_bounds(0, 0, 0, 100, 1, 100).is_none());
+  }
+
+  /// Regression pin: `SimdFloat4x4::ENCODING` must format as
+  /// `{?=[4]}` to match Clang's `@encode(simd_float4x4)` and the
+  /// runtime metadata of `-[VNHumanBodyRecognizedPoint3D position]`.
+  /// The previous `Encoding::Unknown` element rendered as `{?=[4?]}`
+  /// and silently broke every msg_send for that selector under
+  /// `catch_unwind`. Pinning the string here so a future objc2
+  /// upgrade or accidental edit surfaces as a test failure.
+  #[test]
+  fn simd_float4x4_encoding_matches_clang_at_encode() {
+    assert_eq!(SimdFloat4::ENCODING.to_string(), "");
+    assert_eq!(SimdFloat4x4::ENCODING.to_string(), "{?=[4]}");
   }
 }
