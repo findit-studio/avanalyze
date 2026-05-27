@@ -13,12 +13,12 @@
 //! Input: `Request` via crossbeam bounded channel
 //! Output: `Reply` via callback back to the processor-local coordinator
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 use bytes::Bytes;
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 use mediaschema::{
   Aesthetics, AnimalAnalysis, BarcodeDetection, BodyPose3DDetection, BodyPose3DHeightEstimation,
   BodyPose3DJoint, BodyPoseDetection, BodyPoseJoint, BoundingBox, ClassificationDetection,
@@ -33,14 +33,14 @@ use wire_ext::*;
 
 // use tracing::{info, warn};
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 use objc2::{
   encode::{Encode, Encoding},
   rc::Retained,
 };
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 use objc2_core_foundation::{CGPoint, CGRect};
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 use objc2_core_video::{
   CVPixelBuffer, CVPixelBufferGetBaseAddress, CVPixelBufferGetBytesPerRow,
   CVPixelBufferGetDataSize, CVPixelBufferGetHeight, CVPixelBufferGetPixelFormatType,
@@ -48,11 +48,11 @@ use objc2_core_video::{
   CVPixelBufferUnlockBaseAddress, kCVPixelFormatType_OneComponent8,
   kCVPixelFormatType_OneComponent32Float, kCVReturnSuccess,
 };
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 use objc2_foundation::{NSArray, NSData, NSIndexSet, NSNotFound};
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 use objc2_vision::*;
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 use smol_str::{SmolStr, StrExt, ToSmolStr};
 
 pub use options::*;
@@ -63,24 +63,24 @@ mod options;
 // the non-macOS stub use `ErrorInfoExt::new` to construct errors.
 mod wire_ext;
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Debug)]
 struct SimdFloat4([f32; 4]);
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 unsafe impl Encode for SimdFloat4 {
   const ENCODING: Encoding = Encoding::Unknown;
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Debug)]
 struct SimdFloat4x4 {
   columns: [SimdFloat4; 4],
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 unsafe impl Encode for SimdFloat4x4 {
   // Clang reports @encode(simd_float4x4) as "{?=[4]}" because the vector element
   // encoding is intentionally opaque.
@@ -99,7 +99,7 @@ unsafe impl Encode for SimdFloat4x4 {
 /// returns the appropriate edge — both of which the domain
 /// `NormCoord::try_new` will reject downstream, so we still
 /// degrade safely rather than panicking).
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 #[inline]
 fn clamp01(value: f32) -> f32 {
   debug_assert!(
@@ -128,7 +128,7 @@ fn clamp01(value: f32) -> f32 {
 ///
 /// `standardize()` is assumed to have already been called on `rect`;
 /// the input `size` is non-negative.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 fn vision_bbox_to_schema(rect: CGRect) -> Option<BoundingBox> {
   // Vision lower-left → schema top-left: the top edge in schema space
   // is `1.0 - (origin.y + size.height)`.
@@ -176,7 +176,7 @@ fn vision_bbox_to_schema(rect: CGRect) -> Option<BoundingBox> {
 /// the entire detection (e.g. a document quad without all four
 /// corners) or just the offending point (e.g. one bad joint among
 /// many).
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 #[inline]
 fn vision_point_to_schema(x: f64, y: f64) -> Option<(f32, f32)> {
   let x32 = x as f32;
@@ -196,7 +196,7 @@ fn vision_point_to_schema(x: f64, y: f64) -> Option<(f32, f32)> {
 /// concrete default (typically `0.0`) — the choice depends on whether
 /// the scalar is required geometry/score (drop) or an optional pose
 /// angle (default).
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 #[inline]
 fn finite_f32(v: f32) -> Option<f32> {
   if v.is_finite() { Some(v) } else { None }
@@ -207,21 +207,21 @@ fn finite_f32(v: f32) -> Option<f32> {
 /// resolution Apple Vision returns today (8K = ~33 MiB at 8 bits per
 /// pixel) and prevents a runaway / corrupted `width * height` from
 /// driving the worker process into the allocator's abort path.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 const MAX_MASK_BYTES: usize = 64 * 1024 * 1024;
 
 /// Upper bound on a single Vision FeaturePrint payload. Apple's
 /// VNFeaturePrintObservation typically returns ~2 KiB per request;
 /// 64 MiB is a generous upper bound against a corrupted or
 /// adversarial `NSData` length.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 const MAX_FEATURE_PRINT_BYTES: usize = 64 * 1024 * 1024;
 
 /// Upper bound on the number of landmark points per face-landmark
 /// region. Vision's `allPoints` is ~76 points; per-feature regions
 /// are smaller. 1024 leaves headroom against future API expansion
 /// while still capping a corrupted/adversarial `pointCount`.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 const MAX_LANDMARK_POINTS: usize = 1024;
 
 /// Upper bound on the number of detection results from a single
@@ -237,7 +237,7 @@ const MAX_LANDMARK_POINTS: usize = 1024;
 /// count cannot exceed the cap, independently of whatever
 /// configured `max_results` / `max_segments` / … the call site
 /// uses inside the loop.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 const MAX_VISION_RESULTS_PER_FRAME: usize = 4096;
 
 /// Upper bound on the number of joints / recognised points per
@@ -249,15 +249,15 @@ const MAX_VISION_RESULTS_PER_FRAME: usize = 4096;
 /// adversarial `points_by_joint.len()` that would otherwise drive
 /// `to_vecs()`'s internal allocations into the abort path before
 /// the per-extractor logic can drop the pose.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 const MAX_POSE_JOINTS: usize = 256;
 
 /// Hard ceiling on instances per segmentation-mask observation.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 const MAX_NESTED_INSTANCES_PER_OBSERVATION: usize = 64;
 
 /// Hard ceiling on labels per recognised-animal observation.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 const MAX_NESTED_LABELS_PER_OBSERVATION: usize = 32;
 
 /// Hard ceiling on candidate strings per text-recognition
@@ -268,11 +268,11 @@ const MAX_NESTED_LABELS_PER_OBSERVATION: usize = 32;
 /// undefined behaviour across OS versions, so we clamp to 10 here
 /// even though realistic workloads ask for 1-3 candidates
 /// (codex R17 F3).
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 const MAX_TEXT_CANDIDATES_PER_OBSERVATION: usize = 10;
 
 /// Hard ceiling on saliency regions per frame.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 const MAX_SALIENCY_REGIONS_PER_FRAME: usize = 64;
 
 /// Hard ceiling on the total mask count emitted per frame across
@@ -281,14 +281,14 @@ const MAX_SALIENCY_REGIONS_PER_FRAME: usize = 64;
 /// permit 256K mask emissions per frame even though each individual
 /// mask is capped at [`MAX_MASK_BYTES`]. 256 is a generous total
 /// matching realistic Vision output for a single frame.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 const MAX_TOTAL_MASKS_PER_FRAME: usize = 256;
 
 /// Hard ceiling on the cumulative mask payload bytes emitted per
 /// frame. Even at the per-mask cap, a worst-case 256 masks × 64 MiB
 /// = 16 GiB would crush the worker. 256 MiB total is generous for
 /// realistic Vision output while bounding the cumulative budget.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 const MAX_TOTAL_MASK_BYTES_PER_FRAME: usize = 256 * 1024 * 1024;
 
 /// Hard ceiling on the cumulative ATTEMPTED mask generations per
@@ -310,7 +310,7 @@ const MAX_TOTAL_MASK_BYTES_PER_FRAME: usize = 256 * 1024 * 1024;
 /// (low units for segmentation, typically <20 for instance masks),
 /// so 1024 attempts is conservative against realistic workloads
 /// while still defending against the corrupted-array case.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 const MAX_TOTAL_MASK_ATTEMPTS_PER_FRAME: usize = 4 * MAX_TOTAL_MASKS_PER_FRAME;
 
 /// Hard ceiling on the cumulative ATTEMPTED face-landmark points
@@ -325,7 +325,7 @@ const MAX_TOTAL_MASK_ATTEMPTS_PER_FRAME: usize = 4 * MAX_TOTAL_MASKS_PER_FRAME;
 /// `4 * MAX_FACE_LANDMARK_POINTS_PER_FRAME` so a successful frame
 /// can tolerate non-finite/dropped points before the attempt cap
 /// trips (codex R17 F1).
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 const MAX_FACE_LANDMARK_ATTEMPTS_PER_FRAME: usize = 4 * MAX_FACE_LANDMARK_POINTS_PER_FRAME;
 
 /// Hard ceiling on the cumulative face-landmark points emitted per
@@ -333,20 +333,20 @@ const MAX_FACE_LANDMARK_ATTEMPTS_PER_FRAME: usize = 4 * MAX_FACE_LANDMARK_POINTS
 /// Apple's typical output is at most a few faces × ~76 points each,
 /// so 16384 is generous defence-in-depth against the worst-case
 /// nested-emission product (4096 × 13 × MAX_LANDMARK_POINTS).
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 const MAX_FACE_LANDMARK_POINTS_PER_FRAME: usize = 16384;
 
 /// Hard ceiling on the total animal-subject rows emitted per frame.
 /// Apple's animal recogniser returns a few species per frame at most;
 /// 256 caps the adversarial 4096 × MAX_NESTED_LABELS_PER_OBSERVATION
 /// product without restricting real workloads.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 const MAX_TOTAL_ANIMAL_SUBJECTS_PER_FRAME: usize = 256;
 
 /// Hard ceiling on the total text detections emitted per frame.
 /// 256 caps the adversarial 4096 × MAX_TEXT_CANDIDATES_PER_OBSERVATION
 /// product without restricting real text-rich-document workloads.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 const MAX_TOTAL_TEXT_DETECTIONS_PER_FRAME: usize = 256;
 
 /// Upper bound on the input image byte length accepted by
@@ -358,7 +358,7 @@ const MAX_TOTAL_TEXT_DETECTIONS_PER_FRAME: usize = 256;
 /// keyframe encoded JPEG is well under 1 MiB); inputs above that
 /// surface as a structured `ErrorInfo` instead of an alloc-side
 /// crash (codex R17 F1).
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 const MAX_INPUT_IMAGE_BYTES: usize = 64 * 1024 * 1024;
 
 /// Apple's documented maximum for
@@ -367,7 +367,7 @@ const MAX_INPUT_IMAGE_BYTES: usize = 64 * 1024 * 1024;
 /// request revision in this crate is revision 1; configurations
 /// requesting more must clamp at extractor build time to avoid an
 /// Objective-C exception crossing the FFI boundary (codex R17 F2).
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 const MAX_HAND_POSE_MAXIMUM_HAND_COUNT: usize = 6;
 
 /// Upper bound on the byte length of an FFI-sourced `NSString`
@@ -380,7 +380,7 @@ const MAX_HAND_POSE_MAXIMUM_HAND_COUNT: usize = 6;
 /// string allocation into the abort path. Strings exceeding the
 /// cap are dropped; callers skip the offending field rather than
 /// truncating mid-grapheme.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 const MAX_FFI_STRING_BYTES: usize = 4096;
 
 /// Convert an FFI-sourced `NSString` to a Rust `SmolStr` after
@@ -391,7 +391,7 @@ const MAX_FFI_STRING_BYTES: usize = 4096;
 /// classification label / joint name) rather than driving the
 /// allocator into the abort path. The length query is FFI but
 /// allocation-free.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 fn ffi_nsstring_to_smolstr(ns_str: &objc2_foundation::NSString) -> Option<SmolStr> {
   // `NSStringEncoding` is a `usize` type alias (objc2_foundation
   // re-exports it from `objc2::ffi::NSUInteger = usize`).
@@ -413,7 +413,7 @@ fn ffi_nsstring_to_smolstr(ns_str: &objc2_foundation::NSString) -> Option<SmolSt
 /// Composing the three around the SAME `cap` value bounds both
 /// capacity and emission to the hard ceiling, regardless of what
 /// the caller configured.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 #[inline]
 fn effective_results_cap(user_max: usize) -> usize {
   user_max.min(MAX_VISION_RESULTS_PER_FRAME)
@@ -431,7 +431,7 @@ fn effective_results_cap(user_max: usize) -> usize {
 /// Returns `None` on either violation; the caller propagates that
 /// `None` so the detection is dropped rather than triggering UB or
 /// the allocator's abort path.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 #[inline]
 fn validate_raw_slice_bytes(byte_len: usize, max_bytes: usize) -> Option<()> {
   if byte_len > max_bytes {
@@ -448,7 +448,7 @@ fn validate_raw_slice_bytes(byte_len: usize, max_bytes: usize) -> Option<()> {
 /// `byte_len = elem_count * size_of::<T>()` with overflow checking
 /// before the `isize::MAX` comparison, so the helper is safe for
 /// element types larger than `u8`.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 #[inline]
 fn validate_raw_slice_elems<T>(elem_count: usize, max_elems: usize) -> Option<()> {
   if elem_count > max_elems {
@@ -465,7 +465,7 @@ fn validate_raw_slice_elems<T>(elem_count: usize, max_elems: usize) -> Option<()
 /// `try_reserve_exact`. Returns `None` on either bound violation or
 /// allocator failure — both surface to the caller as a dropped mask
 /// detection rather than aborting the process.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 fn try_alloc_packed_mask(packed_len: usize) -> Option<Vec<u8>> {
   if packed_len > MAX_MASK_BYTES {
     return None;
@@ -489,7 +489,7 @@ fn try_alloc_packed_mask(packed_len: usize) -> Option<Vec<u8>> {
 ///   real measurement, and substituting `0.0` would silently admit
 ///   the detection through any `min_capture_quality = 0.0`
 ///   configuration.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 #[inline]
 fn sanitize_capture_quality(raw: Option<f32>) -> Option<f32> {
   match raw {
@@ -507,7 +507,7 @@ fn sanitize_capture_quality(raw: Option<f32>) -> Option<f32> {
 /// consumers there is a known 0-metre subject. The pair
 /// `(0.0, UNKNOWN)` is the truthful encoding of "no estimate
 /// available" and the only consistent fallback.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 #[inline]
 fn sanitize_body_height_pair(
   raw_height: f32,
@@ -534,7 +534,7 @@ fn sanitize_body_height_pair(
 /// Returns `None` on either violation; the caller propagates the
 /// `None` so the mask detection is dropped rather than triggering
 /// UB.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 #[inline]
 fn validate_mask_dims_for_slice(width: usize, height: usize, total_src_len: usize) -> Option<()> {
   let output_payload = width.checked_mul(height)?;
@@ -556,7 +556,7 @@ fn validate_mask_dims_for_slice(width: usize, height: usize, total_src_len: usiz
 /// imageY = faceBBox.y + p.y * faceBBox.height` (lower-left). Callers
 /// then route through [`vision_point_to_schema`] for the schema-side
 /// top-left flip + `[0, 1]` clamp + finite check.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 #[inline]
 fn project_landmark_to_image(point: CGPoint, face_bbox_vision: CGRect) -> CGPoint {
   CGPoint {
@@ -572,7 +572,7 @@ fn project_landmark_to_image(point: CGPoint, face_bbox_vision: CGRect) -> CGPoin
 /// box that the validated domain `BoundingBox::try_new` rejects.
 /// Callers should skip the pose detection on `None`; the joints alone
 /// do not carry enough geometry to construct a valid box.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 fn pose_bbox_from_joint_bounds(
   min_x: f32,
   min_y: f32,
@@ -598,7 +598,7 @@ fn pose_bbox_from_joint_bounds(
 /// previously let `NaN` through (since every NaN comparison is
 /// false) and accepted `>1.0` values, both of which mediaschema's
 /// domain `Confidence::try_new` rejects.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 #[inline]
 fn sanitize_confidence(value: f32, min: f32) -> Option<f32> {
   if value.is_finite() && (0.0..=1.0).contains(&value) && value >= min {
@@ -613,13 +613,13 @@ fn sanitize_confidence(value: f32, min: f32) -> Option<f32> {
 /// RAII guard that holds a `CVPixelBufferLockBaseAddress` lock for the
 /// lifetime of the guard. `Drop` unlocks even on panic-unwind so the
 /// buffer cannot be left in a locked state by a panicking slice index.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 struct CVPixelBufferLockGuard<'a> {
   buffer: &'a CVPixelBuffer,
   flags: CVPixelBufferLockFlags,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 impl<'a> CVPixelBufferLockGuard<'a> {
   /// Acquire a lock on `buffer` with `flags`. Returns `None` if Core
   /// Video refused the lock; on success the guard's `Drop` is
@@ -644,7 +644,7 @@ impl<'a> CVPixelBufferLockGuard<'a> {
   }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 impl Drop for CVPixelBufferLockGuard<'_> {
   fn drop(&mut self) {
     // SAFETY: the corresponding lock was acquired successfully in
@@ -946,14 +946,14 @@ impl Drop for CVPixelBufferLockGuard<'_> {
 /// constructs one fresh analyzer per worker rather than cloning a
 /// single shared instance — `Clone` is intentionally not implemented to
 /// make that contract a compile-time error.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 #[derive(Debug)]
 pub struct VisionAnalyzer {
   opts: ServiceOptions,
   requests: VisionRequests,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 #[derive(Debug)]
 struct VisionRequests {
   classify: Retained<VNClassifyImageRequest>,
@@ -993,7 +993,7 @@ fn apple_vision_keyframe_error(keyframe_id: Id, error: ErrorInfo) -> ErrorInfo {
   )
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 impl VisionRequests {
   fn new(opts: ServiceOptions) -> Self {
     unsafe {
@@ -1132,7 +1132,7 @@ impl VisionRequests {
   }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 impl VisionAnalyzer {
   /// Creates a new Apple Vision analyzer with the specified options.
   #[cfg_attr(not(tarpaulin), inline(always))]
@@ -2327,12 +2327,12 @@ impl VisionAnalyzer {
   }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 fn normalize_classification_label(label: SmolStr) -> SmolStr {
   label.trim().to_ascii_lowercase_smolstr()
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 fn extract_body_pose_3d_coordinates(
   point: &VNHumanBodyRecognizedPoint3D,
 ) -> Option<(f32, f32, f32)> {
@@ -2347,7 +2347,7 @@ fn extract_body_pose_3d_coordinates(
   Some((x, y, z))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 fn map_hand_chirality(chirality: VNChirality) -> HandChirality {
   match chirality {
     VNChirality::Left => HAND_CHIRALITY_LEFT,
@@ -2362,7 +2362,7 @@ fn map_hand_chirality(chirality: VNChirality) -> HandChirality {
 /// caller-side schema flip. Without this projection a non-full-frame
 /// face emits landmarks in the wrong place but still passes `[0, 1]`
 /// validation.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 fn extract_face_landmark_regions(
   landmarks: &VNFaceLandmarks2D,
   face_bbox_vision: CGRect,
@@ -2402,7 +2402,7 @@ fn extract_face_landmark_regions(
   regions
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 fn push_face_landmark_region(
   regions: &mut Vec<FaceLandmarkRegion>,
   name: &'static str,
@@ -2490,7 +2490,7 @@ fn push_face_landmark_region(
   regions.push(FaceLandmarkRegion::new(name, emitted_points));
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 fn map_body_pose_3d_height_estimation(
   estimation: VNHumanBodyPose3DObservationHeightEstimation,
 ) -> BodyPose3DHeightEstimation {
@@ -2522,7 +2522,7 @@ fn map_body_pose_3d_height_estimation(
 /// [`CVPixelBufferLockGuard`] for the duration of the copy and is
 /// released by `Drop` on every exit path — including a panic — so the
 /// buffer cannot be left locked.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 fn copy_instance_mask_buffer(
   pixel_buffer: &CVPixelBuffer,
   remaining_byte_budget: usize,
@@ -2545,7 +2545,7 @@ fn copy_instance_mask_buffer(
 /// is `(v.clamp(0.0, 1.0) * 255.0).round() as u8` with non-finite
 /// inputs collapsed to `0` (background); see
 /// [`process_mask_bytes_f32`] for the per-pixel logic.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 #[allow(non_upper_case_globals)]
 fn copy_instance_mask_buffer_locked(
   pixel_buffer: &CVPixelBuffer,
@@ -2656,7 +2656,7 @@ fn copy_instance_mask_buffer_locked(
 /// (background), matching Vision's documented "non-finite = no
 /// confidence in foreground" convention and keeping the wire payload
 /// canonically 8-bit per pixel across both source pixel formats.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 fn process_mask_bytes_f32(
   width: usize,
   height: usize,
@@ -2723,7 +2723,7 @@ fn process_mask_bytes_f32(
 
 /// Walk an `OneComponent8` mask, copy it tightly packed, and derive a
 /// normalized foreground bbox. Returns `None` for an all-zero mask.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 fn process_mask_bytes_u8(
   width: usize,
   height: usize,
@@ -2788,7 +2788,7 @@ fn process_mask_bytes_u8(
 /// validator's `[0, 1]` + non-zero-extent invariants — a corrupted
 /// pixel-bound input cannot produce a wire bbox that downstream
 /// storage would reject.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 fn normalized_bbox_from_pixel_bounds(
   min_x: usize,
   min_y: usize,
@@ -2864,7 +2864,7 @@ fn normalized_bbox_from_pixel_bounds(
 /// compiles cleanly on non-macOS targets so downstream workspaces can
 /// keep `avanalyze` in their dep tree unconditionally; this stub is
 /// what makes that promise true.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(target_vendor = "apple"))]
 #[derive(Debug)]
 pub struct VisionAnalyzer {
   // Keep the options around so a future native cross-platform
@@ -2873,7 +2873,7 @@ pub struct VisionAnalyzer {
   opts: ServiceOptions,
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(target_vendor = "apple"))]
 impl VisionAnalyzer {
   /// Construct a non-macOS stub analyzer. The configuration is
   /// retained but unused — every `analyze_keyframe` call returns
@@ -2919,7 +2919,7 @@ mod tests {
 
   /// Non-macOS `VisionAnalyzer` stub must report an Apple-Vision
   /// platform error on every `analyze_keyframe` call.
-  #[cfg(not(target_os = "macos"))]
+  #[cfg(not(target_vendor = "apple"))]
   #[test]
   fn non_macos_stub_reports_unavailable() {
     use mediaschema::{Id, domain::ErrorCode};
@@ -2931,7 +2931,7 @@ mod tests {
   }
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(all(test, target_vendor = "apple"))]
 mod macos_tests {
   use super::*;
   use mediaschema::domain::aggregates::video::BoundingBox as DomainBoundingBox;
