@@ -99,6 +99,8 @@ rpath = false
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
+default-target = "aarch64-apple-darwin"
+targets = []
 
 [workspace.lints.rust]
 rust_2018_idioms = "warn"
