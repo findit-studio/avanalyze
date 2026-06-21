@@ -927,6 +927,13 @@ impl VisionAnalyzer {
   /// `mediaschema::Keyframe::try_new`, which enforces non-nil ids,
   /// positive `Dimensions`, a `pts` `Timestamp`, and a
   /// `KeyframeExtractor` tag at construction time.
+  ///
+  /// The returned `Keyframe` carries a freshly-minted **placeholder
+  /// `thumbnail_id`** (`Uuid7::new()`): avanalyze does not own thumbnail
+  /// storage, but the domain `try_new` rejects a nil `thumbnail_id`. The
+  /// orchestrator persists only the keyframe's detection child tables
+  /// (faces / OCR / objects / …), never the base keyframe row, so this
+  /// placeholder is internal to the in-memory aggregate and never lands.
   pub fn analyze_keyframe(
     &self,
     scene_id: Id,
@@ -950,13 +957,26 @@ impl VisionAnalyzer {
     // domain `try_new` invariants (non-nil ids + positive
     // dimensions) surface as structured `ErrorInfo` before we
     // perform the expensive image work.
-    let keyframe =
-      Keyframe::try_new(keyframe_id, scene_id, pts, dimensions, extractor).map_err(|e| {
-        apple_vision_error(
-          ErrorCode::AppleVisionRequestFailed,
-          SmolStr::from(format!("keyframe construction failed: {e}")),
-        )
-      })?;
+    //
+    // `thumbnail_id`: avanalyze does not own thumbnails, but the domain
+    // rejects a nil FK — mint a placeholder. The orchestrator enriches
+    // the keyframe's detection child tables, never the base row, so this
+    // never reaches storage.
+    let thumbnail_id = Uuid7::new();
+    let keyframe = Keyframe::try_new(
+      keyframe_id,
+      scene_id,
+      thumbnail_id,
+      pts,
+      dimensions,
+      extractor,
+    )
+    .map_err(|e| {
+      apple_vision_error(
+        ErrorCode::AppleVisionRequestFailed,
+        SmolStr::from(format!("keyframe construction failed: {e}")),
+      )
+    })?;
     objc2::rc::autoreleasepool(|_| {
       let ns_data = NSData::with_bytes(jpeg_data);
       let handler = unsafe { VNSequenceRequestHandler::new() };
