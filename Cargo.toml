@@ -51,7 +51,14 @@ mediaframe = { version = "0.1", default-features = false, features = ["std"] }
 mediatime = { version = "0.1", default-features = false, features = ["std"] }
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
-objc2 = "0.6"
+# `exception` pulls in `objc2-exception-helper`, enabling
+# `objc2::exception::catch` — the ONLY way to catch an Objective-C
+# `NSException` unwinding across the Vision FFI boundary. Rust's
+# `catch_unwind` cannot catch foreign exceptions, so without this a
+# Vision detector that raises (e.g. on a pathological keyframe) aborts
+# the whole process (`fatal runtime error: Rust cannot catch foreign
+# exceptions`). See `VisionRequests::perform` / the `extract_*` guards.
+objc2 = { version = "0.6", features = ["exception"] }
 objc2-core-foundation = { version = "0.3", features = ["CFCGTypes"] }
 objc2-foundation = { version = "0.3", features = ["NSArray", "NSString", "NSData", "NSError", "NSObjCRuntime", "NSIndexSet"] }
 objc2-core-video = { version = "0.3", features = ["CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVReturn"] }
