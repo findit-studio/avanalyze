@@ -30,13 +30,13 @@ tracing = { version = "0.1", optional = true }
 # Only the `video` aggregate tree is needed (apple-vision feeds Keyframe +
 # detections).
 #
-# Git dependency (not crates.io 0.2.0) pinned to the desktop's
-# `feat/keyframe-thumbnail-fk` branch: that revision replaced the
-# `Keyframe`'s inline `data`/`mime` with a first-class `Thumbnail` entity
-# + a keyframe `thumbnail_id` FK (a 6-arg `try_new`). The desktop indexer
-# composes avanalyze's returned `Keyframe`, so both crates MUST resolve to
-# the same mediaschema revision. Revert to a crates.io version once that
-# mediaschema PR releases.
+# Git dependency (not crates.io 0.2.0) pinned to mediaschema `main`: the
+# `feat/keyframe-thumbnail-fk` work (which replaced the `Keyframe`'s inline
+# `data`/`mime` with a first-class `Thumbnail` entity + a keyframe
+# `thumbnail_id` FK, a 6-arg `try_new`) is now merged to `main`. The desktop
+# indexer composes avanalyze's returned `Keyframe`, so both crates MUST
+# resolve to the same mediaschema revision (same git URL + branch). Revert
+# to a crates.io version once that mediaschema release ships.
 #
 # `sqlx-sqlite` deliberately NOT enabled: avanalyze uses only the validated
 # DOMAIN `Keyframe` (not the storage layer) — the desktop owns persistence.
@@ -44,7 +44,7 @@ tracing = { version = "0.1", optional = true }
 # types (validated `try_new`-style aggregates), not the protobuf-generated
 # wire records — the engine boundary stays clean, serialization happens
 # inside mediaschema's storage backends.
-mediaschema = { git = "https://github.com/Findit-AI/mediaschema", branch = "feat/keyframe-thumbnail-fk", default-features = false, features = ["std", "video"] }
+mediaschema = { git = "https://github.com/Findit-AI/mediaschema", branch = "main", default-features = false, features = ["std", "video"] }
 mediaframe = { version = "0.1", default-features = false, features = ["std"] }
 # `Keyframe::try_new` requires a `mediatime::Timestamp` parameter; the
 # domain layer re-exports the type but the constructor lives here.
