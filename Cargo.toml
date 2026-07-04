@@ -44,7 +44,7 @@ tracing = { version = "0.1", optional = true }
 # types (validated `try_new`-style aggregates), not the protobuf-generated
 # wire records — the engine boundary stays clean, serialization happens
 # inside mediaschema's storage backends.
-mediaschema = { git = "https://github.com/Findit-AI/mediaschema", branch = "main", default-features = false, features = ["std", "video"] }
+mediaschema = { version = "0.2", default-features = false, features = ["std", "video"] }
 mediaframe = { version = "0.1", default-features = false, features = ["std"] }
 # `Keyframe::try_new` requires a `mediatime::Timestamp` parameter; the
 # domain layer re-exports the type but the constructor lives here.

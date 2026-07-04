@@ -47,7 +47,7 @@ unconditionally.
 
 ## Status
 
-Pre-release (`0.0.0`). The data plane — `VisionAnalyzer::analyze_keyframe`
+Pre-release (`0.2`). The data plane — `VisionAnalyzer::analyze_keyframe`
 — is functional. Service-framework integration (`ThreadService`,
 `Request` / `Reply`, `handle_message`) is **commented out** pending the
 external `findit-service` / `findit-pipeline` crates landing in the

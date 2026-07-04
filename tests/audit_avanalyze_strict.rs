@@ -105,10 +105,7 @@ mod serde_coercion_tests {
     assert_eq!(o.barcodes().min_payload_len(), 5);
     assert_eq!(o.attention_saliency().max_regions(), 32);
     assert_eq!(o.document_segments().max_segments(), 8);
-    assert_eq!(
-      o.person_instance_masks().max_instances_per_observation(),
-      8
-    );
+    assert_eq!(o.person_instance_masks().max_instances_per_observation(), 8);
   }
 }
 
