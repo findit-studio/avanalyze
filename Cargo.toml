@@ -1,6 +1,6 @@
 [package]
 name = "avanalyze"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 repository = "https://github.com/Findit-AI/avanalyze"
 homepage = "https://github.com/Findit-AI/avanalyze"
@@ -28,23 +28,37 @@ tracing = { version = "0.1", optional = true }
 
 # Domain types live in `mediaschema` — engine output IS the storage shape.
 # Only the `video` aggregate tree is needed (apple-vision feeds Keyframe +
-# detections). Pinned to the 0.1 minor series; per mediaschema's pre-1.0
-# contract, any breaking surface change bumps the `x` in `0.x.y`, so 0.1.*
-# patches are guaranteed additive across Rust API + proto wire + sqlx DDL
-# + mongodb document shape.
+# detections).
 #
-# `buffa` deliberately NOT enabled: avanalyze writes against DOMAIN types
-# (validated `try_new`-style aggregates), not the protobuf-generated
-# wire records — engine boundary stays clean, serialization happens
+# Git dependency (not crates.io 0.2.0) pinned to mediaschema `main`: the
+# `feat/keyframe-thumbnail-fk` work (which replaced the `Keyframe`'s inline
+# `data`/`mime` with a first-class `Thumbnail` entity + a keyframe
+# `thumbnail_id` FK, a 6-arg `try_new`) is now merged to `main`. The desktop
+# indexer composes avanalyze's returned `Keyframe`, so both crates MUST
+# resolve to the same mediaschema revision (same git URL + branch). Revert
+# to a crates.io version once that mediaschema release ships.
+#
+# `sqlx-sqlite` deliberately NOT enabled: avanalyze uses only the validated
+# DOMAIN `Keyframe` (not the storage layer) — the desktop owns persistence.
+# `buffa` deliberately NOT enabled either: avanalyze writes against DOMAIN
+# types (validated `try_new`-style aggregates), not the protobuf-generated
+# wire records — the engine boundary stays clean, serialization happens
 # inside mediaschema's storage backends.
-mediaschema = { version = "0.1", default-features = false, features = ["std", "video"] }
+mediaschema = { git = "https://github.com/Findit-AI/mediaschema", branch = "main", default-features = false, features = ["std", "video"] }
 mediaframe = { version = "0.1", default-features = false, features = ["std"] }
 # `Keyframe::try_new` requires a `mediatime::Timestamp` parameter; the
 # domain layer re-exports the type but the constructor lives here.
 mediatime = { version = "0.1", default-features = false, features = ["std"] }
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
-objc2 = "0.6"
+# `exception` pulls in `objc2-exception-helper`, enabling
+# `objc2::exception::catch` — the ONLY way to catch an Objective-C
+# `NSException` unwinding across the Vision FFI boundary. Rust's
+# `catch_unwind` cannot catch foreign exceptions, so without this a
+# Vision detector that raises (e.g. on a pathological keyframe) aborts
+# the whole process (`fatal runtime error: Rust cannot catch foreign
+# exceptions`). See `VisionRequests::perform` / the `extract_*` guards.
+objc2 = { version = "0.6", features = ["exception"] }
 objc2-core-foundation = { version = "0.3", features = ["CFCGTypes"] }
 objc2-foundation = { version = "0.3", features = ["NSArray", "NSString", "NSData", "NSError", "NSObjCRuntime", "NSIndexSet"] }
 objc2-core-video = { version = "0.3", features = ["CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVReturn"] }

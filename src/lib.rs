@@ -46,6 +46,7 @@ type Id = Uuid7;
 #[cfg(target_vendor = "apple")]
 use objc2::{
   encode::{Encode, Encoding},
+  exception::catch as catch_objc_exception,
   rc::Retained,
 };
 #[cfg(target_vendor = "apple")]
@@ -427,6 +428,62 @@ fn ffi_nsstring_to_smolstr(ns_str: &objc2_foundation::NSString) -> Option<SmolSt
   Some(ns_str.to_smolstr())
 }
 
+/// Run `f` under an Objective-C exception barrier, returning `fallback`
+/// (the empty/degraded result for that detector) if Apple's Vision
+/// framework raises an `NSException` that unwinds across the FFI
+/// boundary.
+///
+/// Rust's [`std::panic::catch_unwind`] (used elsewhere in this file for
+/// a *Rust*-panic quirk) explicitly **cannot** catch a foreign
+/// Objective-C exception — one that escaped would abort the entire
+/// process with `fatal runtime error: Rust cannot catch foreign
+/// exceptions`. [`objc2::exception::catch`] is the only sanctioned
+/// barrier: it converts the unwinding `NSException` into a `Result`, so
+/// one misbehaving detector degrades to an empty result for that
+/// detector instead of taking the whole worker (and pipeline) down. A
+/// caught exception's `name`/`reason` is logged via the exception's
+/// (safe) `Display` impl.
+///
+/// `detector` names the Vision request whose perform/result-extraction
+/// raised, so the warning pins the culprit.
+///
+/// The closure is wrapped in [`AssertUnwindSafe`] internally: it
+/// captures `&VisionAnalyzer` (whose retained `VNRequest` handles are
+/// not `RefUnwindSafe`) and, for the mask extractors, `&mut` budget
+/// counters. Asserting unwind-safety is sound here — on a caught
+/// exception the closure's borrows are dropped and `fallback` is
+/// returned, so no half-updated state is ever observed. A partially
+/// advanced mask counter only ever over-counts (the conservative
+/// direction for a resource cap), never under-counts.
+#[cfg(target_vendor = "apple")]
+fn guard_vision_ffi<R>(detector: &'static str, fallback: R, f: impl FnOnce() -> R) -> R {
+  match catch_objc_exception(AssertUnwindSafe(f)) {
+    Ok(value) => value,
+    Err(exception) => {
+      #[cfg(feature = "tracing")]
+      match &exception {
+        // The `Exception` `Display` impl is safe: it checks
+        // `isKindOfClass: NSException` internally and renders the
+        // reason only when present, so logging it cannot itself raise.
+        Some(exc) => tracing::warn!(
+          detector,
+          exception = %exc,
+          "Apple Vision raised an Objective-C exception; skipping this detector and returning a \
+           partial keyframe",
+        ),
+        None => tracing::warn!(
+          detector,
+          "Apple Vision raised a nil Objective-C exception; skipping this detector and returning \
+           a partial keyframe",
+        ),
+      }
+      #[cfg(not(feature = "tracing"))]
+      let _ = (detector, exception);
+      fallback
+    }
+  }
+}
+
 /// Compute the effective per-extractor cap as
 /// `min(user_configured_max, MAX_VISION_RESULTS_PER_FRAME)`. Use
 /// this for ALL of: `Vec::with_capacity(cap)`, `.iter().take(cap)`,
@@ -524,6 +581,46 @@ fn sanitize_capture_quality(raw: Option<f32>) -> Option<f32> {
     Some(v) => finite_f32(v),
     None => Some(0.0),
   }
+}
+
+/// Minimum intersection-over-union for a face-rectangle detection and a
+/// capture-quality observation to be treated as the SAME face when merging the
+/// two Vision face passes (issue #48). Vision runs both passes on the identical
+/// frame at the same revision, so a genuine match has near-1.0 IoU; 0.5 is a
+/// forgiving floor that still rejects two distinct faces.
+#[cfg(target_vendor = "apple")]
+const FACE_MATCH_MIN_IOU: f32 = 0.5;
+
+/// Intersection-over-union of two normalized bounding boxes. `0.0` when they do
+/// not overlap, or when either box is degenerate (zero area).
+#[cfg(target_vendor = "apple")]
+fn bbox_iou(a: &BoundingBox, b: &BoundingBox) -> f32 {
+  let ix = (a.x() + a.width()).min(b.x() + b.width()) - a.x().max(b.x());
+  let iy = (a.y() + a.height()).min(b.y() + b.height()) - a.y().max(b.y());
+  if ix <= 0.0 || iy <= 0.0 {
+    return 0.0;
+  }
+  let inter = ix * iy;
+  let union = a.width() * a.height() + b.width() * b.height() - inter;
+  if union <= 0.0 { 0.0 } else { inter / union }
+}
+
+/// The capture quality to annotate a detected face `bbox` with: the quality of
+/// the best-overlapping (IoU ≥ [`FACE_MATCH_MIN_IOU`]) capture-quality
+/// observation, or `0.0` when none overlaps. `scored` is the `(bbox, quality)`
+/// list from the capture-quality pass.
+#[cfg(target_vendor = "apple")]
+fn matched_capture_quality(bbox: &BoundingBox, scored: &[(BoundingBox, f32)]) -> f32 {
+  let mut best_iou = FACE_MATCH_MIN_IOU;
+  let mut best_quality = 0.0;
+  for (candidate, quality) in scored {
+    let iou = bbox_iou(bbox, candidate);
+    if iou >= best_iou {
+      best_iou = iou;
+      best_quality = *quality;
+    }
+  }
+  best_quality
 }
 
 /// Sanitise a raw 3-D body-pose height + height-estimation pair.
@@ -856,19 +953,31 @@ impl VisionRequests {
         Retained::cast_unchecked::<VNRequest>(self.aesthetics.clone()),
       ]);
 
-      handler
-        .performRequests_onImageData_error(&requests, data)
-        .map_err(|e| {
-          // Route NSError's localizedDescription through the bounded
-          // FFI-string helper so a pathological error message cannot
-          // drive the allocator into the abort path while the worker
-          // is already trying to report a failure.
-          let raw = e.localizedDescription();
-          let message: SmolStr = ffi_nsstring_to_smolstr(&raw).unwrap_or_else(|| {
-            SmolStr::new_static("apple-vision request failed (description elided)")
-          });
-          apple_vision_error(ErrorCode::AppleVisionRequestFailed, message)
-        })
+      // The batched `performRequests:` runs ~19 detectors in one call.
+      // A detector can fail two ways: a recoverable `NSError` (mapped
+      // below), or a fatal Objective-C `NSException` that unwinds across
+      // the FFI boundary and would abort the whole process. Guard the
+      // perform with `objc2::exception::catch` so a raising detector
+      // degrades to "no perform" — the per-detector `results()` pulls in
+      // `analyze_keyframe` then return empty for the detectors that did
+      // not complete, yielding a partial keyframe instead of an abort.
+      // On a caught exception the captured Vision handles are discarded
+      // and extraction proceeds, so no broken state is observed.
+      guard_vision_ffi("performRequests", Ok(()), || {
+        handler
+          .performRequests_onImageData_error(&requests, data)
+          .map_err(|e| {
+            // Route NSError's localizedDescription through the bounded
+            // FFI-string helper so a pathological error message cannot
+            // drive the allocator into the abort path while the worker
+            // is already trying to report a failure.
+            let raw = e.localizedDescription();
+            let message: SmolStr = ffi_nsstring_to_smolstr(&raw).unwrap_or_else(|| {
+              SmolStr::new_static("apple-vision request failed (description elided)")
+            });
+            apple_vision_error(ErrorCode::AppleVisionRequestFailed, message)
+          })
+      })
     }
   }
 }
@@ -927,6 +1036,13 @@ impl VisionAnalyzer {
   /// `mediaschema::Keyframe::try_new`, which enforces non-nil ids,
   /// positive `Dimensions`, a `pts` `Timestamp`, and a
   /// `KeyframeExtractor` tag at construction time.
+  ///
+  /// The returned `Keyframe` carries a freshly-minted **placeholder
+  /// `thumbnail_id`** (`Uuid7::new()`): avanalyze does not own thumbnail
+  /// storage, but the domain `try_new` rejects a nil `thumbnail_id`. The
+  /// orchestrator persists only the keyframe's detection child tables
+  /// (faces / OCR / objects / …), never the base keyframe row, so this
+  /// placeholder is internal to the in-memory aggregate and never lands.
   pub fn analyze_keyframe(
     &self,
     scene_id: Id,
@@ -950,64 +1066,140 @@ impl VisionAnalyzer {
     // domain `try_new` invariants (non-nil ids + positive
     // dimensions) surface as structured `ErrorInfo` before we
     // perform the expensive image work.
-    let keyframe =
-      Keyframe::try_new(keyframe_id, scene_id, pts, dimensions, extractor).map_err(|e| {
-        apple_vision_error(
-          ErrorCode::AppleVisionRequestFailed,
-          SmolStr::from(format!("keyframe construction failed: {e}")),
-        )
-      })?;
+    //
+    // `thumbnail_id`: avanalyze does not own thumbnails, but the domain
+    // rejects a nil FK — mint a placeholder. The orchestrator enriches
+    // the keyframe's detection child tables, never the base row, so this
+    // never reaches storage.
+    let thumbnail_id = Uuid7::new();
+    let keyframe = Keyframe::try_new(
+      keyframe_id,
+      scene_id,
+      thumbnail_id,
+      pts,
+      dimensions,
+      extractor,
+    )
+    .map_err(|e| {
+      apple_vision_error(
+        ErrorCode::AppleVisionRequestFailed,
+        SmolStr::from(format!("keyframe construction failed: {e}")),
+      )
+    })?;
     objc2::rc::autoreleasepool(|_| {
       let ns_data = NSData::with_bytes(jpeg_data);
       let handler = unsafe { VNSequenceRequestHandler::new() };
       self.requests.perform(&handler, &ns_data)?;
 
+      // Per-detector Objective-C exception barrier. The batched
+      // `perform` above runs every detector, but result extraction
+      // re-enters Vision FFI per detector (`results()` + per-observation
+      // accessors). Any one of those can raise an `NSException` that
+      // `catch_unwind` cannot catch — so each `extract_*` is wrapped in
+      // `objc2::exception::catch` (via `guard_vision_ffi`). A raising
+      // detector contributes its empty fallback and the OTHER detectors'
+      // results still land: the keyframe degrades per detector, never
+      // aborting the process.
+      //
       // Shared mask budgets — both `extract_person_instance_masks`
       // and `extract_person_segmentation_masks` charge against the
       // SAME per-frame totals (count, bytes, AND attempts) so the
       // cap is enforced across both surfaces and across both the
-      // success and failure paths (codex R14 F1 + R15).
+      // success and failure paths (codex R14 F1 + R15). The mask
+      // closures capture these `&mut` counters, hence `AssertUnwindSafe`:
+      // a caught exception leaves a counter at its partial (over-counted,
+      // never under-counted) value, the safe direction for a cap.
       let mut mask_total_bytes: usize = 0;
       let mut mask_total_count: usize = 0;
       let mut mask_total_attempts: usize = 0;
-      let instance_masks = self.extract_person_instance_masks(
-        &mut mask_total_bytes,
-        &mut mask_total_count,
-        &mut mask_total_attempts,
-      );
-      let segmentation_masks = self.extract_person_segmentation_masks(
-        &mut mask_total_bytes,
-        &mut mask_total_count,
-        &mut mask_total_attempts,
-      );
+      let instance_masks = guard_vision_ffi("person_instance_mask", Vec::new(), || {
+        self.extract_person_instance_masks(
+          &mut mask_total_bytes,
+          &mut mask_total_count,
+          &mut mask_total_attempts,
+        )
+      });
+      let segmentation_masks = guard_vision_ffi("person_segmentation", Vec::new(), || {
+        self.extract_person_segmentation_masks(
+          &mut mask_total_bytes,
+          &mut mask_total_count,
+          &mut mask_total_attempts,
+        )
+      });
 
       Ok(
         keyframe
-          .with_classifications(self.extract_classifications())
+          .with_classifications(guard_vision_ffi("classify", Vec::new(), || {
+            self.extract_classifications()
+          }))
           .with_humans(
             HumanAnalysis::new()
-              .with_subjects(self.extract_human_subjects())
-              .with_faces(self.extract_faces())
-              .with_face_rectangles(self.extract_face_rectangles())
-              .with_face_landmarks(self.extract_face_landmarks())
-              .with_body_poses(self.extract_body_poses())
-              .with_hand_poses(self.extract_hand_poses())
+              .with_subjects(guard_vision_ffi(
+                "human_rectangles",
+                Vec::new(),
+                || self.extract_human_subjects(),
+              ))
+              // #48: ONE record per face — the rectangles pass is the detection
+              // spine, annotated with capture quality by bbox overlap (see
+              // `extract_faces`). `face_rectangles` is intentionally left empty
+              // so no duplicate `keyframe_face` row is written under a second kind.
+              .with_faces(guard_vision_ffi("faces", Vec::new(), || self.extract_faces()))
+              .with_face_landmarks(guard_vision_ffi(
+                "face_landmarks",
+                Vec::new(),
+                || self.extract_face_landmarks(),
+              ))
+              .with_body_poses(guard_vision_ffi("body_pose", Vec::new(), || {
+                self.extract_body_poses()
+              }))
+              .with_hand_poses(guard_vision_ffi("hand_pose", Vec::new(), || {
+                self.extract_hand_poses()
+              }))
+              // `extract_body_poses_3d` self-guards (inner
+              // `objc2::exception::catch` under its `catch_unwind`); a
+              // call-site guard here would put `catch_unwind` inside the
+              // ObjC barrier and could not catch the foreign exception.
               .with_body_poses_3d(self.extract_body_poses_3d())
               .with_instance_masks(instance_masks)
               .with_segmentation_masks(segmentation_masks),
           )
           .with_animals(
             AnimalAnalysis::new()
-              .with_subjects(self.extract_animal_subjects())
-              .with_body_poses(self.extract_animal_body_poses()),
+              .with_subjects(guard_vision_ffi("animals", Vec::new(), || {
+                self.extract_animal_subjects()
+              }))
+              .with_body_poses(guard_vision_ffi("animal_body_pose", Vec::new(), || {
+                self.extract_animal_body_poses()
+              })),
           )
-          .with_text_detections(self.extract_text_detections())
-          .with_barcodes(self.extract_barcodes())
-          .with_attention_saliency(self.extract_attention_saliency())
-          .with_objectness_saliency(self.extract_objectness_saliency())
-          .with_horizon(self.extract_horizon())
-          .with_document_segments(self.extract_document_segments())
-          .with_aesthetics(self.extract_aesthetics()),
+          .with_text_detections(guard_vision_ffi("text", Vec::new(), || {
+            self.extract_text_detections()
+          }))
+          .with_barcodes(guard_vision_ffi("barcodes", Vec::new(), || {
+            self.extract_barcodes()
+          }))
+          .with_attention_saliency(guard_vision_ffi("attention_saliency", Vec::new(), || {
+            self.extract_attention_saliency()
+          }))
+          .with_objectness_saliency(guard_vision_ffi("objectness_saliency", Vec::new(), || {
+            self.extract_objectness_saliency()
+          }))
+          .with_horizon(guard_vision_ffi(
+            "horizon",
+            // The "no detection" sentinel — matches `extract_horizon`'s
+            // own `empty` (zero confidence + zero angle is in range).
+            HorizonInfo::try_new(0.0, 0.0).expect("zero confidence + zero angle is in range"),
+            || self.extract_horizon(),
+          ))
+          .with_document_segments(guard_vision_ffi("document_segments", Vec::new(), || {
+            self.extract_document_segments()
+          }))
+          .with_aesthetics(guard_vision_ffi(
+            "aesthetics",
+            // The "no detection" sentinel — matches `extract_aesthetics`.
+            Aesthetics::new(0.0, false),
+            || self.extract_aesthetics(),
+          )),
       )
     })
   }
@@ -1048,33 +1240,59 @@ impl VisionAnalyzer {
     tags
   }
 
+  /// The detected faces of the frame, ONE record per face (issue #48).
+  ///
+  /// The face-rectangles pass is the detection spine — every detected face
+  /// appears exactly once — and each face is annotated with the capture quality
+  /// of its best bounding-box-overlapping capture-quality observation (`0.0`
+  /// when the capture-quality pass did not cover it). `min_capture_quality` then
+  /// drops faces whose annotated quality is below it: the default (0.1) keeps
+  /// quality-scored faces, while `min_capture_quality == 0.0` keeps every
+  /// detected face.
+  ///
+  /// This replaces the previous TWO collections (`faces` from the capture-quality
+  /// pass PLUS `face_rectangles` from the rectangles pass), which persisted a
+  /// duplicate `keyframe_face` row per face under two `kind`s with identical
+  /// bounding boxes and inflated face counts.
   fn extract_faces(&self) -> Vec<FaceDetection> {
-    let Some(results) = (unsafe { self.requests.face_quality.results() }) else {
+    let Some(rect_results) = (unsafe { self.requests.face_rectangles.results() }) else {
       return Vec::new();
     };
-    let opts = self.opts.face_capture();
+    let rect_opts = self.opts.face_rectangles();
+    let capture_opts = self.opts.face_capture();
 
-    let mut faces = Vec::with_capacity(results.len().min(MAX_VISION_RESULTS_PER_FRAME));
-    for obs in results.iter().take(MAX_VISION_RESULTS_PER_FRAME) {
+    // The capture-quality pass as `(bbox, quality)` pairs, to annotate the
+    // detection spine by bounding-box overlap. Built once. Non-finite quality
+    // readings drop the pair (see `sanitize_capture_quality`); degenerate bboxes
+    // are skipped.
+    let scored: Vec<(BoundingBox, f32)> = match unsafe { self.requests.face_quality.results() } {
+      Some(results) => results
+        .iter()
+        .take(MAX_VISION_RESULTS_PER_FRAME)
+        .filter_map(|obs| {
+          let quality =
+            sanitize_capture_quality(unsafe { obs.faceCaptureQuality() }.map(|q| q.floatValue()))?;
+          let bbox = vision_bbox_to_schema(unsafe { obs.boundingBox() }.standardize())?;
+          Some((bbox, quality))
+        })
+        .collect(),
+      None => Vec::new(),
+    };
+
+    let mut faces = Vec::with_capacity(rect_results.len().min(MAX_VISION_RESULTS_PER_FRAME));
+    for obs in rect_results.iter().take(MAX_VISION_RESULTS_PER_FRAME) {
       let Some(confidence) =
-        sanitize_confidence(unsafe { obs.confidence() }, opts.min_confidence())
+        sanitize_confidence(unsafe { obs.confidence() }, rect_opts.min_confidence())
       else {
         continue;
       };
-      // See `sanitize_capture_quality` for the three-state policy
-      // (absent → 0.0, finite → pass-through, non-finite → drop).
-      let Some(capture_quality) =
-        sanitize_capture_quality(unsafe { obs.faceCaptureQuality() }.map(|q| q.floatValue()))
-      else {
-        continue;
-      };
-      if capture_quality < opts.min_capture_quality() {
-        continue;
-      }
-
       let Some(bbox) = vision_bbox_to_schema(unsafe { obs.boundingBox() }.standardize()) else {
         continue;
       };
+      let capture_quality = matched_capture_quality(&bbox, &scored);
+      if capture_quality < capture_opts.min_capture_quality() {
+        continue;
+      }
       let roll = unsafe { obs.roll() }
         .map(|v| v.floatValue())
         .and_then(finite_f32)
@@ -1089,45 +1307,6 @@ impl VisionAnalyzer {
         .unwrap_or(0.0);
       if let Ok(face) = FaceDetection::try_new(bbox, confidence, capture_quality, roll, yaw, pitch)
       {
-        faces.push(face);
-      }
-    }
-
-    faces
-  }
-
-  fn extract_face_rectangles(&self) -> Vec<FaceDetection> {
-    let Some(results) = (unsafe { self.requests.face_rectangles.results() }) else {
-      return Vec::new();
-    };
-    let opts = self.opts.face_rectangles();
-
-    let mut faces = Vec::with_capacity(results.len().min(MAX_VISION_RESULTS_PER_FRAME));
-    for obs in results.iter().take(MAX_VISION_RESULTS_PER_FRAME) {
-      let Some(confidence) =
-        sanitize_confidence(unsafe { obs.confidence() }, opts.min_confidence())
-      else {
-        continue;
-      };
-
-      let Some(bbox) = vision_bbox_to_schema(unsafe { obs.boundingBox() }.standardize()) else {
-        continue;
-      };
-      let roll = unsafe { obs.roll() }
-        .map(|v| v.floatValue())
-        .and_then(finite_f32)
-        .unwrap_or(0.0);
-      let yaw = unsafe { obs.yaw() }
-        .map(|v| v.floatValue())
-        .and_then(finite_f32)
-        .unwrap_or(0.0);
-      let pitch = unsafe { obs.pitch() }
-        .map(|v| v.floatValue())
-        .and_then(finite_f32)
-        .unwrap_or(0.0);
-      // `face_rectangles` carries no capture quality from Vision —
-      // default to 0.0 (the type does not range-validate it).
-      if let Ok(face) = FaceDetection::try_new(bbox, confidence, 0.0, roll, yaw, pitch) {
         faces.push(face);
       }
     }
@@ -1334,82 +1513,94 @@ impl VisionAnalyzer {
   }
 
   fn extract_body_poses_3d(&self) -> Vec<BodyPose3DDetection> {
+    // Two nested barriers, innermost FIRST. The `VNHumanBodyRecognizedPoint3D`
+    // `position`/`confidence` msg_sends below have a `simd_float4x4` return
+    // encoding that objc2 rejects: in a DEBUG build objc2's runtime
+    // verification turns that into a *Rust panic* (caught by the outer
+    // `catch_unwind`), but in a RELEASE build verification is compiled out and
+    // the real Objective-C dispatch raises an `NSException` instead. That
+    // foreign exception MUST be caught by the inner `objc2::exception::catch`
+    // (`guard_vision_ffi`) — if it reached the outer `catch_unwind` it would
+    // abort the process (`catch_unwind` cannot catch foreign exceptions). So
+    // the ObjC barrier is innermost; the Rust-panic barrier wraps it.
     catch_unwind(AssertUnwindSafe(|| {
-      let Some(results) = (unsafe { self.requests.body_pose_3d.results() }) else {
-        return Vec::new();
-      };
-      let Some(group_name) = (unsafe { VNHumanBodyPose3DObservationJointsGroupNameAll }) else {
-        return Vec::new();
-      };
-
-      let mut body_poses = Vec::with_capacity(results.len().min(MAX_VISION_RESULTS_PER_FRAME));
-      for obs in results.iter().take(MAX_VISION_RESULTS_PER_FRAME) {
-        let Ok(points_by_joint) =
-          (unsafe { obs.recognizedPointsForJointsGroupName_error(group_name) })
-        else {
-          continue;
+      guard_vision_ffi("body_pose_3d", Vec::new(), || {
+        let Some(results) = (unsafe { self.requests.body_pose_3d.results() }) else {
+          return Vec::new();
+        };
+        let Some(group_name) = (unsafe { VNHumanBodyPose3DObservationJointsGroupNameAll }) else {
+          return Vec::new();
         };
 
-        // Bound the dictionary materialisation: `to_vecs()` allocates
-        // two `Vec`s sized to `points_by_joint.len()`, which is FFI-
-        // reported. Drop the pose entirely if the joint count
-        // exceeds `MAX_POSE_JOINTS` rather than risking an allocator
-        // abort on a corrupted/adversarial Vision dictionary.
-        if points_by_joint.len() > MAX_POSE_JOINTS {
-          continue;
-        }
-        let (joint_names, points) = points_by_joint.to_vecs();
-        let mut joints = Vec::with_capacity(points.len());
-
-        for (joint_name, point) in joint_names.into_iter().zip(points) {
-          let Some(name) = ffi_nsstring_to_smolstr(&joint_name) else {
+        let mut body_poses = Vec::with_capacity(results.len().min(MAX_VISION_RESULTS_PER_FRAME));
+        for obs in results.iter().take(MAX_VISION_RESULTS_PER_FRAME) {
+          let Ok(points_by_joint) =
+            (unsafe { obs.recognizedPointsForJointsGroupName_error(group_name) })
+          else {
             continue;
           };
-          if name.is_empty() {
+
+          // Bound the dictionary materialisation: `to_vecs()` allocates
+          // two `Vec`s sized to `points_by_joint.len()`, which is FFI-
+          // reported. Drop the pose entirely if the joint count
+          // exceeds `MAX_POSE_JOINTS` rather than risking an allocator
+          // abort on a corrupted/adversarial Vision dictionary.
+          if points_by_joint.len() > MAX_POSE_JOINTS {
             continue;
           }
+          let (joint_names, points) = points_by_joint.to_vecs();
+          let mut joints = Vec::with_capacity(points.len());
 
-          let Some((x, y, z)) = extract_body_pose_3d_coordinates(&point) else {
+          for (joint_name, point) in joint_names.into_iter().zip(points) {
+            let Some(name) = ffi_nsstring_to_smolstr(&joint_name) else {
+              continue;
+            };
+            if name.is_empty() {
+              continue;
+            }
+
+            let Some((x, y, z)) = extract_body_pose_3d_coordinates(&point) else {
+              continue;
+            };
+            let raw_confidence: f32 = unsafe { objc2::msg_send![&*point, confidence] };
+            let Some(confidence) = sanitize_confidence(
+              raw_confidence,
+              self.opts.body_pose_3d().min_joint_confidence(),
+            ) else {
+              continue;
+            };
+
+            let Ok(joint) = BodyPose3DJoint::try_new(name, x, y, z, confidence) else {
+              continue;
+            };
+            joints.push(joint);
+          }
+
+          if joints.is_empty() {
+            continue;
+          }
+          let Some(pose_confidence) = sanitize_confidence(unsafe { obs.confidence() }, 0.0) else {
             continue;
           };
-          let raw_confidence: f32 = unsafe { objc2::msg_send![&*point, confidence] };
-          let Some(confidence) = sanitize_confidence(
-            raw_confidence,
-            self.opts.body_pose_3d().min_joint_confidence(),
-          ) else {
-            continue;
-          };
 
-          let Ok(joint) = BodyPose3DJoint::try_new(name, x, y, z, confidence) else {
-            continue;
-          };
-          joints.push(joint);
+          joints.sort_by(|lhs, rhs| lhs.name().cmp(rhs.name()));
+          // See `sanitize_body_height_pair` — couples the
+          // body_height substitution with the height_estimation enum
+          // so `(0.0, UNKNOWN)` is the only fallback for non-finite
+          // readings.
+          let mapped_estimation =
+            map_body_pose_3d_height_estimation(unsafe { obs.heightEstimation() });
+          let (body_height, height_estimation) =
+            sanitize_body_height_pair(unsafe { obs.bodyHeight() }, mapped_estimation);
+          if let Ok(pose) =
+            BodyPose3DDetection::try_new(pose_confidence, body_height, height_estimation, joints)
+          {
+            body_poses.push(pose);
+          }
         }
 
-        if joints.is_empty() {
-          continue;
-        }
-        let Some(pose_confidence) = sanitize_confidence(unsafe { obs.confidence() }, 0.0) else {
-          continue;
-        };
-
-        joints.sort_by(|lhs, rhs| lhs.name().cmp(rhs.name()));
-        // See `sanitize_body_height_pair` — couples the
-        // body_height substitution with the height_estimation enum
-        // so `(0.0, UNKNOWN)` is the only fallback for non-finite
-        // readings.
-        let mapped_estimation =
-          map_body_pose_3d_height_estimation(unsafe { obs.heightEstimation() });
-        let (body_height, height_estimation) =
-          sanitize_body_height_pair(unsafe { obs.bodyHeight() }, mapped_estimation);
-        if let Ok(pose) =
-          BodyPose3DDetection::try_new(pose_confidence, body_height, height_estimation, joints)
-        {
-          body_poses.push(pose);
-        }
-      }
-
-      body_poses
+        body_poses
+      })
     }))
     .unwrap_or_else(|_| {
       #[cfg(feature = "tracing")]
@@ -2696,6 +2887,69 @@ mod macos_tests {
   use mediaschema::domain::aggregates::video::BoundingBox as DomainBoundingBox;
   use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 
+  /// #48: IoU of a box with itself is 1.0 — exact-duplicate detections (the
+  /// common case across the two Vision face passes) match perfectly.
+  #[test]
+  fn bbox_iou_identical_is_one() {
+    let a = DomainBoundingBox::try_new(0.1, 0.2, 0.3, 0.4).unwrap();
+    assert!(
+      (bbox_iou(&a, &a) - 1.0).abs() < 1e-6,
+      "iou = {}",
+      bbox_iou(&a, &a)
+    );
+  }
+
+  /// #48: IoU of disjoint boxes is 0.0.
+  #[test]
+  fn bbox_iou_disjoint_is_zero() {
+    let a = DomainBoundingBox::try_new(0.0, 0.0, 0.2, 0.2).unwrap();
+    let b = DomainBoundingBox::try_new(0.5, 0.5, 0.2, 0.2).unwrap();
+    assert_eq!(bbox_iou(&a, &b), 0.0);
+  }
+
+  /// #48: partial overlap. Two 0.2×0.2 boxes offset by 0.1 in x share a
+  /// 0.1×0.2 strip: inter = 0.02, union = 0.04 + 0.04 − 0.02 = 0.06 → IoU = 1/3.
+  #[test]
+  fn bbox_iou_partial_overlap() {
+    let a = DomainBoundingBox::try_new(0.0, 0.0, 0.2, 0.2).unwrap();
+    let b = DomainBoundingBox::try_new(0.1, 0.0, 0.2, 0.2).unwrap();
+    assert!(
+      (bbox_iou(&a, &b) - 1.0 / 3.0).abs() < 1e-5,
+      "iou = {}",
+      bbox_iou(&a, &b)
+    );
+  }
+
+  /// #48: a detected face is annotated with the quality of the overlapping
+  /// capture-quality observation, and the highest-IoU match wins.
+  #[test]
+  fn matched_capture_quality_takes_overlapping_score() {
+    let face = DomainBoundingBox::try_new(0.10, 0.10, 0.20, 0.20).unwrap();
+    let scored = vec![
+      (
+        DomainBoundingBox::try_new(0.50, 0.50, 0.20, 0.20).unwrap(),
+        0.2,
+      ), // disjoint
+      (
+        DomainBoundingBox::try_new(0.10, 0.10, 0.20, 0.20).unwrap(),
+        0.8,
+      ), // exact overlap
+    ];
+    assert!((matched_capture_quality(&face, &scored) - 0.8).abs() < 1e-6);
+  }
+
+  /// #48: a face the capture-quality pass did not cover annotates to 0.0 (so
+  /// the default `min_capture_quality` of 0.1 drops it, while 0.0 keeps it).
+  #[test]
+  fn matched_capture_quality_zero_without_overlap() {
+    let face = DomainBoundingBox::try_new(0.10, 0.10, 0.20, 0.20).unwrap();
+    let scored = vec![(
+      DomainBoundingBox::try_new(0.60, 0.60, 0.20, 0.20).unwrap(),
+      0.9,
+    )];
+    assert_eq!(matched_capture_quality(&face, &scored), 0.0);
+  }
+
   /// `vision_bbox_to_schema` must flip y. A Vision rect of
   /// `(0.1, 0.2, 0.3, 0.4)` (lower-left origin) maps to
   /// `(0.1, 1.0 - (0.2 + 0.4), 0.3, 0.4)` = `(0.1, 0.4, 0.3, 0.4)`
@@ -3493,5 +3747,41 @@ mod macos_tests {
   fn simd_float4x4_encoding_matches_clang_at_encode() {
     assert_eq!(SimdFloat4::ENCODING.to_string(), "");
     assert_eq!(SimdFloat4x4::ENCODING.to_string(), "{?=[4]}");
+  }
+
+  /// `guard_vision_ffi` passes a non-raising closure's value through
+  /// untouched (the common, no-exception path).
+  #[test]
+  fn guard_vision_ffi_returns_closure_value_when_no_exception() {
+    let got = guard_vision_ffi("test_detector", Vec::<u8>::new(), || vec![1u8, 2, 3]);
+    assert_eq!(got, vec![1u8, 2, 3]);
+  }
+
+  /// The core of the process-abort fix: a real Objective-C `NSException`
+  /// raised inside the guarded closure is caught and converted to the
+  /// `fallback`, NOT propagated. `std::panic::catch_unwind` cannot do
+  /// this — a foreign exception escaping it aborts the process with
+  /// `fatal runtime error: Rust cannot catch foreign exceptions`.
+  ///
+  /// `-[NSArray objectAtIndex:]` on an empty array raises
+  /// `NSRangeException` — a genuine foreign exception via a *valid*
+  /// selector, so objc2's debug-build msg_send verification passes and
+  /// the runtime raises for real in BOTH debug and release builds
+  /// (unlike the encoding-mismatched `VNHumanBodyRecognizedPoint3D`
+  /// selector, which only raises in release). If `guard_vision_ffi`
+  /// did not wrap the call in `objc2::exception::catch`, this test
+  /// would abort the whole test binary instead of returning.
+  #[test]
+  fn guard_vision_ffi_catches_objc_exception_and_returns_fallback() {
+    let empty: Retained<NSArray<objc2::runtime::NSObject>> = NSArray::new();
+    let got = guard_vision_ffi("test_detector", 7u32, || {
+      // Out-of-bounds access raises NSRangeException across the FFI.
+      let _ = empty.objectAtIndex(0);
+      0u32
+    });
+    assert_eq!(
+      got, 7u32,
+      "guard must return the fallback after catching the NSException"
+    );
   }
 }
