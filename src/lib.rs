@@ -583,6 +583,46 @@ fn sanitize_capture_quality(raw: Option<f32>) -> Option<f32> {
   }
 }
 
+/// Minimum intersection-over-union for a face-rectangle detection and a
+/// capture-quality observation to be treated as the SAME face when merging the
+/// two Vision face passes (issue #48). Vision runs both passes on the identical
+/// frame at the same revision, so a genuine match has near-1.0 IoU; 0.5 is a
+/// forgiving floor that still rejects two distinct faces.
+#[cfg(target_vendor = "apple")]
+const FACE_MATCH_MIN_IOU: f32 = 0.5;
+
+/// Intersection-over-union of two normalized bounding boxes. `0.0` when they do
+/// not overlap, or when either box is degenerate (zero area).
+#[cfg(target_vendor = "apple")]
+fn bbox_iou(a: &BoundingBox, b: &BoundingBox) -> f32 {
+  let ix = (a.x() + a.width()).min(b.x() + b.width()) - a.x().max(b.x());
+  let iy = (a.y() + a.height()).min(b.y() + b.height()) - a.y().max(b.y());
+  if ix <= 0.0 || iy <= 0.0 {
+    return 0.0;
+  }
+  let inter = ix * iy;
+  let union = a.width() * a.height() + b.width() * b.height() - inter;
+  if union <= 0.0 { 0.0 } else { inter / union }
+}
+
+/// The capture quality to annotate a detected face `bbox` with: the quality of
+/// the best-overlapping (IoU ≥ [`FACE_MATCH_MIN_IOU`]) capture-quality
+/// observation, or `0.0` when none overlaps. `scored` is the `(bbox, quality)`
+/// list from the capture-quality pass.
+#[cfg(target_vendor = "apple")]
+fn matched_capture_quality(bbox: &BoundingBox, scored: &[(BoundingBox, f32)]) -> f32 {
+  let mut best_iou = FACE_MATCH_MIN_IOU;
+  let mut best_quality = 0.0;
+  for (candidate, quality) in scored {
+    let iou = bbox_iou(bbox, candidate);
+    if iou >= best_iou {
+      best_iou = iou;
+      best_quality = *quality;
+    }
+  }
+  best_quality
+}
+
 /// Sanitise a raw 3-D body-pose height + height-estimation pair.
 ///
 /// Vision's `bodyHeight()` is metres in model space. When the
@@ -1099,14 +1139,11 @@ impl VisionAnalyzer {
                 Vec::new(),
                 || self.extract_human_subjects(),
               ))
-              .with_faces(guard_vision_ffi("face_quality", Vec::new(), || {
-                self.extract_faces()
-              }))
-              .with_face_rectangles(guard_vision_ffi(
-                "face_rectangles",
-                Vec::new(),
-                || self.extract_face_rectangles(),
-              ))
+              // #48: ONE record per face — the rectangles pass is the detection
+              // spine, annotated with capture quality by bbox overlap (see
+              // `extract_faces`). `face_rectangles` is intentionally left empty
+              // so no duplicate `keyframe_face` row is written under a second kind.
+              .with_faces(guard_vision_ffi("faces", Vec::new(), || self.extract_faces()))
               .with_face_landmarks(guard_vision_ffi(
                 "face_landmarks",
                 Vec::new(),
@@ -1203,33 +1240,59 @@ impl VisionAnalyzer {
     tags
   }
 
+  /// The detected faces of the frame, ONE record per face (issue #48).
+  ///
+  /// The face-rectangles pass is the detection spine — every detected face
+  /// appears exactly once — and each face is annotated with the capture quality
+  /// of its best bounding-box-overlapping capture-quality observation (`0.0`
+  /// when the capture-quality pass did not cover it). `min_capture_quality` then
+  /// drops faces whose annotated quality is below it: the default (0.1) keeps
+  /// quality-scored faces, while `min_capture_quality == 0.0` keeps every
+  /// detected face.
+  ///
+  /// This replaces the previous TWO collections (`faces` from the capture-quality
+  /// pass PLUS `face_rectangles` from the rectangles pass), which persisted a
+  /// duplicate `keyframe_face` row per face under two `kind`s with identical
+  /// bounding boxes and inflated face counts.
   fn extract_faces(&self) -> Vec<FaceDetection> {
-    let Some(results) = (unsafe { self.requests.face_quality.results() }) else {
+    let Some(rect_results) = (unsafe { self.requests.face_rectangles.results() }) else {
       return Vec::new();
     };
-    let opts = self.opts.face_capture();
+    let rect_opts = self.opts.face_rectangles();
+    let capture_opts = self.opts.face_capture();
 
-    let mut faces = Vec::with_capacity(results.len().min(MAX_VISION_RESULTS_PER_FRAME));
-    for obs in results.iter().take(MAX_VISION_RESULTS_PER_FRAME) {
+    // The capture-quality pass as `(bbox, quality)` pairs, to annotate the
+    // detection spine by bounding-box overlap. Built once. Non-finite quality
+    // readings drop the pair (see `sanitize_capture_quality`); degenerate bboxes
+    // are skipped.
+    let scored: Vec<(BoundingBox, f32)> = match unsafe { self.requests.face_quality.results() } {
+      Some(results) => results
+        .iter()
+        .take(MAX_VISION_RESULTS_PER_FRAME)
+        .filter_map(|obs| {
+          let quality =
+            sanitize_capture_quality(unsafe { obs.faceCaptureQuality() }.map(|q| q.floatValue()))?;
+          let bbox = vision_bbox_to_schema(unsafe { obs.boundingBox() }.standardize())?;
+          Some((bbox, quality))
+        })
+        .collect(),
+      None => Vec::new(),
+    };
+
+    let mut faces = Vec::with_capacity(rect_results.len().min(MAX_VISION_RESULTS_PER_FRAME));
+    for obs in rect_results.iter().take(MAX_VISION_RESULTS_PER_FRAME) {
       let Some(confidence) =
-        sanitize_confidence(unsafe { obs.confidence() }, opts.min_confidence())
+        sanitize_confidence(unsafe { obs.confidence() }, rect_opts.min_confidence())
       else {
         continue;
       };
-      // See `sanitize_capture_quality` for the three-state policy
-      // (absent → 0.0, finite → pass-through, non-finite → drop).
-      let Some(capture_quality) =
-        sanitize_capture_quality(unsafe { obs.faceCaptureQuality() }.map(|q| q.floatValue()))
-      else {
-        continue;
-      };
-      if capture_quality < opts.min_capture_quality() {
-        continue;
-      }
-
       let Some(bbox) = vision_bbox_to_schema(unsafe { obs.boundingBox() }.standardize()) else {
         continue;
       };
+      let capture_quality = matched_capture_quality(&bbox, &scored);
+      if capture_quality < capture_opts.min_capture_quality() {
+        continue;
+      }
       let roll = unsafe { obs.roll() }
         .map(|v| v.floatValue())
         .and_then(finite_f32)
@@ -1244,45 +1307,6 @@ impl VisionAnalyzer {
         .unwrap_or(0.0);
       if let Ok(face) = FaceDetection::try_new(bbox, confidence, capture_quality, roll, yaw, pitch)
       {
-        faces.push(face);
-      }
-    }
-
-    faces
-  }
-
-  fn extract_face_rectangles(&self) -> Vec<FaceDetection> {
-    let Some(results) = (unsafe { self.requests.face_rectangles.results() }) else {
-      return Vec::new();
-    };
-    let opts = self.opts.face_rectangles();
-
-    let mut faces = Vec::with_capacity(results.len().min(MAX_VISION_RESULTS_PER_FRAME));
-    for obs in results.iter().take(MAX_VISION_RESULTS_PER_FRAME) {
-      let Some(confidence) =
-        sanitize_confidence(unsafe { obs.confidence() }, opts.min_confidence())
-      else {
-        continue;
-      };
-
-      let Some(bbox) = vision_bbox_to_schema(unsafe { obs.boundingBox() }.standardize()) else {
-        continue;
-      };
-      let roll = unsafe { obs.roll() }
-        .map(|v| v.floatValue())
-        .and_then(finite_f32)
-        .unwrap_or(0.0);
-      let yaw = unsafe { obs.yaw() }
-        .map(|v| v.floatValue())
-        .and_then(finite_f32)
-        .unwrap_or(0.0);
-      let pitch = unsafe { obs.pitch() }
-        .map(|v| v.floatValue())
-        .and_then(finite_f32)
-        .unwrap_or(0.0);
-      // `face_rectangles` carries no capture quality from Vision —
-      // default to 0.0 (the type does not range-validate it).
-      if let Ok(face) = FaceDetection::try_new(bbox, confidence, 0.0, roll, yaw, pitch) {
         faces.push(face);
       }
     }
@@ -2862,6 +2886,69 @@ mod macos_tests {
   use super::*;
   use mediaschema::domain::aggregates::video::BoundingBox as DomainBoundingBox;
   use objc2_core_foundation::{CGPoint, CGRect, CGSize};
+
+  /// #48: IoU of a box with itself is 1.0 — exact-duplicate detections (the
+  /// common case across the two Vision face passes) match perfectly.
+  #[test]
+  fn bbox_iou_identical_is_one() {
+    let a = DomainBoundingBox::try_new(0.1, 0.2, 0.3, 0.4).unwrap();
+    assert!(
+      (bbox_iou(&a, &a) - 1.0).abs() < 1e-6,
+      "iou = {}",
+      bbox_iou(&a, &a)
+    );
+  }
+
+  /// #48: IoU of disjoint boxes is 0.0.
+  #[test]
+  fn bbox_iou_disjoint_is_zero() {
+    let a = DomainBoundingBox::try_new(0.0, 0.0, 0.2, 0.2).unwrap();
+    let b = DomainBoundingBox::try_new(0.5, 0.5, 0.2, 0.2).unwrap();
+    assert_eq!(bbox_iou(&a, &b), 0.0);
+  }
+
+  /// #48: partial overlap. Two 0.2×0.2 boxes offset by 0.1 in x share a
+  /// 0.1×0.2 strip: inter = 0.02, union = 0.04 + 0.04 − 0.02 = 0.06 → IoU = 1/3.
+  #[test]
+  fn bbox_iou_partial_overlap() {
+    let a = DomainBoundingBox::try_new(0.0, 0.0, 0.2, 0.2).unwrap();
+    let b = DomainBoundingBox::try_new(0.1, 0.0, 0.2, 0.2).unwrap();
+    assert!(
+      (bbox_iou(&a, &b) - 1.0 / 3.0).abs() < 1e-5,
+      "iou = {}",
+      bbox_iou(&a, &b)
+    );
+  }
+
+  /// #48: a detected face is annotated with the quality of the overlapping
+  /// capture-quality observation, and the highest-IoU match wins.
+  #[test]
+  fn matched_capture_quality_takes_overlapping_score() {
+    let face = DomainBoundingBox::try_new(0.10, 0.10, 0.20, 0.20).unwrap();
+    let scored = vec![
+      (
+        DomainBoundingBox::try_new(0.50, 0.50, 0.20, 0.20).unwrap(),
+        0.2,
+      ), // disjoint
+      (
+        DomainBoundingBox::try_new(0.10, 0.10, 0.20, 0.20).unwrap(),
+        0.8,
+      ), // exact overlap
+    ];
+    assert!((matched_capture_quality(&face, &scored) - 0.8).abs() < 1e-6);
+  }
+
+  /// #48: a face the capture-quality pass did not cover annotates to 0.0 (so
+  /// the default `min_capture_quality` of 0.1 drops it, while 0.0 keeps it).
+  #[test]
+  fn matched_capture_quality_zero_without_overlap() {
+    let face = DomainBoundingBox::try_new(0.10, 0.10, 0.20, 0.20).unwrap();
+    let scored = vec![(
+      DomainBoundingBox::try_new(0.60, 0.60, 0.20, 0.20).unwrap(),
+      0.9,
+    )];
+    assert_eq!(matched_capture_quality(&face, &scored), 0.0);
+  }
 
   /// `vision_bbox_to_schema` must flip y. A Vision rect of
   /// `(0.1, 0.2, 0.3, 0.4)` (lower-left origin) maps to
