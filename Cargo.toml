@@ -48,7 +48,7 @@ mediaschema = { version = "0.2", default-features = false, features = ["std", "v
 mediaframe = { version = "0.1", default-features = false, features = ["std"] }
 # `Keyframe::try_new` requires a `mediatime::Timestamp` parameter; the
 # domain layer re-exports the type but the constructor lives here.
-mediatime = { version = "0.1", default-features = false, features = ["std"] }
+mediatime = { version = "0.2", default-features = false, features = ["std"] }
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 # `exception` pulls in `objc2-exception-helper`, enabling
