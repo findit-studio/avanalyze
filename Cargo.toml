@@ -82,7 +82,10 @@ tempfile = "3"
 # against a real, foreign, validating vocabulary instead of a
 # permissive stub. Nothing in the engine or the public API links these
 # — the dev graph is free to move independently.
-mediaframe = { version = "0.4", default-features = false, features = ["std"] }
+# Follows mediaschema, not the newest release: the reference implementation
+# hands mediaframe types (the `Dimensions` family) to mediaschema's
+# constructors, so the two must link the SAME mediaframe — 0.2 pins 0.1.
+mediaframe = { version = "0.1", default-features = false, features = ["std"] }
 mediaschema = { version = "0.2", default-features = false, features = ["std", "video"] }
 
 [profile.bench]
