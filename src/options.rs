@@ -753,7 +753,9 @@ const fn default_saliency_max_regions() -> usize {
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct AppleVisionSaliencyOptions {
+  #[cfg_attr(feature = "serde", serde(default = "default_saliency_min_confidence"))]
   min_confidence: f32,
+  #[cfg_attr(feature = "serde", serde(default = "default_saliency_max_regions"))]
   max_regions: usize,
 }
 
@@ -814,6 +816,7 @@ const fn default_horizon_min_confidence() -> f32 {
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct AppleVisionHorizonOptions {
+  #[cfg_attr(feature = "serde", serde(default = "default_horizon_min_confidence"))]
   min_confidence: f32,
 }
 
@@ -859,7 +862,15 @@ const fn default_document_segmentation_max_segments() -> usize {
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct AppleVisionDocumentSegmentationOptions {
+  #[cfg_attr(
+    feature = "serde",
+    serde(default = "default_document_segmentation_min_confidence")
+  )]
   min_confidence: f32,
+  #[cfg_attr(
+    feature = "serde",
+    serde(default = "default_document_segmentation_max_segments")
+  )]
   max_segments: usize,
 }
 
@@ -920,6 +931,10 @@ const fn default_aesthetics_min_overall_score() -> f32 {
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct AppleVisionAestheticsOptions {
+  #[cfg_attr(
+    feature = "serde",
+    serde(default = "default_aesthetics_min_overall_score")
+  )]
   min_overall_score: f32,
 }
 
@@ -965,7 +980,15 @@ const fn default_person_instance_mask_max_instances_per_observation() -> usize {
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct AppleVisionPersonInstanceMaskOptions {
+  #[cfg_attr(
+    feature = "serde",
+    serde(default = "default_person_instance_mask_min_confidence")
+  )]
   min_confidence: f32,
+  #[cfg_attr(
+    feature = "serde",
+    serde(default = "default_person_instance_mask_max_instances_per_observation")
+  )]
   max_instances_per_observation: usize,
 }
 
@@ -1033,6 +1056,10 @@ const fn default_person_segmentation_min_confidence() -> f32 {
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct AppleVisionPersonSegmentationOptions {
+  #[cfg_attr(
+    feature = "serde",
+    serde(default = "default_person_segmentation_min_confidence")
+  )]
   min_confidence: f32,
 }
 

@@ -59,6 +59,14 @@ The engine stops assembling and stops depending.
 
 ### Fixed
 
+- **Six options types were mandatory-in-full when deserialized.** The saliency,
+  horizon, document-segmentation, aesthetics, person-instance-mask and
+  person-segmentation options carried no field-level `serde(default)`, so a
+  config that named one knob in such a section — `{"attention_saliency":
+  {"max_regions": 4}}` — failed on the field it did *not* name instead of
+  filling that field in. Every field now defaults from the same function its
+  `DEFAULT_*` constant reads, which is what the `DEFAULT_*` entry above already
+  claimed for the whole set.
 - **No panic path remains.** The two `expect`s on the horizon sentinel are
   gone: a vocabulary that refuses `try_new(0.0, 0.0)` now costs the horizon
   slot, not the worker thread.
