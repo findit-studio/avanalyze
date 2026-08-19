@@ -110,5 +110,5 @@ unconditionally.
 
 at your option.
 
-[Github-url]: https://github.com/Findit-AI/avanalyze
+[Github-url]: https://github.com/findit-studio/avanalyze
 [doc-url]: https://docs.rs/avanalyze
