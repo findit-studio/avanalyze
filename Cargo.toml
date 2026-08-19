@@ -1,11 +1,11 @@
 [package]
 name = "avanalyze"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 repository = "https://github.com/Findit-AI/avanalyze"
 homepage = "https://github.com/Findit-AI/avanalyze"
 documentation = "https://docs.rs/avanalyze"
-description = "Long-running Apple Vision.framework worker that analyses keyframes and emits mediaschema-shaped detections."
+description = "Apple Vision.framework keyframe analysis that builds detections into an output vocabulary you name."
 license = "MIT OR Apache-2.0"
 rust-version = "1.95"
 
@@ -20,35 +20,10 @@ serde = ["dep:serde"]
 tracing = ["dep:tracing"]
 
 [dependencies]
-bytes = "1"
 serde = { version = "1", optional = true, features = ["derive"] }
 smol_str = "0.3"
 
 tracing = { version = "0.1", optional = true }
-
-# Domain types live in `mediaschema` — engine output IS the storage shape.
-# Only the `video` aggregate tree is needed (apple-vision feeds Keyframe +
-# detections).
-#
-# Git dependency (not crates.io 0.2.0) pinned to mediaschema `main`: the
-# `feat/keyframe-thumbnail-fk` work (which replaced the `Keyframe`'s inline
-# `data`/`mime` with a first-class `Thumbnail` entity + a keyframe
-# `thumbnail_id` FK, a 6-arg `try_new`) is now merged to `main`. The desktop
-# indexer composes avanalyze's returned `Keyframe`, so both crates MUST
-# resolve to the same mediaschema revision (same git URL + branch). Revert
-# to a crates.io version once that mediaschema release ships.
-#
-# `sqlx-sqlite` deliberately NOT enabled: avanalyze uses only the validated
-# DOMAIN `Keyframe` (not the storage layer) — the desktop owns persistence.
-# `buffa` deliberately NOT enabled either: avanalyze writes against DOMAIN
-# types (validated `try_new`-style aggregates), not the protobuf-generated
-# wire records — the engine boundary stays clean, serialization happens
-# inside mediaschema's storage backends.
-mediaschema = { version = "0.2", default-features = false, features = ["std", "video"] }
-mediaframe = { version = "0.1", default-features = false, features = ["std"] }
-# `Keyframe::try_new` requires a `mediatime::Timestamp` parameter; the
-# domain layer re-exports the type but the constructor lives here.
-mediatime = { version = "0.1", default-features = false, features = ["std"] }
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 # `exception` pulls in `objc2-exception-helper`, enabling
@@ -96,9 +71,19 @@ objc2-vision = { version = "0.3", features = [
 workspace = true
 
 [dev-dependencies]
+bytes = "1"
 criterion = "0.8"
 serde_json = "1"
 tempfile = "3"
+
+# The reference implementation of the `Detections` contract lives in
+# `src/tests/reference.rs`: it wires mediaschema's validated domain
+# aggregates to this crate's traits, so the conformance suite runs
+# against a real, foreign, validating vocabulary instead of a
+# permissive stub. Nothing in the engine or the public API links these
+# — the dev graph is free to move independently.
+mediaframe = { version = "0.1", default-features = false, features = ["std"] }
+mediaschema = { version = "0.2", default-features = false, features = ["std", "video"] }
 
 [profile.bench]
 opt-level = 3

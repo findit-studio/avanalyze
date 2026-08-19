@@ -35,7 +35,7 @@ default_options!(
   AppleVisionAestheticsOptions,
   AppleVisionPersonInstanceMaskOptions,
   AppleVisionPersonSegmentationOptions,
-  ServiceOptions,
+  AnalyzeOptions,
 );
 
 #[cfg_attr(not(tarpaulin), inline(always))]
@@ -63,11 +63,16 @@ pub struct AppleVisionClassificationOptions {
 }
 
 impl AppleVisionClassificationOptions {
+  /// Default [`min_confidence`](Self::min_confidence).
+  pub const DEFAULT_MIN_CONFIDENCE: f32 = default_classification_min_confidence();
+  /// Default [`max_results`](Self::max_results).
+  pub const DEFAULT_MAX_RESULTS: usize = default_classification_max_results();
+
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new() -> Self {
     Self {
-      min_confidence: default_classification_min_confidence(),
-      max_results: default_classification_max_results(),
+      min_confidence: Self::DEFAULT_MIN_CONFIDENCE,
+      max_results: Self::DEFAULT_MAX_RESULTS,
     }
   }
 
@@ -119,10 +124,13 @@ pub struct AppleVisionAnimalOptions {
 }
 
 impl AppleVisionAnimalOptions {
+  /// Default [`min_confidence`](Self::min_confidence).
+  pub const DEFAULT_MIN_CONFIDENCE: f32 = default_animal_min_confidence();
+
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new() -> Self {
     Self {
-      min_confidence: default_animal_min_confidence(),
+      min_confidence: Self::DEFAULT_MIN_CONFIDENCE,
     }
   }
 
@@ -167,11 +175,17 @@ pub struct AppleVisionTextOptions {
 }
 
 impl AppleVisionTextOptions {
+  /// Default [`min_text_len`](Self::min_text_len).
+  pub const DEFAULT_MIN_TEXT_LEN: usize = default_text_min_len();
+  /// Default [`max_candidates_per_observation`](Self::max_candidates_per_observation).
+  pub const DEFAULT_MAX_CANDIDATES_PER_OBSERVATION: usize =
+    default_text_max_candidates_per_observation();
+
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new() -> Self {
     Self {
-      min_text_len: default_text_min_len(),
-      max_candidates_per_observation: default_text_max_candidates_per_observation(),
+      min_text_len: Self::DEFAULT_MIN_TEXT_LEN,
+      max_candidates_per_observation: Self::DEFAULT_MAX_CANDIDATES_PER_OBSERVATION,
     }
   }
 
@@ -232,10 +246,13 @@ pub struct AppleVisionBodyPoseOptions {
 }
 
 impl AppleVisionBodyPoseOptions {
+  /// Default [`min_joint_confidence`](Self::min_joint_confidence).
+  pub const DEFAULT_MIN_JOINT_CONFIDENCE: f32 = default_body_pose_min_joint_confidence();
+
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new() -> Self {
     Self {
-      min_joint_confidence: default_body_pose_min_joint_confidence(),
+      min_joint_confidence: Self::DEFAULT_MIN_JOINT_CONFIDENCE,
     }
   }
 
@@ -283,11 +300,16 @@ pub struct AppleVisionHandPoseOptions {
 }
 
 impl AppleVisionHandPoseOptions {
+  /// Default [`min_joint_confidence`](Self::min_joint_confidence).
+  pub const DEFAULT_MIN_JOINT_CONFIDENCE: f32 = default_hand_pose_min_joint_confidence();
+  /// Default [`maximum_hand_count`](Self::maximum_hand_count).
+  pub const DEFAULT_MAXIMUM_HAND_COUNT: usize = default_hand_pose_maximum_hand_count();
+
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new() -> Self {
     Self {
-      min_joint_confidence: default_hand_pose_min_joint_confidence(),
-      maximum_hand_count: default_hand_pose_maximum_hand_count(),
+      min_joint_confidence: Self::DEFAULT_MIN_JOINT_CONFIDENCE,
+      maximum_hand_count: Self::DEFAULT_MAXIMUM_HAND_COUNT,
     }
   }
 
@@ -342,10 +364,13 @@ pub struct AppleVisionAnimalPoseOptions {
 }
 
 impl AppleVisionAnimalPoseOptions {
+  /// Default [`min_joint_confidence`](Self::min_joint_confidence).
+  pub const DEFAULT_MIN_JOINT_CONFIDENCE: f32 = default_animal_pose_min_joint_confidence();
+
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new() -> Self {
     Self {
-      min_joint_confidence: default_animal_pose_min_joint_confidence(),
+      min_joint_confidence: Self::DEFAULT_MIN_JOINT_CONFIDENCE,
     }
   }
 
@@ -383,10 +408,13 @@ pub struct AppleVisionBodyPose3DOptions {
 }
 
 impl AppleVisionBodyPose3DOptions {
+  /// Default [`min_joint_confidence`](Self::min_joint_confidence).
+  pub const DEFAULT_MIN_JOINT_CONFIDENCE: f32 = default_body_pose_3d_min_joint_confidence();
+
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new() -> Self {
     Self {
-      min_joint_confidence: default_body_pose_3d_min_joint_confidence(),
+      min_joint_confidence: Self::DEFAULT_MIN_JOINT_CONFIDENCE,
     }
   }
 
@@ -434,11 +462,16 @@ pub struct AppleVisionFaceCaptureOptions {
 }
 
 impl AppleVisionFaceCaptureOptions {
+  /// Default [`min_confidence`](Self::min_confidence).
+  pub const DEFAULT_MIN_CONFIDENCE: f32 = default_face_capture_min_confidence();
+  /// Default [`min_capture_quality`](Self::min_capture_quality).
+  pub const DEFAULT_MIN_CAPTURE_QUALITY: f32 = default_face_capture_min_capture_quality();
+
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new() -> Self {
     Self {
-      min_confidence: default_face_capture_min_confidence(),
-      min_capture_quality: default_face_capture_min_capture_quality(),
+      min_confidence: Self::DEFAULT_MIN_CONFIDENCE,
+      min_capture_quality: Self::DEFAULT_MIN_CAPTURE_QUALITY,
     }
   }
 
@@ -493,10 +526,13 @@ pub struct AppleVisionFaceRectangleOptions {
 }
 
 impl AppleVisionFaceRectangleOptions {
+  /// Default [`min_confidence`](Self::min_confidence).
+  pub const DEFAULT_MIN_CONFIDENCE: f32 = default_face_rectangle_min_confidence();
+
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new() -> Self {
     Self {
-      min_confidence: default_face_rectangle_min_confidence(),
+      min_confidence: Self::DEFAULT_MIN_CONFIDENCE,
     }
   }
 
@@ -544,11 +580,16 @@ pub struct AppleVisionFaceLandmarkOptions {
 }
 
 impl AppleVisionFaceLandmarkOptions {
+  /// Default [`min_confidence`](Self::min_confidence).
+  pub const DEFAULT_MIN_CONFIDENCE: f32 = default_face_landmark_min_confidence();
+  /// Default [`min_region_count`](Self::min_region_count).
+  pub const DEFAULT_MIN_REGION_COUNT: usize = default_face_landmark_min_region_count();
+
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new() -> Self {
     Self {
-      min_confidence: default_face_landmark_min_confidence(),
-      min_region_count: default_face_landmark_min_region_count(),
+      min_confidence: Self::DEFAULT_MIN_CONFIDENCE,
+      min_region_count: Self::DEFAULT_MIN_REGION_COUNT,
     }
   }
 
@@ -603,10 +644,13 @@ pub struct AppleVisionHumanSubjectOptions {
 }
 
 impl AppleVisionHumanSubjectOptions {
+  /// Default [`min_confidence`](Self::min_confidence).
+  pub const DEFAULT_MIN_CONFIDENCE: f32 = default_human_subject_min_confidence();
+
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new() -> Self {
     Self {
-      min_confidence: default_human_subject_min_confidence(),
+      min_confidence: Self::DEFAULT_MIN_CONFIDENCE,
     }
   }
 
@@ -648,11 +692,16 @@ pub struct AppleVisionBarcodeOptions {
 }
 
 impl AppleVisionBarcodeOptions {
+  /// Default [`min_confidence`](Self::min_confidence).
+  pub const DEFAULT_MIN_CONFIDENCE: f32 = default_barcode_min_confidence();
+  /// Default [`min_payload_len`](Self::min_payload_len).
+  pub const DEFAULT_MIN_PAYLOAD_LEN: usize = default_barcode_min_payload_len();
+
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new() -> Self {
     Self {
-      min_confidence: default_barcode_min_confidence(),
-      min_payload_len: default_barcode_min_payload_len(),
+      min_confidence: Self::DEFAULT_MIN_CONFIDENCE,
+      min_payload_len: Self::DEFAULT_MIN_PAYLOAD_LEN,
     }
   }
 
@@ -709,11 +758,16 @@ pub struct AppleVisionSaliencyOptions {
 }
 
 impl AppleVisionSaliencyOptions {
+  /// Default [`min_confidence`](Self::min_confidence).
+  pub const DEFAULT_MIN_CONFIDENCE: f32 = default_saliency_min_confidence();
+  /// Default [`max_regions`](Self::max_regions).
+  pub const DEFAULT_MAX_REGIONS: usize = default_saliency_max_regions();
+
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new() -> Self {
     Self {
-      min_confidence: default_saliency_min_confidence(),
-      max_regions: default_saliency_max_regions(),
+      min_confidence: Self::DEFAULT_MIN_CONFIDENCE,
+      max_regions: Self::DEFAULT_MAX_REGIONS,
     }
   }
 
@@ -764,10 +818,13 @@ pub struct AppleVisionHorizonOptions {
 }
 
 impl AppleVisionHorizonOptions {
+  /// Default [`min_confidence`](Self::min_confidence).
+  pub const DEFAULT_MIN_CONFIDENCE: f32 = default_horizon_min_confidence();
+
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new() -> Self {
     Self {
-      min_confidence: default_horizon_min_confidence(),
+      min_confidence: Self::DEFAULT_MIN_CONFIDENCE,
     }
   }
 
@@ -807,11 +864,16 @@ pub struct AppleVisionDocumentSegmentationOptions {
 }
 
 impl AppleVisionDocumentSegmentationOptions {
+  /// Default [`min_confidence`](Self::min_confidence).
+  pub const DEFAULT_MIN_CONFIDENCE: f32 = default_document_segmentation_min_confidence();
+  /// Default [`max_segments`](Self::max_segments).
+  pub const DEFAULT_MAX_SEGMENTS: usize = default_document_segmentation_max_segments();
+
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new() -> Self {
     Self {
-      min_confidence: default_document_segmentation_min_confidence(),
-      max_segments: default_document_segmentation_max_segments(),
+      min_confidence: Self::DEFAULT_MIN_CONFIDENCE,
+      max_segments: Self::DEFAULT_MAX_SEGMENTS,
     }
   }
 
@@ -862,10 +924,13 @@ pub struct AppleVisionAestheticsOptions {
 }
 
 impl AppleVisionAestheticsOptions {
+  /// Default [`min_overall_score`](Self::min_overall_score).
+  pub const DEFAULT_MIN_OVERALL_SCORE: f32 = default_aesthetics_min_overall_score();
+
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new() -> Self {
     Self {
-      min_overall_score: default_aesthetics_min_overall_score(),
+      min_overall_score: Self::DEFAULT_MIN_OVERALL_SCORE,
     }
   }
 
@@ -905,11 +970,17 @@ pub struct AppleVisionPersonInstanceMaskOptions {
 }
 
 impl AppleVisionPersonInstanceMaskOptions {
+  /// Default [`min_confidence`](Self::min_confidence).
+  pub const DEFAULT_MIN_CONFIDENCE: f32 = default_person_instance_mask_min_confidence();
+  /// Default [`max_instances_per_observation`](Self::max_instances_per_observation).
+  pub const DEFAULT_MAX_INSTANCES_PER_OBSERVATION: usize =
+    default_person_instance_mask_max_instances_per_observation();
+
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new() -> Self {
     Self {
-      min_confidence: default_person_instance_mask_min_confidence(),
-      max_instances_per_observation: default_person_instance_mask_max_instances_per_observation(),
+      min_confidence: Self::DEFAULT_MIN_CONFIDENCE,
+      max_instances_per_observation: Self::DEFAULT_MAX_INSTANCES_PER_OBSERVATION,
     }
   }
 
@@ -966,10 +1037,13 @@ pub struct AppleVisionPersonSegmentationOptions {
 }
 
 impl AppleVisionPersonSegmentationOptions {
+  /// Default [`min_confidence`](Self::min_confidence).
+  pub const DEFAULT_MIN_CONFIDENCE: f32 = default_person_segmentation_min_confidence();
+
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new() -> Self {
     Self {
-      min_confidence: default_person_segmentation_min_confidence(),
+      min_confidence: Self::DEFAULT_MIN_CONFIDENCE,
     }
   }
 
@@ -994,7 +1068,7 @@ impl AppleVisionPersonSegmentationOptions {
 #[cfg(feature = "serde")]
 #[cfg_attr(not(tarpaulin), inline(always))]
 const fn default_num_workers() -> usize {
-  1
+  AnalyzeOptions::DEFAULT_NUM_WORKERS
 }
 
 // Mirror the `with_workers` / `set_workers` 0 -> 1 coercion at the serde
@@ -1011,7 +1085,7 @@ where
 
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct ServiceOptions {
+pub struct AnalyzeOptions {
   #[cfg_attr(
     feature = "serde",
     serde(
@@ -1060,11 +1134,14 @@ pub struct ServiceOptions {
   person_segmentation_masks: AppleVisionPersonSegmentationOptions,
 }
 
-impl ServiceOptions {
+impl AnalyzeOptions {
+  /// Default [`num_workers`](Self::num_workers).
+  pub const DEFAULT_NUM_WORKERS: usize = 1;
+
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new() -> Self {
     Self {
-      num_workers: 1,
+      num_workers: Self::DEFAULT_NUM_WORKERS,
       classifications: AppleVisionClassificationOptions::new(),
       face_capture: AppleVisionFaceCaptureOptions::new(),
       face_rectangles: AppleVisionFaceRectangleOptions::new(),

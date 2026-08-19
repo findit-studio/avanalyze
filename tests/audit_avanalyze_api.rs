@@ -1,70 +1,66 @@
 //! AUDIT: Public API surface + non-macOS stub (R4, R28, R30)
 //!
-//! Tests the public VisionAnalyzer API on all platforms.
+//! Tests the public VisionAnalyzer API on all platforms, driving it
+//! through the outside vocabulary in `tests/common`.
 
-use avanalyze::*;
+mod common;
+
+use avanalyze::{AnalyzeOptions, AppleVisionClassificationOptions, VisionAnalyzer};
+use common::Plain;
 
 // -- R30: Non-macOS stub always errors --
 
 #[cfg(not(target_vendor = "apple"))]
 mod non_macos {
   use super::*;
-  use core::num::NonZeroU32;
-  use mediatime::{Timebase, Timestamp};
-
-  fn make_params() -> (Uuid7, Uuid7, Timestamp, Dimensions, KeyframeExtractor) {
-    let tb = Timebase::new(1, NonZeroU32::new(1000).unwrap());
-    (
-      Uuid7::new(),
-      Uuid7::new(),
-      Timestamp::new(0, tb),
-      Dimensions::new(320, 180),
-      KeyframeExtractor::Manual,
-    )
-  }
+  use avanalyze::AnalyzeErrorKind;
 
   #[test]
   fn stub_returns_error() {
-    let analyzer = VisionAnalyzer::new(ServiceOptions::new());
-    let (sid, kid, pts, dims, ext) = make_params();
+    let options = AnalyzeOptions::new();
+    let analyzer = VisionAnalyzer::new(&options);
     let err = analyzer
-      .analyze_keyframe(sid, kid, pts, dims, ext, &[])
+      .analyze_keyframe::<Plain>(&[], &options)
       .expect_err("stub must Err");
-    assert_eq!(err.code(), ErrorCode::AppleVisionFailed);
+    assert_eq!(err.kind(), AnalyzeErrorKind::Unsupported);
   }
 
   #[test]
   fn stub_error_mentions_macos() {
-    let analyzer = VisionAnalyzer::new(ServiceOptions::new());
-    let (sid, kid, pts, dims, ext) = make_params();
+    let options = AnalyzeOptions::new();
+    let analyzer = VisionAnalyzer::new(&options);
     let err = analyzer
-      .analyze_keyframe(sid, kid, pts, dims, ext, &[0xFF, 0xD8])
+      .analyze_keyframe::<Plain>(&[0xFF, 0xD8], &options)
       .expect_err("stub must Err");
     assert!(err.message().contains("macOS"));
   }
 
   #[test]
   fn stub_ignores_data_size() {
-    let analyzer = VisionAnalyzer::new(ServiceOptions::new());
-    let (sid, kid, pts, dims, ext) = make_params();
+    let options = AnalyzeOptions::new();
+    let analyzer = VisionAnalyzer::new(&options);
     let e1 = analyzer
-      .analyze_keyframe(sid, kid, pts, dims, ext, &[])
+      .analyze_keyframe::<Plain>(&[], &options)
       .expect_err("empty");
     let e2 = analyzer
-      .analyze_keyframe(sid, kid, pts, dims, ext, &vec![0u8; 1024])
+      .analyze_keyframe::<Plain>(&vec![0u8; 1024], &options)
       .expect_err("large");
-    assert_eq!(e1.code(), e2.code());
+    assert_eq!(e1.kind(), e2.kind());
   }
 
   #[test]
-  fn error_has_code_and_message() {
-    let analyzer = VisionAnalyzer::new(ServiceOptions::new());
-    let (sid, kid, pts, dims, ext) = make_params();
+  fn error_has_kind_and_message() {
+    let options = AnalyzeOptions::new();
+    let analyzer = VisionAnalyzer::new(&options);
     let err = analyzer
-      .analyze_keyframe(sid, kid, pts, dims, ext, &[])
+      .analyze_keyframe::<Plain>(&[], &options)
       .expect_err("stub");
-    let _ = format!("{:?}", err.code());
+    let _ = format!("{:?}", err.kind());
     assert!(!err.message().is_empty());
+    // The error is a real `std::error::Error`, not a record the caller
+    // has to reassemble a string from.
+    let as_error: &dyn std::error::Error = &err;
+    assert!(as_error.to_string().contains("macOS"));
   }
 }
 
@@ -72,25 +68,26 @@ mod non_macos {
 
 #[test]
 fn vision_analyzer_debug() {
-  let analyzer = VisionAnalyzer::new(ServiceOptions::new());
+  let analyzer = VisionAnalyzer::new(&AnalyzeOptions::new());
   let dbg = format!("{analyzer:?}");
   assert!(dbg.contains("VisionAnalyzer"));
 }
 
-// -- R30: ServiceOptions is Send --
+// -- R30: AnalyzeOptions is Send --
 
 #[test]
-fn service_options_is_send() {
+fn analyze_options_is_send() {
   fn assert_send<T: Send>() {}
-  assert_send::<ServiceOptions>();
+  assert_send::<AnalyzeOptions>();
 }
 
 // -- R30: Multiple constructions --
 
 #[test]
 fn multiple_analyzer_constructions() {
+  let options = AnalyzeOptions::new();
   for _ in 0..10 {
-    let _ = VisionAnalyzer::new(ServiceOptions::new());
+    let _ = VisionAnalyzer::new(&options);
   }
 }
 
@@ -98,10 +95,10 @@ fn multiple_analyzer_constructions() {
 
 #[test]
 fn analyzer_with_custom_options() {
-  let mut opts = ServiceOptions::new().with_workers(4);
+  let mut opts = AnalyzeOptions::new().with_workers(4);
   opts.classifications_mut().set_min_confidence(0.5);
   opts.classifications_mut().set_max_results(5);
-  let analyzer = VisionAnalyzer::new(opts);
+  let analyzer = VisionAnalyzer::new(&opts);
   let _ = format!("{analyzer:?}");
 }
 
@@ -110,7 +107,26 @@ fn analyzer_with_custom_options() {
 #[test]
 fn default_feature_compiles() {
   // This test file compiles with default features (no serde, no tracing)
-  let _ = ServiceOptions::new();
+  let _ = AnalyzeOptions::new();
+}
+
+// -- Defaults are public constants, single-sourced with `new()` --
+
+#[test]
+fn default_constants_match_constructed_defaults() {
+  let o = AppleVisionClassificationOptions::new();
+  assert_eq!(
+    o.min_confidence(),
+    AppleVisionClassificationOptions::DEFAULT_MIN_CONFIDENCE
+  );
+  assert_eq!(
+    o.max_results(),
+    AppleVisionClassificationOptions::DEFAULT_MAX_RESULTS
+  );
+  assert_eq!(
+    AnalyzeOptions::new().num_workers(),
+    AnalyzeOptions::DEFAULT_NUM_WORKERS
+  );
 }
 
 // -- Process-abort regression: a real Vision keyframe must not SIGABRT --
@@ -125,7 +141,7 @@ fn default_feature_compiles() {
 /// process with `fatal runtime error: Rust cannot catch foreign
 /// exceptions`. The fix guards every Vision FFI call with
 /// `objc2::exception::catch`, degrading a raising detector to an empty
-/// result and returning a partial `Keyframe`.
+/// result and returning a partial analysis.
 ///
 /// The committed fixture is the desktop's exact keyframe-extraction
 /// output for `01_airport.mp4` (the `AreaResampler` downscale to
@@ -141,29 +157,24 @@ fn default_feature_compiles() {
 #[cfg(target_vendor = "apple")]
 #[test]
 fn analyze_keyframe_does_not_abort_on_real_airport_keyframe() {
-  use core::num::NonZeroU32;
-  use mediaframe::frame::Dimensions;
-  use mediaschema::domain::{KeyframeExtractor, Uuid7};
-  use mediatime::{Timebase, Timestamp};
-
   // The desktop resample emits a 288x512 frame for this clip.
   const JPEG: &[u8] = include_bytes!("fixtures/airport_keyframe.jpg");
 
-  let analyzer = VisionAnalyzer::new(ServiceOptions::new());
-  let tb = Timebase::new(1, NonZeroU32::new(1000).expect("nonzero den"));
-  let keyframe = analyzer
-    .analyze_keyframe(
-      Uuid7::new(),
-      Uuid7::new(),
-      Timestamp::new(0, tb),
-      Dimensions::new(288, 512),
-      KeyframeExtractor::Manual,
-      JPEG,
-    )
-    .expect("analyze_keyframe must return Ok (a partial Keyframe), never abort the process");
+  let options = AnalyzeOptions::new();
+  let analyzer = VisionAnalyzer::new(&options);
+  let analysis = analyzer
+    .analyze_keyframe::<Plain>(JPEG, &options)
+    .expect("analyze_keyframe must return Ok (a partial analysis), never abort the process");
 
-  // The returned aggregate must carry the caller-supplied frame
-  // metadata — i.e. it is a real, usable Keyframe, not a degenerate
-  // shell.
-  assert_eq!(keyframe.dimensions(), Dimensions::new(288, 512));
+  // Both frame-wide slots are always written — with a real reading or
+  // with the engine's sentinel — so a successful call is never a
+  // degenerate shell.
+  assert!(
+    analysis.horizon().is_some(),
+    "the horizon slot carries at least the no-detection sentinel"
+  );
+  assert!(
+    analysis.aesthetics().is_some(),
+    "the aesthetics slot carries at least the no-detection sentinel"
+  );
 }

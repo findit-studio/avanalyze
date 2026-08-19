@@ -109,12 +109,12 @@ mod serde_tests {
 
   #[test]
   fn serde_service_options() {
-    roundtrip(&ServiceOptions::new());
+    roundtrip(&AnalyzeOptions::new());
   }
 
   #[test]
   fn serde_service_options_custom() {
-    let o = ServiceOptions::new().with_workers(4);
+    let o = AnalyzeOptions::new().with_workers(4);
     roundtrip(&o);
   }
 
@@ -123,7 +123,7 @@ mod serde_tests {
   #[test]
   fn serde_service_options_from_empty_json() {
     // All fields should use their serde(default) values
-    let o: ServiceOptions = serde_json::from_str("{}").expect("empty json");
+    let o: AnalyzeOptions = serde_json::from_str("{}").expect("empty json");
     assert_eq!(o.num_workers(), 1);
     assert_eq!(o.classifications().min_confidence(), 0.3);
     assert_eq!(o.classifications().max_results(), 12);
@@ -133,7 +133,7 @@ mod serde_tests {
   #[test]
   fn serde_service_options_from_partial_json() {
     let json = r#"{"num_workers": 8, "classifications": {"min_confidence": 0.5}}"#;
-    let o: ServiceOptions = serde_json::from_str(json).expect("partial json");
+    let o: AnalyzeOptions = serde_json::from_str(json).expect("partial json");
     assert_eq!(o.num_workers(), 8);
     assert_eq!(o.classifications().min_confidence(), 0.5);
     // max_results should be default
@@ -149,7 +149,7 @@ mod serde_tests {
     // (coerced to 1) — a custom `deserialize_with` mirrors the runtime
     // setter contract at the serde boundary.
     let json = r#"{"num_workers": 0}"#;
-    let o: ServiceOptions = serde_json::from_str(json).expect("zero workers json");
+    let o: AnalyzeOptions = serde_json::from_str(json).expect("zero workers json");
     assert_eq!(o.num_workers(), 1, "0 must be coerced to 1");
   }
 

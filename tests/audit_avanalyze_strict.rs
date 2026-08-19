@@ -12,59 +12,59 @@ mod serde_coercion_tests {
 
   #[test]
   fn serde_zero_workers_coerced_to_one() {
-    let o: ServiceOptions = serde_json::from_str(r#"{"num_workers": 0}"#).unwrap();
+    let o: AnalyzeOptions = serde_json::from_str(r#"{"num_workers": 0}"#).unwrap();
     assert_eq!(o.num_workers(), 1);
   }
 
   #[test]
   fn serde_one_workers_unchanged() {
-    let o: ServiceOptions = serde_json::from_str(r#"{"num_workers": 1}"#).unwrap();
+    let o: AnalyzeOptions = serde_json::from_str(r#"{"num_workers": 1}"#).unwrap();
     assert_eq!(o.num_workers(), 1);
   }
 
   #[test]
   fn serde_large_workers_unchanged() {
-    let o: ServiceOptions = serde_json::from_str(r#"{"num_workers": 256}"#).unwrap();
+    let o: AnalyzeOptions = serde_json::from_str(r#"{"num_workers": 256}"#).unwrap();
     assert_eq!(o.num_workers(), 256);
   }
 
   #[test]
   fn serde_missing_num_workers_defaults_to_one() {
-    let o: ServiceOptions = serde_json::from_str(r#"{}"#).unwrap();
+    let o: AnalyzeOptions = serde_json::from_str(r#"{}"#).unwrap();
     assert_eq!(o.num_workers(), 1);
   }
 
   #[test]
   fn serde_max_workers_unchanged() {
     let json = format!(r#"{{"num_workers": {}}}"#, usize::MAX);
-    let o: ServiceOptions = serde_json::from_str(&json).unwrap();
+    let o: AnalyzeOptions = serde_json::from_str(&json).unwrap();
     assert_eq!(o.num_workers(), usize::MAX);
   }
 
   #[test]
   fn serde_negative_workers_rejected() {
-    let result = serde_json::from_str::<ServiceOptions>(r#"{"num_workers": -1}"#);
+    let result = serde_json::from_str::<AnalyzeOptions>(r#"{"num_workers": -1}"#);
     assert!(result.is_err(), "negative usize must be rejected");
   }
 
   #[test]
   fn serde_workers_roundtrip_preserves_coercion() {
-    let o = ServiceOptions::new().with_workers(0);
+    let o = AnalyzeOptions::new().with_workers(0);
     assert_eq!(o.num_workers(), 1);
     let json = serde_json::to_string(&o).unwrap();
-    let o2: ServiceOptions = serde_json::from_str(&json).unwrap();
+    let o2: AnalyzeOptions = serde_json::from_str(&json).unwrap();
     assert_eq!(o2.num_workers(), 1);
   }
 
   #[test]
   fn serde_float_workers_rejected() {
-    let result = serde_json::from_str::<ServiceOptions>(r#"{"num_workers": 1.5}"#);
+    let result = serde_json::from_str::<AnalyzeOptions>(r#"{"num_workers": 1.5}"#);
     assert!(result.is_err(), "float must be rejected for usize");
   }
 
   #[test]
   fn serde_string_workers_rejected() {
-    let result = serde_json::from_str::<ServiceOptions>(r#"{"num_workers": "two"}"#);
+    let result = serde_json::from_str::<AnalyzeOptions>(r#"{"num_workers": "two"}"#);
     assert!(result.is_err(), "string must be rejected for usize");
   }
 
@@ -92,7 +92,7 @@ mod serde_coercion_tests {
       "person_instance_masks": {"min_confidence": 0.5, "max_instances_per_observation": 8},
       "person_segmentation_masks": {"min_confidence": 0.4}
     }"#;
-    let o: ServiceOptions = serde_json::from_str(json).unwrap();
+    let o: AnalyzeOptions = serde_json::from_str(json).unwrap();
     assert_eq!(o.num_workers(), 4);
     assert_eq!(o.classifications().min_confidence(), 0.5);
     assert_eq!(o.classifications().max_results(), 20);
@@ -132,7 +132,7 @@ fn setter_modifies_in_place() {
 
 #[test]
 fn mut_accessor_idempotent() {
-  let mut o = ServiceOptions::new();
+  let mut o = AnalyzeOptions::new();
   let ptr1 = o.classifications_mut() as *const _;
   let ptr2 = o.classifications_mut() as *const _;
   assert_eq!(ptr1, ptr2, "mut accessor must return same address");
@@ -140,7 +140,7 @@ fn mut_accessor_idempotent() {
 
 #[test]
 fn modifying_one_option_does_not_affect_others() {
-  let mut o = ServiceOptions::new();
+  let mut o = AnalyzeOptions::new();
   let original_barcode = o.barcodes().min_confidence();
   o.classifications_mut().set_min_confidence(0.99);
   assert_eq!(
@@ -152,8 +152,8 @@ fn modifying_one_option_does_not_affect_others() {
 
 #[test]
 fn new_equals_default_for_all_fields() {
-  let a = ServiceOptions::new();
-  let b = ServiceOptions::default();
+  let a = AnalyzeOptions::new();
+  let b = AnalyzeOptions::default();
   assert_eq!(a.num_workers(), b.num_workers());
   assert_eq!(
     a.classifications().min_confidence(),
@@ -199,11 +199,11 @@ fn options_with_subnormal_float() {
 #[cfg(feature = "serde")]
 #[test]
 fn serde_roundtrip_service_options_full() {
-  let mut opts = ServiceOptions::new().with_workers(8);
+  let mut opts = AnalyzeOptions::new().with_workers(8);
   opts.classifications_mut().set_min_confidence(0.7);
   opts.hand_pose_mut().set_maximum_hand_count(4);
   let json = serde_json::to_string_pretty(&opts).unwrap();
-  let back: ServiceOptions = serde_json::from_str(&json).unwrap();
+  let back: AnalyzeOptions = serde_json::from_str(&json).unwrap();
   assert_eq!(back.num_workers(), 8);
   assert_eq!(back.classifications().min_confidence(), 0.7);
   assert_eq!(back.hand_pose().maximum_hand_count(), 4);
