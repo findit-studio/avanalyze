@@ -1,47 +1,23 @@
 #![doc = include_str!("../README.md")]
-// #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(docsrs, allow(unused_attributes))]
 #![deny(missing_docs)]
 
-//! Long-running Apple Vision.framework service thread.
+//! Apple Vision.framework, wrapped so it only ever *produces*.
 //!
-//! Each worker thread owns an `AppleVisionAnalyzer` and processes keyframes
-//! independently. Vision.framework is stateless per-request, so multiple
-//! workers can run in parallel.
-//!
-//! Input: `Request` via crossbeam bounded channel
-//! Output: `Reply` via callback back to the processor-local coordinator
+//! One [`VisionAnalyzer`] per worker thread runs every configured
+//! Vision request against a JPEG and hands back an [`Analysis`] — a
+//! flat set of detections in whatever output vocabulary the caller
+//! named through the [`Detections`] bundle. The engine mints no
+//! identifiers, assembles no aggregate, and depends on no schema
+//! crate; Vision.framework is stateless per-request, so workers run in
+//! parallel.
 
 #[cfg(target_vendor = "apple")]
-use std::panic::{AssertUnwindSafe, catch_unwind};
-
-#[cfg(target_vendor = "apple")]
-use bytes::Bytes;
-use mediaframe::frame::Dimensions;
-#[cfg(target_vendor = "apple")]
-use mediaschema::domain::aggregates::video::{
-  Aesthetics, AnimalAnalysis, BarcodeDetection, BodyPose3DDetection, BodyPose3DHeightEstimation,
-  BodyPose3DJoint, BodyPoseDetection, BodyPoseJoint, BoundingBox, Detection, DocumentSegment,
-  FaceDetection, FaceLandmarkRegion, FaceLandmarksDetection, HandChirality, HandPoseDetection,
-  HorizonInfo, HumanAnalysis, PersonInstanceMaskDetection, PersonSegmentationMask, SaliencyRegion,
-  SubjectDetection, TextDetection,
+use std::{
+  borrow::Cow,
+  panic::{AssertUnwindSafe, catch_unwind},
 };
-use mediaschema::domain::{ErrorCode, ErrorInfo, Keyframe, KeyframeExtractor, Uuid7};
-use mediatime::Timestamp;
-
-// The domain `Keyframe` is generic over its `Id` type; avanalyze
-// specialises on `Uuid7` (mediaschema's domain identifier). `Id` was
-// previously a wire-record alias for `Bytes`; under the domain
-// migration it becomes the typed `Uuid7`.
-//
-// Held as a doc alias rather than a re-export so the (commented)
-// service-framework block keeps compiling against the new identifier
-// type without a churn-only rename.
-#[cfg(target_vendor = "apple")]
-type Id = Uuid7;
-
-// use tracing::{info, warn};
 
 #[cfg(target_vendor = "apple")]
 use objc2::{
@@ -66,9 +42,19 @@ use objc2_vision::*;
 #[cfg(target_vendor = "apple")]
 use smol_str::{SmolStr, StrExt, ToSmolStr};
 
+pub use analysis::*;
+pub use contract::*;
+pub use error::*;
 pub use options::*;
 
+mod analysis;
+pub mod conformance;
+mod contract;
+mod error;
 mod options;
+
+#[cfg(test)]
+mod tests;
 
 #[cfg(target_vendor = "apple")]
 #[repr(C, align(16))]
@@ -112,7 +98,7 @@ unsafe impl Encode for SimdFloat4x4 {
   const ENCODING: Encoding = Encoding::Struct("?", &[Encoding::Array(4, &Encoding::None)]);
 }
 
-// ----- Vision → mediaschema coordinate conversion ---------------------------
+// ----- Vision → contract coordinate conversion ------------------------------
 
 /// Clamp a finite `f32` into `[0.0, 1.0]`. Callers MUST filter
 /// non-finite inputs before invoking this helper — passing `NaN` /
@@ -135,18 +121,17 @@ fn clamp01(value: f32) -> f32 {
 }
 
 /// Convert a Vision-framework normalized bounding box (lower-left
-/// origin, y grows up) into the mediaschema convention (top-left
+/// origin, y grows up) into the contract's convention (top-left
 /// origin, y grows down) and intersect it with the unit square
 /// `[0, 1] × [0, 1]`.
 ///
-/// The schema documents `apple-vision convention: floats in [0.0, 1.0],
-/// origin top-left` (see `mediaschema::domain ... NormCoord`), while
-/// `VNObservation::boundingBox` is documented as a normalized rect in
-/// image coordinates where `(0,0)` is the lower-left corner. Vision is
-/// empirically loose about staying inside `[0, 1]` — partially
-/// off-screen detections can produce `origin.x < 0`,
-/// `origin.x + width > 1`, etc., which the validated domain
-/// `BoundingBox::try_new` would reject. We clamp every component and
+/// [`BoundingBox`] documents floats in `[0.0, 1.0]` with a top-left
+/// origin, while `VNObservation::boundingBox` is documented as a
+/// normalized rect in image coordinates where `(0,0)` is the
+/// lower-left corner. Vision is empirically loose about staying inside
+/// `[0, 1]` — partially off-screen detections can produce
+/// `origin.x < 0`, `origin.x + width > 1`, etc., which a validating
+/// [`BoundingBox::try_new`] would reject. We clamp every component and
 /// return `None` if the resulting rectangle is degenerate
 /// (zero-width or zero-height); the detection is then dropped at the
 /// engine layer instead of poisoning downstream storage.
@@ -154,7 +139,7 @@ fn clamp01(value: f32) -> f32 {
 /// `standardize()` is assumed to have already been called on `rect`;
 /// the input `size` is non-negative.
 #[cfg(target_vendor = "apple")]
-fn vision_bbox_to_schema(rect: CGRect) -> Option<BoundingBox> {
+fn vision_rect_to_bbox<B: BoundingBox>(rect: CGRect) -> Option<B> {
   // Vision lower-left → schema top-left: the top edge in schema space
   // is `1.0 - (origin.y + size.height)`.
   let raw_x = rect.origin.x as f32;
@@ -182,20 +167,19 @@ fn vision_bbox_to_schema(rect: CGRect) -> Option<BoundingBox> {
   if width <= 0.0 || height <= 0.0 {
     return None;
   }
-  // The clamp logic above guarantees the validating-ctor invariants
-  // (finite, `[0, 1]`, positive extent, `left + width <= 1.0`); a
-  // failure here would be a regression in the upstream guards, not a
-  // real Vision input.
-  BoundingBox::try_new(left, top, width, height).ok()
+  // The clamp logic above guarantees the invariants a validating
+  // vocabulary checks (finite, `[0, 1]`, positive extent,
+  // `left + width <= 1.0`); a failure here would be a regression in
+  // the upstream guards, not a real Vision input.
+  B::try_new(left, top, width, height).ok()
 }
 
-/// Flip a Vision normalized point's y axis to match mediaschema's
+/// Flip a Vision normalized point's y axis to match the contract's
 /// top-left origin and clamp both components into `[0.0, 1.0]`.
-/// `BoundingBox`, `Point2D`, `BodyPoseJoint` (2-D), `FaceLandmarkPoint`,
-/// and `DocumentSegment` corners all share the top-left convention (see
-/// `NormCoord` doc-comment in mediaschema). 3-D joints
-/// (`BodyPose3DJoint`) are model-space metres and are NOT flipped or
-/// clamped.
+/// [`BoundingBox`], [`BodyPoseJoint`] (2-D), face-landmark points, and
+/// [`DocumentSegment`] corners all share the top-left convention.
+/// 3-D joints ([`BodyPose3DJoint`]) are model-space metres and are NOT
+/// flipped or clamped.
 ///
 /// Returns `None` when either input coordinate is non-finite. A `NaN`
 /// or `±Inf` from a glitched Vision observation is geometrically
@@ -207,7 +191,7 @@ fn vision_bbox_to_schema(rect: CGRect) -> Option<BoundingBox> {
 /// many).
 #[cfg(target_vendor = "apple")]
 #[inline]
-fn vision_point_to_schema(x: f64, y: f64) -> Option<(f32, f32)> {
+fn vision_point_to_normalized(x: f64, y: f64) -> Option<(f32, f32)> {
   let x32 = x as f32;
   let flipped_y = (1.0 - y) as f32;
   if !x32.is_finite() || !flipped_y.is_finite() {
@@ -339,7 +323,7 @@ const MAX_TOTAL_MASK_ATTEMPTS_PER_FRAME: usize = 4 * MAX_TOTAL_MASKS_PER_FRAME;
 /// visited per frame across all detections × all 13 named regions.
 /// Symmetric with `MAX_TOTAL_MASK_ATTEMPTS_PER_FRAME`: a corrupted
 /// observation set where every region's points fail
-/// `vision_point_to_schema`'s finite check (or where the parent
+/// `vision_point_to_normalized`'s finite check (or where the parent
 /// detection later fails the bbox / min_region_count gates) would
 /// otherwise let the helper walk up to
 /// `4096 * 13 * MAX_LANDMARK_POINTS` raw points without the
@@ -378,7 +362,7 @@ const MAX_TOTAL_TEXT_DETECTIONS_PER_FRAME: usize = 256;
 /// memory and drive the allocator into the abort path. 64 MiB
 /// covers an extremely generous keyframe (Apple's typical
 /// keyframe encoded JPEG is well under 1 MiB); inputs above that
-/// surface as a structured `ErrorInfo` instead of an alloc-side
+/// surface as a structured [`AnalyzeError`] instead of an alloc-side
 /// crash (codex R17 F1).
 #[cfg(target_vendor = "apple")]
 const MAX_INPUT_IMAGE_BYTES: usize = 64 * 1024 * 1024;
@@ -594,7 +578,7 @@ const FACE_MATCH_MIN_IOU: f32 = 0.5;
 /// Intersection-over-union of two normalized bounding boxes. `0.0` when they do
 /// not overlap, or when either box is degenerate (zero area).
 #[cfg(target_vendor = "apple")]
-fn bbox_iou(a: &BoundingBox, b: &BoundingBox) -> f32 {
+fn bbox_iou<B: BoundingBox>(a: &B, b: &B) -> f32 {
   let ix = (a.x() + a.width()).min(b.x() + b.width()) - a.x().max(b.x());
   let iy = (a.y() + a.height()).min(b.y() + b.height()) - a.y().max(b.y());
   if ix <= 0.0 || iy <= 0.0 {
@@ -610,7 +594,7 @@ fn bbox_iou(a: &BoundingBox, b: &BoundingBox) -> f32 {
 /// observation, or `0.0` when none overlaps. `scored` is the `(bbox, quality)`
 /// list from the capture-quality pass.
 #[cfg(target_vendor = "apple")]
-fn matched_capture_quality(bbox: &BoundingBox, scored: &[(BoundingBox, f32)]) -> f32 {
+fn matched_capture_quality<B: BoundingBox>(bbox: &B, scored: &[(B, f32)]) -> f32 {
   let mut best_iou = FACE_MATCH_MIN_IOU;
   let mut best_quality = 0.0;
   for (candidate, quality) in scored {
@@ -636,11 +620,11 @@ fn matched_capture_quality(bbox: &BoundingBox, scored: &[(BoundingBox, f32)]) ->
 #[inline]
 fn sanitize_body_height_pair(
   raw_height: f32,
-  measured_or_reference: BodyPose3DHeightEstimation,
-) -> (f32, BodyPose3DHeightEstimation) {
+  measured_or_reference: HeightEstimation,
+) -> (f32, HeightEstimation) {
   match finite_f32(raw_height) {
     Some(finite) => (finite, measured_or_reference),
-    None => (0.0, BodyPose3DHeightEstimation::Unknown),
+    None => (0.0, HeightEstimation::Unknown),
   }
 }
 
@@ -679,7 +663,7 @@ fn validate_mask_dims_for_slice(width: usize, height: usize, total_src_len: usiz
 /// `VNImagePointForFaceLandmarkPoint(p, faceBBox, w, h)` performs
 /// `imageX = faceBBox.x + p.x * faceBBox.width;
 /// imageY = faceBBox.y + p.y * faceBBox.height` (lower-left). Callers
-/// then route through [`vision_point_to_schema`] for the schema-side
+/// then route through [`vision_point_to_normalized`] for the
 /// top-left flip + `[0, 1]` clamp + finite check.
 #[cfg(target_vendor = "apple")]
 #[inline]
@@ -694,16 +678,16 @@ fn project_landmark_to_image(point: CGPoint, face_bbox_vision: CGRect) -> CGPoin
 /// surviving joint coordinates. Returns `None` when the extent in
 /// either axis is zero — a single joint, or joints that are perfectly
 /// colinear horizontally/vertically, would otherwise produce a wire
-/// box that the validated domain `BoundingBox::try_new` rejects.
+/// box that a validating [`BoundingBox::try_new`] rejects.
 /// Callers should skip the pose detection on `None`; the joints alone
 /// do not carry enough geometry to construct a valid box.
 #[cfg(target_vendor = "apple")]
-fn pose_bbox_from_joint_bounds(
+fn pose_bbox_from_joint_bounds<B: BoundingBox>(
   min_x: f32,
   min_y: f32,
   max_x: f32,
   max_y: f32,
-) -> Option<BoundingBox> {
+) -> Option<B> {
   if !(min_x.is_finite() && min_y.is_finite() && max_x.is_finite() && max_y.is_finite()) {
     return None;
   }
@@ -713,10 +697,10 @@ fn pose_bbox_from_joint_bounds(
     return None;
   }
   // Joints are sanitised individually upstream (each goes through
-  // `vision_point_to_schema` which clamps to `[0, 1]`), so the
-  // derived bbox should satisfy the domain invariants. Drop on the
-  // off-chance the validator rejects.
-  BoundingBox::try_new(min_x, min_y, width, height).ok()
+  // `vision_point_to_normalized` which clamps to `[0, 1]`), so the
+  // derived bbox should satisfy the contract invariants. Drop on the
+  // off-chance the vocabulary rejects.
+  B::try_new(min_x, min_y, width, height).ok()
 }
 
 /// Validate a raw Vision `confidence` value against the configured
@@ -725,8 +709,8 @@ fn pose_bbox_from_joint_bounds(
 /// non-finite, outside `[0, 1]`, or below `min` — the caller drops
 /// the detection in that case. A simple `value < min` threshold
 /// previously let `NaN` through (since every NaN comparison is
-/// false) and accepted `>1.0` values, both of which mediaschema's
-/// domain `Confidence::try_new` rejects.
+/// false) and accepted `>1.0` values, both of which a validating
+/// vocabulary rejects.
 #[cfg(target_vendor = "apple")]
 #[inline]
 fn sanitize_confidence(value: f32, min: f32) -> Option<f32> {
@@ -791,14 +775,13 @@ impl Drop for CVPixelBufferLockGuard<'_> {
 /// [`VisionAnalyzer::new`]. The analyzer owns retained `VNRequest`
 /// Objective-C objects that carry per-call state across
 /// `performRequests` / `results()`, so they are *not* safe to share
-/// across threads or clone. The upcoming service-framework layer
-/// constructs one fresh analyzer per worker rather than cloning a
-/// single shared instance — `Clone` is intentionally not implemented to
-/// make that contract a compile-time error.
+/// across threads or clone. Construct one fresh analyzer per worker
+/// rather than cloning a single shared instance — `Clone` is
+/// intentionally not implemented to make that contract a compile-time
+/// error.
 #[cfg(target_vendor = "apple")]
 #[derive(Debug)]
 pub struct VisionAnalyzer {
-  opts: ServiceOptions,
   requests: VisionRequests,
 }
 
@@ -827,18 +810,8 @@ struct VisionRequests {
 }
 
 #[cfg(target_vendor = "apple")]
-fn apple_vision_error(code: ErrorCode, message: impl Into<SmolStr>) -> ErrorInfo {
-  ErrorInfo::new(code, message)
-}
-
-#[cfg(not(target_vendor = "apple"))]
-fn apple_vision_error(code: ErrorCode, message: &'static str) -> ErrorInfo {
-  ErrorInfo::new(code, message)
-}
-
-#[cfg(target_vendor = "apple")]
 impl VisionRequests {
-  fn new(opts: ServiceOptions) -> Self {
+  fn new(opts: &AnalyzeOptions) -> Self {
     unsafe {
       let classify = VNClassifyImageRequest::new();
       classify.setRevision(VNClassifyImageRequestRevision2);
@@ -929,7 +902,7 @@ impl VisionRequests {
     }
   }
 
-  fn perform(&self, handler: &VNSequenceRequestHandler, data: &NSData) -> Result<(), ErrorInfo> {
+  fn perform(&self, handler: &VNSequenceRequestHandler, data: &NSData) -> Result<(), AnalyzeError> {
     unsafe {
       let requests = NSArray::from_retained_slice(&[
         Retained::cast_unchecked::<VNRequest>(self.classify.clone()),
@@ -972,10 +945,12 @@ impl VisionRequests {
             // drive the allocator into the abort path while the worker
             // is already trying to report a failure.
             let raw = e.localizedDescription();
-            let message: SmolStr = ffi_nsstring_to_smolstr(&raw).unwrap_or_else(|| {
-              SmolStr::new_static("apple-vision request failed (description elided)")
-            });
-            apple_vision_error(ErrorCode::AppleVisionRequestFailed, message)
+            let message = ffi_nsstring_to_smolstr(&raw)
+              .map(|m| Cow::Owned(String::from(m)))
+              .unwrap_or(Cow::Borrowed(
+                "apple-vision request failed (description elided)",
+              ));
+            AnalyzeError::new(AnalyzeErrorKind::RequestFailed, message)
           })
       })
     }
@@ -984,22 +959,33 @@ impl VisionRequests {
 
 #[cfg(target_vendor = "apple")]
 impl VisionAnalyzer {
-  /// Creates a new Apple Vision analyzer with the specified options.
+  /// Creates an analyzer with `options` baked into its retained
+  /// Vision requests.
+  ///
+  /// Only
+  /// [`maximum_hand_count`](AppleVisionHandPoseOptions::maximum_hand_count)
+  /// is consumed here — Apple bakes that one into the request object
+  /// itself. Every other knob is read per call by
+  /// [`analyze_keyframe`](VisionAnalyzer::analyze_keyframe), so the
+  /// analyzer carries no configuration of its own.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn new(opts: ServiceOptions) -> Self {
+  pub fn new(options: &AnalyzeOptions) -> Self {
     Self {
-      requests: VisionRequests::new(opts.clone()),
-      opts,
+      requests: VisionRequests::new(options),
     }
   }
 
+  /// Logs the pinned revision of every Vision request this analyzer
+  /// holds.
+  ///
+  /// Revisions are fixed at construction and a drift changes detection
+  /// semantics **silently** — same API, different numbers. This is the
+  /// diagnostic that makes the drift visible; wrap the call in your own
+  /// span if you need to attribute it to a worker.
   #[cfg(feature = "tracing")]
-  #[allow(dead_code)] // called from the (currently commented) service-framework block
-  fn log_request_revisions(&self, svc: &'static str, worker_id: usize) {
+  pub fn log_request_revisions(&self) {
     unsafe {
       tracing::info!(
-        service = svc,
-        worker = worker_id,
         classify_rev = self.requests.classify.revision(),
         face_rectangles_rev = self.requests.face_rectangles.revision(),
         face_landmarks_rev = self.requests.face_landmarks.revision(),
@@ -1024,68 +1010,42 @@ impl VisionAnalyzer {
     }
   }
 
-  /// Run every Apple Vision request configured at construction time against
-  /// the supplied JPEG bytes and gather the resulting detections into a
-  /// fully-populated [`Keyframe`].
+  /// Runs every Apple Vision request against `jpeg_data` and gathers
+  /// the detections into an [`Analysis`].
   ///
-  /// `scene_id`, `keyframe_id`, `pts`, `dimensions`, and `extractor` are
-  /// supplied by the caller and attached verbatim to the returned
-  /// `Keyframe`; the engine does not derive or generate identifiers or
-  /// frame metadata itself. The widened signature (vs. the pre-domain
-  /// shape that only took the two ids) is required by
-  /// `mediaschema::Keyframe::try_new`, which enforces non-nil ids,
-  /// positive `Dimensions`, a `pts` `Timestamp`, and a
-  /// `KeyframeExtractor` tag at construction time.
+  /// `D` names the output vocabulary and `options` supplies every
+  /// per-detector gate. Nothing identifies the frame — no ids, no
+  /// timestamp, no dimensions — because the engine has no such
+  /// knowledge; composing this analysis into whatever record you store
+  /// is the caller's job.
   ///
-  /// The returned `Keyframe` carries a freshly-minted **placeholder
-  /// `thumbnail_id`** (`Uuid7::new()`): avanalyze does not own thumbnail
-  /// storage, but the domain `try_new` rejects a nil `thumbnail_id`. The
-  /// orchestrator persists only the keyframe's detection child tables
-  /// (faces / OCR / objects / …), never the base keyframe row, so this
-  /// placeholder is internal to the in-memory aggregate and never lands.
-  pub fn analyze_keyframe(
+  /// Degradation is per detector: one Vision request that raises an
+  /// Objective-C exception contributes an empty slot while the others
+  /// still land. Individual detections are filtered before
+  /// construction and refused ones are silently absent — there is no
+  /// "dropped" counter. An `Err` therefore means no analysis happened
+  /// at all.
+  ///
+  /// `options` is read per call, but
+  /// [`VisionAnalyzer::new`] already baked
+  /// [`maximum_hand_count`](AppleVisionHandPoseOptions::maximum_hand_count)
+  /// into the retained hand-pose request: that one knob follows the
+  /// analyzer, not the call.
+  pub fn analyze_keyframe<D: Detections>(
     &self,
-    scene_id: Id,
-    keyframe_id: Id,
-    pts: Timestamp,
-    dimensions: Dimensions,
-    extractor: KeyframeExtractor,
     jpeg_data: &[u8],
-  ) -> Result<Keyframe, ErrorInfo> {
+    options: &AnalyzeOptions,
+  ) -> Result<Analysis<D>, AnalyzeError> {
     // Input-byte budget — refuse oversized payloads BEFORE
     // Foundation copies them into an NSData and doubles peak
     // memory. Surface as a structured error so the orchestrator
     // can decide whether to retry, log, or escalate (codex R17 F1).
     if jpeg_data.len() > MAX_INPUT_IMAGE_BYTES {
-      return Err(apple_vision_error(
-        ErrorCode::AppleVisionRequestFailed,
-        SmolStr::new_static("input image exceeds MAX_INPUT_IMAGE_BYTES"),
+      return Err(AnalyzeError::new(
+        AnalyzeErrorKind::RequestFailed,
+        "input image exceeds MAX_INPUT_IMAGE_BYTES",
       ));
     }
-    // Construct the keyframe shell BEFORE running Vision so the
-    // domain `try_new` invariants (non-nil ids + positive
-    // dimensions) surface as structured `ErrorInfo` before we
-    // perform the expensive image work.
-    //
-    // `thumbnail_id`: avanalyze does not own thumbnails, but the domain
-    // rejects a nil FK — mint a placeholder. The orchestrator enriches
-    // the keyframe's detection child tables, never the base row, so this
-    // never reaches storage.
-    let thumbnail_id = Uuid7::new();
-    let keyframe = Keyframe::try_new(
-      keyframe_id,
-      scene_id,
-      thumbnail_id,
-      pts,
-      dimensions,
-      extractor,
-    )
-    .map_err(|e| {
-      apple_vision_error(
-        ErrorCode::AppleVisionRequestFailed,
-        SmolStr::from(format!("keyframe construction failed: {e}")),
-      )
-    })?;
     objc2::rc::autoreleasepool(|_| {
       let ns_data = NSData::with_bytes(jpeg_data);
       let handler = unsafe { VNSequenceRequestHandler::new() };
@@ -1098,7 +1058,7 @@ impl VisionAnalyzer {
       // `catch_unwind` cannot catch — so each `extract_*` is wrapped in
       // `objc2::exception::catch` (via `guard_vision_ffi`). A raising
       // detector contributes its empty fallback and the OTHER detectors'
-      // results still land: the keyframe degrades per detector, never
+      // results still land: the analysis degrades per detector, never
       // aborting the process.
       //
       // Shared mask budgets — both `extract_person_instance_masks`
@@ -1113,99 +1073,94 @@ impl VisionAnalyzer {
       let mut mask_total_count: usize = 0;
       let mut mask_total_attempts: usize = 0;
       let instance_masks = guard_vision_ffi("person_instance_mask", Vec::new(), || {
-        self.extract_person_instance_masks(
+        self.extract_person_instance_masks::<D>(
+          options,
           &mut mask_total_bytes,
           &mut mask_total_count,
           &mut mask_total_attempts,
         )
       });
       let segmentation_masks = guard_vision_ffi("person_segmentation", Vec::new(), || {
-        self.extract_person_segmentation_masks(
+        self.extract_person_segmentation_masks::<D>(
+          options,
           &mut mask_total_bytes,
           &mut mask_total_count,
           &mut mask_total_attempts,
         )
       });
 
-      Ok(
-        keyframe
-          .with_classifications(guard_vision_ffi("classify", Vec::new(), || {
-            self.extract_classifications()
-          }))
-          .with_humans(
-            HumanAnalysis::new()
-              .with_subjects(guard_vision_ffi(
-                "human_rectangles",
-                Vec::new(),
-                || self.extract_human_subjects(),
-              ))
-              // #48: ONE record per face — the rectangles pass is the detection
-              // spine, annotated with capture quality by bbox overlap (see
-              // `extract_faces`). `face_rectangles` is intentionally left empty
-              // so no duplicate `keyframe_face` row is written under a second kind.
-              .with_faces(guard_vision_ffi("faces", Vec::new(), || self.extract_faces()))
-              .with_face_landmarks(guard_vision_ffi(
-                "face_landmarks",
-                Vec::new(),
-                || self.extract_face_landmarks(),
-              ))
-              .with_body_poses(guard_vision_ffi("body_pose", Vec::new(), || {
-                self.extract_body_poses()
-              }))
-              .with_hand_poses(guard_vision_ffi("hand_pose", Vec::new(), || {
-                self.extract_hand_poses()
-              }))
-              // `extract_body_poses_3d` self-guards (inner
-              // `objc2::exception::catch` under its `catch_unwind`); a
-              // call-site guard here would put `catch_unwind` inside the
-              // ObjC barrier and could not catch the foreign exception.
-              .with_body_poses_3d(self.extract_body_poses_3d())
-              .with_instance_masks(instance_masks)
-              .with_segmentation_masks(segmentation_masks),
-          )
-          .with_animals(
-            AnimalAnalysis::new()
-              .with_subjects(guard_vision_ffi("animals", Vec::new(), || {
-                self.extract_animal_subjects()
-              }))
-              .with_body_poses(guard_vision_ffi("animal_body_pose", Vec::new(), || {
-                self.extract_animal_body_poses()
-              })),
-          )
-          .with_text_detections(guard_vision_ffi("text", Vec::new(), || {
-            self.extract_text_detections()
-          }))
-          .with_barcodes(guard_vision_ffi("barcodes", Vec::new(), || {
-            self.extract_barcodes()
-          }))
-          .with_attention_saliency(guard_vision_ffi("attention_saliency", Vec::new(), || {
-            self.extract_attention_saliency()
-          }))
-          .with_objectness_saliency(guard_vision_ffi("objectness_saliency", Vec::new(), || {
-            self.extract_objectness_saliency()
-          }))
-          .with_horizon(guard_vision_ffi(
-            "horizon",
-            // The "no detection" sentinel — matches `extract_horizon`'s
-            // own `empty` (zero confidence + zero angle is in range).
-            HorizonInfo::try_new(0.0, 0.0).expect("zero confidence + zero angle is in range"),
-            || self.extract_horizon(),
-          ))
-          .with_document_segments(guard_vision_ffi("document_segments", Vec::new(), || {
-            self.extract_document_segments()
-          }))
-          .with_aesthetics(guard_vision_ffi(
-            "aesthetics",
-            // The "no detection" sentinel — matches `extract_aesthetics`.
-            Aesthetics::new(0.0, false),
-            || self.extract_aesthetics(),
-          )),
-      )
+      let mut analysis: Analysis<D> = Analysis::new();
+      analysis
+        .set_classifications(guard_vision_ffi("classify", Vec::new(), || {
+          self.extract_classifications::<D>(options)
+        }))
+        .set_human_subjects(guard_vision_ffi("human_rectangles", Vec::new(), || {
+          self.extract_human_subjects::<D>(options)
+        }))
+        // #48: ONE record per face — the rectangles pass is the detection
+        // spine, annotated with capture quality by bbox overlap (see
+        // `extract_faces`). The capture-quality pass contributes no
+        // records of its own, so no face is counted twice.
+        .set_faces(guard_vision_ffi("faces", Vec::new(), || {
+          self.extract_faces::<D>(options)
+        }))
+        .set_face_landmarks(guard_vision_ffi("face_landmarks", Vec::new(), || {
+          self.extract_face_landmarks::<D>(options)
+        }))
+        .set_body_poses(guard_vision_ffi("body_pose", Vec::new(), || {
+          self.extract_body_poses::<D>(options)
+        }))
+        .set_hand_poses(guard_vision_ffi("hand_pose", Vec::new(), || {
+          self.extract_hand_poses::<D>(options)
+        }))
+        // `extract_body_poses_3d` self-guards (inner
+        // `objc2::exception::catch` under its `catch_unwind`); a
+        // call-site guard here would put `catch_unwind` inside the
+        // ObjC barrier and could not catch the foreign exception.
+        .set_body_poses_3d(self.extract_body_poses_3d::<D>(options))
+        .set_person_instance_masks(instance_masks)
+        .set_person_segmentation_masks(segmentation_masks)
+        .set_animal_subjects(guard_vision_ffi("animals", Vec::new(), || {
+          self.extract_animal_subjects::<D>(options)
+        }))
+        .set_animal_body_poses(guard_vision_ffi("animal_body_pose", Vec::new(), || {
+          self.extract_animal_body_poses::<D>(options)
+        }))
+        .set_text_detections(guard_vision_ffi("text", Vec::new(), || {
+          self.extract_text_detections::<D>(options)
+        }))
+        .set_barcodes(guard_vision_ffi("barcodes", Vec::new(), || {
+          self.extract_barcodes::<D>(options)
+        }))
+        .set_attention_saliency(guard_vision_ffi("attention_saliency", Vec::new(), || {
+          self.extract_attention_saliency::<D>(options)
+        }))
+        .set_objectness_saliency(guard_vision_ffi("objectness_saliency", Vec::new(), || {
+          self.extract_objectness_saliency::<D>(options)
+        }))
+        .set_horizon(guard_vision_ffi(
+          "horizon",
+          // The "no detection" sentinel — matches `extract_horizon`'s
+          // own `empty`. `None` only if the vocabulary refuses even
+          // that, which costs the slot rather than the frame.
+          D::HorizonInfo::try_new(0.0, 0.0).ok(),
+          || self.extract_horizon::<D>(options),
+        ))
+        .set_document_segments(guard_vision_ffi("document_segments", Vec::new(), || {
+          self.extract_document_segments::<D>(options)
+        }))
+        .set_aesthetics(Some(guard_vision_ffi(
+          "aesthetics",
+          // The "no detection" sentinel — matches `extract_aesthetics`.
+          D::Aesthetics::new(0.0, false),
+          || self.extract_aesthetics::<D>(options),
+        )));
+      Ok(analysis)
     })
   }
 
-  fn extract_classifications(&self) -> Vec<Detection> {
-    let opts = self.opts.classifications();
+  fn extract_classifications<D: Detections>(&self, options: &AnalyzeOptions) -> Vec<D::Detection> {
+    let opts = options.classifications();
     let Some(results) = (unsafe { self.requests.classify.results() }) else {
       return Vec::new();
     };
@@ -1231,7 +1186,7 @@ impl VisionAnalyzer {
       };
       let label = normalize_classification_label(label);
       if !label.is_empty()
-        && let Ok(detection) = Detection::try_new(label, confidence)
+        && let Ok(detection) = D::Detection::try_new(&label, confidence)
       {
         tags.push(detection);
       }
@@ -1254,25 +1209,25 @@ impl VisionAnalyzer {
   /// pass PLUS `face_rectangles` from the rectangles pass), which persisted a
   /// duplicate `keyframe_face` row per face under two `kind`s with identical
   /// bounding boxes and inflated face counts.
-  fn extract_faces(&self) -> Vec<FaceDetection> {
+  fn extract_faces<D: Detections>(&self, options: &AnalyzeOptions) -> Vec<D::FaceDetection> {
     let Some(rect_results) = (unsafe { self.requests.face_rectangles.results() }) else {
       return Vec::new();
     };
-    let rect_opts = self.opts.face_rectangles();
-    let capture_opts = self.opts.face_capture();
+    let rect_opts = options.face_rectangles();
+    let capture_opts = options.face_capture();
 
     // The capture-quality pass as `(bbox, quality)` pairs, to annotate the
     // detection spine by bounding-box overlap. Built once. Non-finite quality
     // readings drop the pair (see `sanitize_capture_quality`); degenerate bboxes
     // are skipped.
-    let scored: Vec<(BoundingBox, f32)> = match unsafe { self.requests.face_quality.results() } {
+    let scored: Vec<(D::BoundingBox, f32)> = match unsafe { self.requests.face_quality.results() } {
       Some(results) => results
         .iter()
         .take(MAX_VISION_RESULTS_PER_FRAME)
         .filter_map(|obs| {
           let quality =
             sanitize_capture_quality(unsafe { obs.faceCaptureQuality() }.map(|q| q.floatValue()))?;
-          let bbox = vision_bbox_to_schema(unsafe { obs.boundingBox() }.standardize())?;
+          let bbox = vision_rect_to_bbox(unsafe { obs.boundingBox() }.standardize())?;
           Some((bbox, quality))
         })
         .collect(),
@@ -1286,7 +1241,7 @@ impl VisionAnalyzer {
       else {
         continue;
       };
-      let Some(bbox) = vision_bbox_to_schema(unsafe { obs.boundingBox() }.standardize()) else {
+      let Some(bbox) = vision_rect_to_bbox(unsafe { obs.boundingBox() }.standardize()) else {
         continue;
       };
       let capture_quality = matched_capture_quality(&bbox, &scored);
@@ -1305,7 +1260,8 @@ impl VisionAnalyzer {
         .map(|v| v.floatValue())
         .and_then(finite_f32)
         .unwrap_or(0.0);
-      if let Ok(face) = FaceDetection::try_new(bbox, confidence, capture_quality, roll, yaw, pitch)
+      if let Ok(face) =
+        D::FaceDetection::try_new(bbox, confidence, capture_quality, roll, yaw, pitch)
       {
         faces.push(face);
       }
@@ -1314,11 +1270,14 @@ impl VisionAnalyzer {
     faces
   }
 
-  fn extract_face_landmarks(&self) -> Vec<FaceLandmarksDetection> {
+  fn extract_face_landmarks<D: Detections>(
+    &self,
+    options: &AnalyzeOptions,
+  ) -> Vec<D::FaceLandmarksDetection> {
     let Some(results) = (unsafe { self.requests.face_landmarks.results() }) else {
       return Vec::new();
     };
-    let opts = self.opts.face_landmarks();
+    let opts = options.face_landmarks();
 
     let mut detections = Vec::with_capacity(results.len().min(MAX_VISION_RESULTS_PER_FRAME));
     // Per-frame budgets:
@@ -1361,7 +1320,7 @@ impl VisionAnalyzer {
       // obviously-invalid observation does not spend the landmark
       // attempt budget (codex R17 F1 sub-rec). Re-using the same
       // schema-conversion guard the post-extraction commit uses.
-      if vision_bbox_to_schema(face_rect_vision).is_none() {
+      if vision_rect_to_bbox::<D::BoundingBox>(face_rect_vision).is_none() {
         continue;
       }
 
@@ -1369,7 +1328,7 @@ impl VisionAnalyzer {
       // ONLY after the detection survives every gate. Attempt budget
       // is committed immediately by the helper.
       let mut tentative_remaining = total_points_remaining;
-      let regions = extract_face_landmark_regions(
+      let regions = extract_face_landmark_regions::<D::FaceLandmarkRegion>(
         &landmarks,
         face_rect_vision,
         &mut tentative_remaining,
@@ -1379,13 +1338,13 @@ impl VisionAnalyzer {
         continue;
       }
 
-      let Some(bbox) = vision_bbox_to_schema(face_rect_vision) else {
+      let Some(bbox) = vision_rect_to_bbox(face_rect_vision) else {
         continue;
       };
-      let Ok(detection) = FaceLandmarksDetection::try_new(bbox, confidence, regions) else {
+      let Ok(detection) = D::FaceLandmarksDetection::try_new(bbox, confidence, regions) else {
         // The confidence has already been sanitised; a failure here
-        // would be a domain-validator regression rather than real
-        // Vision input — skip rather than abort the frame.
+        // is the vocabulary refusing a value the engine considers
+        // valid — skip rather than abort the frame.
         continue;
       };
       // Commit the budget — the detection is being pushed.
@@ -1396,11 +1355,14 @@ impl VisionAnalyzer {
     detections
   }
 
-  fn extract_human_subjects(&self) -> Vec<SubjectDetection> {
+  fn extract_human_subjects<D: Detections>(
+    &self,
+    options: &AnalyzeOptions,
+  ) -> Vec<D::SubjectDetection> {
     let Some(results) = (unsafe { self.requests.human_rectangles.results() }) else {
       return Vec::new();
     };
-    let opts = self.opts.human_subjects();
+    let opts = options.human_subjects();
 
     let mut humans = Vec::with_capacity(results.len().min(MAX_VISION_RESULTS_PER_FRAME));
     for obs in results.iter().take(MAX_VISION_RESULTS_PER_FRAME) {
@@ -1410,19 +1372,22 @@ impl VisionAnalyzer {
         continue;
       };
 
-      let Some(bbox) = vision_bbox_to_schema(unsafe { obs.boundingBox() }.standardize()) else {
+      let Some(bbox) = vision_rect_to_bbox(unsafe { obs.boundingBox() }.standardize()) else {
         continue;
       };
-      let Ok(detection) = Detection::try_new(SmolStr::new_static("person"), confidence) else {
+      let Ok(detection) = D::Detection::try_new("person", confidence) else {
         continue;
       };
-      humans.push(SubjectDetection::new(detection, bbox));
+      humans.push(D::SubjectDetection::new(detection, bbox));
     }
 
     humans
   }
 
-  fn extract_body_poses(&self) -> Vec<BodyPoseDetection> {
+  fn extract_body_poses<D: Detections>(
+    &self,
+    options: &AnalyzeOptions,
+  ) -> Vec<D::BodyPoseDetection> {
     let Some(results) = (unsafe { self.requests.body_pose.results() }) else {
       return Vec::new();
     };
@@ -1463,13 +1428,13 @@ impl VisionAnalyzer {
         // deriving the bbox. A non-finite raw coordinate is dropped at
         // the source — partial-joint lists are valid for body pose so
         // we skip just this joint, not the whole pose.
-        let Some((x, y)) = vision_point_to_schema(unsafe { point.x() }, unsafe { point.y() })
+        let Some((x, y)) = vision_point_to_normalized(unsafe { point.x() }, unsafe { point.y() })
         else {
           continue;
         };
         let Some(confidence) = sanitize_confidence(
           unsafe { point.confidence() },
-          self.opts.body_pose().min_joint_confidence(),
+          options.body_pose().min_joint_confidence(),
         ) else {
           continue;
         };
@@ -1479,7 +1444,7 @@ impl VisionAnalyzer {
         max_x = max_x.max(x);
         max_y = max_y.max(y);
 
-        let Ok(joint) = BodyPoseJoint::try_new(name, x, y, confidence) else {
+        let Ok(joint) = D::BodyPoseJoint::try_new(&name, x, y, confidence) else {
           continue;
         };
         joints.push(joint);
@@ -1504,7 +1469,7 @@ impl VisionAnalyzer {
       };
 
       joints.sort_by(|lhs, rhs| lhs.name().cmp(rhs.name()));
-      if let Ok(pose) = BodyPoseDetection::try_new(bbox, pose_confidence, joints) {
+      if let Ok(pose) = D::BodyPoseDetection::try_new(bbox, pose_confidence, joints) {
         body_poses.push(pose);
       }
     }
@@ -1512,7 +1477,10 @@ impl VisionAnalyzer {
     body_poses
   }
 
-  fn extract_body_poses_3d(&self) -> Vec<BodyPose3DDetection> {
+  fn extract_body_poses_3d<D: Detections>(
+    &self,
+    options: &AnalyzeOptions,
+  ) -> Vec<D::BodyPose3DDetection> {
     // Two nested barriers, innermost FIRST. The `VNHumanBodyRecognizedPoint3D`
     // `position`/`confidence` msg_sends below have a `simd_float4x4` return
     // encoding that objc2 rejects: in a DEBUG build objc2's runtime
@@ -1565,12 +1533,12 @@ impl VisionAnalyzer {
             let raw_confidence: f32 = unsafe { objc2::msg_send![&*point, confidence] };
             let Some(confidence) = sanitize_confidence(
               raw_confidence,
-              self.opts.body_pose_3d().min_joint_confidence(),
+              options.body_pose_3d().min_joint_confidence(),
             ) else {
               continue;
             };
 
-            let Ok(joint) = BodyPose3DJoint::try_new(name, x, y, z, confidence) else {
+            let Ok(joint) = D::BodyPose3DJoint::try_new(&name, x, y, z, confidence) else {
               continue;
             };
             joints.push(joint);
@@ -1593,7 +1561,7 @@ impl VisionAnalyzer {
           let (body_height, height_estimation) =
             sanitize_body_height_pair(unsafe { obs.bodyHeight() }, mapped_estimation);
           if let Ok(pose) =
-            BodyPose3DDetection::try_new(pose_confidence, body_height, height_estimation, joints)
+            D::BodyPose3DDetection::try_new(pose_confidence, body_height, height_estimation, joints)
           {
             body_poses.push(pose);
           }
@@ -1609,7 +1577,10 @@ impl VisionAnalyzer {
     })
   }
 
-  fn extract_hand_poses(&self) -> Vec<HandPoseDetection> {
+  fn extract_hand_poses<D: Detections>(
+    &self,
+    options: &AnalyzeOptions,
+  ) -> Vec<D::HandPoseDetection> {
     let Some(results) = (unsafe { self.requests.hand_pose.results() }) else {
       return Vec::new();
     };
@@ -1649,13 +1620,13 @@ impl VisionAnalyzer {
         // the top-left schema convention. A non-finite raw coordinate
         // is dropped at the source — partial-joint hand lists are
         // valid so we skip only this joint.
-        let Some((x, y)) = vision_point_to_schema(unsafe { point.x() }, unsafe { point.y() })
+        let Some((x, y)) = vision_point_to_normalized(unsafe { point.x() }, unsafe { point.y() })
         else {
           continue;
         };
         let Some(confidence) = sanitize_confidence(
           unsafe { point.confidence() },
-          self.opts.hand_pose().min_joint_confidence(),
+          options.hand_pose().min_joint_confidence(),
         ) else {
           continue;
         };
@@ -1665,7 +1636,7 @@ impl VisionAnalyzer {
         max_x = max_x.max(x);
         max_y = max_y.max(y);
 
-        let Ok(joint) = BodyPoseJoint::try_new(name, x, y, confidence) else {
+        let Ok(joint) = D::BodyPoseJoint::try_new(&name, x, y, confidence) else {
           continue;
         };
         joints.push(joint);
@@ -1683,7 +1654,7 @@ impl VisionAnalyzer {
       };
 
       joints.sort_by(|lhs, rhs| lhs.name().cmp(rhs.name()));
-      if let Ok(pose) = HandPoseDetection::try_new(
+      if let Ok(pose) = D::HandPoseDetection::try_new(
         bbox,
         pose_confidence,
         map_hand_chirality(unsafe { obs.chirality() }),
@@ -1696,16 +1667,17 @@ impl VisionAnalyzer {
     hand_poses
   }
 
-  fn extract_person_instance_masks(
+  fn extract_person_instance_masks<D: Detections>(
     &self,
+    options: &AnalyzeOptions,
     total_mask_bytes: &mut usize,
     total_mask_count: &mut usize,
     total_mask_attempts: &mut usize,
-  ) -> Vec<PersonInstanceMaskDetection> {
+  ) -> Vec<D::PersonInstanceMaskDetection> {
     let Some(results) = (unsafe { self.requests.person_instance_mask.results() }) else {
       return Vec::new();
     };
-    let opts = self.opts.person_instance_masks();
+    let opts = options.person_instance_masks();
 
     // Per-frame budgets — count AND cumulative payload bytes — are
     // SHARED across both mask extractors via the caller's mutable
@@ -1775,20 +1747,21 @@ impl VisionAnalyzer {
         // budget into the copier so it rejects the mask BEFORE
         // allocating if the packed size would overshoot.
         let remaining_budget = MAX_TOTAL_MASK_BYTES_PER_FRAME.saturating_sub(*total_mask_bytes);
-        let Some((bbox, dimensions, data)) =
-          copy_instance_mask_buffer(&mask_buffer, remaining_budget)
+        let Some((bbox, width, height, data)) =
+          copy_instance_mask_buffer::<D::BoundingBox>(&mask_buffer, remaining_budget)
         else {
           instance_index = instances.indexGreaterThanIndex(instance_index);
           continue;
         };
 
         let data_len = data.len();
-        match PersonInstanceMaskDetection::try_new(
+        match D::PersonInstanceMaskDetection::try_new(
           bbox,
           confidence,
           wire_instance_index,
-          dimensions,
-          data,
+          width,
+          height,
+          &data,
         ) {
           Ok(mask) => {
             *total_mask_bytes = total_mask_bytes.saturating_add(data_len);
@@ -1796,9 +1769,10 @@ impl VisionAnalyzer {
             masks.push(mask);
           }
           Err(_) => {
-            // Validator rejected — `dimensions` already verified
-            // > 0 and `data` non-empty before reaching here, so
-            // this only triggers on a future invariant addition.
+            // Refused — `width`/`height` are already verified > 0 and
+            // `data` is non-empty before reaching here, so this only
+            // triggers on a vocabulary invariant the engine does not
+            // model.
           }
         }
 
@@ -1809,16 +1783,17 @@ impl VisionAnalyzer {
     masks
   }
 
-  fn extract_person_segmentation_masks(
+  fn extract_person_segmentation_masks<D: Detections>(
     &self,
+    options: &AnalyzeOptions,
     total_mask_bytes: &mut usize,
     total_mask_count: &mut usize,
     total_mask_attempts: &mut usize,
-  ) -> Vec<PersonSegmentationMask> {
+  ) -> Vec<D::PersonSegmentationMask> {
     let Some(results) = (unsafe { self.requests.person_segmentation.results() }) else {
       return Vec::new();
     };
-    let opts = self.opts.person_segmentation_masks();
+    let opts = options.person_segmentation_masks();
 
     // Shared per-frame mask budget — counters owned by the caller,
     // also charged by `extract_person_instance_masks`. The cumulative
@@ -1848,14 +1823,14 @@ impl VisionAnalyzer {
       // Pre-allocation budget check: refuse the mask before alloc
       // if it would overshoot the per-frame cumulative budget.
       let remaining_budget = MAX_TOTAL_MASK_BYTES_PER_FRAME.saturating_sub(*total_mask_bytes);
-      let Some((bbox, dimensions, data)) =
-        copy_instance_mask_buffer(&pixel_buffer, remaining_budget)
+      let Some((bbox, width, height, data)) =
+        copy_instance_mask_buffer::<D::BoundingBox>(&pixel_buffer, remaining_budget)
       else {
         continue;
       };
 
       let data_len = data.len();
-      if let Ok(mask) = PersonSegmentationMask::try_new(bbox, confidence, dimensions, data) {
+      if let Ok(mask) = D::PersonSegmentationMask::try_new(bbox, confidence, width, height, &data) {
         *total_mask_bytes = total_mask_bytes.saturating_add(data_len);
         *total_mask_count = total_mask_count.saturating_add(1);
         masks.push(mask);
@@ -1865,7 +1840,10 @@ impl VisionAnalyzer {
     masks
   }
 
-  fn extract_animal_subjects(&self) -> Vec<SubjectDetection> {
+  fn extract_animal_subjects<D: Detections>(
+    &self,
+    options: &AnalyzeOptions,
+  ) -> Vec<D::SubjectDetection> {
     unsafe {
       let Some(results) = self.requests.animals.results() else {
         return Vec::new();
@@ -1886,7 +1864,7 @@ impl VisionAnalyzer {
             break 'outer;
           }
           let Some(confidence) =
-            sanitize_confidence(label.confidence(), self.opts.animals().min_confidence())
+            sanitize_confidence(label.confidence(), options.animals().min_confidence())
           else {
             continue;
           };
@@ -1895,10 +1873,10 @@ impl VisionAnalyzer {
             continue;
           };
           if !id.is_empty()
-            && let Some(bbox) = vision_bbox_to_schema(obs.boundingBox().standardize())
-            && let Ok(detection) = Detection::try_new(id, confidence)
+            && let Some(bbox) = vision_rect_to_bbox(obs.boundingBox().standardize())
+            && let Ok(detection) = D::Detection::try_new(&id, confidence)
           {
-            animals.push(SubjectDetection::new(detection, bbox));
+            animals.push(D::SubjectDetection::new(detection, bbox));
           }
         }
       }
@@ -1907,7 +1885,10 @@ impl VisionAnalyzer {
     }
   }
 
-  fn extract_animal_body_poses(&self) -> Vec<BodyPoseDetection> {
+  fn extract_animal_body_poses<D: Detections>(
+    &self,
+    options: &AnalyzeOptions,
+  ) -> Vec<D::BodyPoseDetection> {
     let Some(results) = (unsafe { self.requests.animal_body_pose.results() }) else {
       return Vec::new();
     };
@@ -1950,13 +1931,13 @@ impl VisionAnalyzer {
         // the top-left schema convention. A non-finite raw coordinate
         // is dropped at the source — partial-joint animal-pose lists
         // are valid so we skip only this joint.
-        let Some((x, y)) = vision_point_to_schema(unsafe { point.x() }, unsafe { point.y() })
+        let Some((x, y)) = vision_point_to_normalized(unsafe { point.x() }, unsafe { point.y() })
         else {
           continue;
         };
         let Some(confidence) = sanitize_confidence(
           unsafe { point.confidence() },
-          self.opts.animal_pose().min_joint_confidence(),
+          options.animal_pose().min_joint_confidence(),
         ) else {
           continue;
         };
@@ -1966,7 +1947,7 @@ impl VisionAnalyzer {
         max_x = max_x.max(x);
         max_y = max_y.max(y);
 
-        let Ok(joint) = BodyPoseJoint::try_new(name, x, y, confidence) else {
+        let Ok(joint) = D::BodyPoseJoint::try_new(&name, x, y, confidence) else {
           continue;
         };
         joints.push(joint);
@@ -1984,7 +1965,7 @@ impl VisionAnalyzer {
       };
 
       joints.sort_by(|lhs, rhs| lhs.name().cmp(rhs.name()));
-      if let Ok(pose) = BodyPoseDetection::try_new(bbox, pose_confidence, joints) {
+      if let Ok(pose) = D::BodyPoseDetection::try_new(bbox, pose_confidence, joints) {
         body_poses.push(pose);
       }
     }
@@ -1992,7 +1973,10 @@ impl VisionAnalyzer {
     body_poses
   }
 
-  fn extract_text_detections(&self) -> Vec<TextDetection> {
+  fn extract_text_detections<D: Detections>(
+    &self,
+    options: &AnalyzeOptions,
+  ) -> Vec<D::TextDetection> {
     let Some(results) = self.requests.text.results() else {
       return Vec::new();
     };
@@ -2006,8 +1990,7 @@ impl VisionAnalyzer {
       }
       // Bound the requested candidate count to the hard per-observation cap
       // — Apple's topCandidates allocates an NSArray sized to the argument.
-      let candidate_cap = self
-        .opts
+      let candidate_cap = options
         .text()
         .max_candidates_per_observation()
         .min(MAX_TEXT_CANDIDATES_PER_OBSERVATION);
@@ -2024,14 +2007,14 @@ impl VisionAnalyzer {
         let Some(text) = ffi_nsstring_to_smolstr(&raw_string) else {
           continue;
         };
-        if text.len() < self.opts.text().min_text_len() {
+        if text.len() < options.text().min_text_len() {
           continue;
         }
         let Some(confidence) = sanitize_confidence(candidate.confidence(), 0.0) else {
           continue;
         };
-        if let Some(bbox) = vision_bbox_to_schema(unsafe { obs.boundingBox() }.standardize())
-          && let Ok(detection) = TextDetection::try_new(text, confidence, bbox)
+        if let Some(bbox) = vision_rect_to_bbox(unsafe { obs.boundingBox() }.standardize())
+          && let Ok(detection) = D::TextDetection::try_new(&text, confidence, bbox)
         {
           text_detections.push(detection);
         }
@@ -2040,11 +2023,11 @@ impl VisionAnalyzer {
     text_detections
   }
 
-  fn extract_barcodes(&self) -> Vec<BarcodeDetection> {
+  fn extract_barcodes<D: Detections>(&self, options: &AnalyzeOptions) -> Vec<D::BarcodeDetection> {
     let Some(results) = (unsafe { self.requests.barcodes.results() }) else {
       return Vec::new();
     };
-    let opts = self.opts.barcodes();
+    let opts = options.barcodes();
 
     let mut barcodes = Vec::with_capacity(results.len().min(MAX_VISION_RESULTS_PER_FRAME));
     for obs in results.iter().take(MAX_VISION_RESULTS_PER_FRAME) {
@@ -2060,13 +2043,13 @@ impl VisionAnalyzer {
           continue;
         };
         if s.len() >= opts.min_payload_len()
-          && let Some(bbox) = vision_bbox_to_schema(unsafe { obs.boundingBox() }.standardize())
+          && let Some(bbox) = vision_rect_to_bbox(unsafe { obs.boundingBox() }.standardize())
         {
           let raw_sym = unsafe { obs.symbology() };
           let Some(symbology) = ffi_nsstring_to_smolstr(&raw_sym) else {
             continue;
           };
-          if let Ok(barcode) = BarcodeDetection::try_new(s, symbology, confidence, bbox) {
+          if let Ok(barcode) = D::BarcodeDetection::try_new(&s, &symbology, confidence, bbox) {
             barcodes.push(barcode);
           }
         }
@@ -2075,25 +2058,31 @@ impl VisionAnalyzer {
     barcodes
   }
 
-  fn extract_attention_saliency(&self) -> Vec<SaliencyRegion> {
-    self.extract_saliency_regions(
+  fn extract_attention_saliency<D: Detections>(
+    &self,
+    options: &AnalyzeOptions,
+  ) -> Vec<D::SaliencyRegion> {
+    self.extract_saliency_regions::<D>(
       unsafe { self.requests.attention_saliency.results() },
-      self.opts.attention_saliency(),
+      options.attention_saliency(),
     )
   }
 
-  fn extract_objectness_saliency(&self) -> Vec<SaliencyRegion> {
-    self.extract_saliency_regions(
+  fn extract_objectness_saliency<D: Detections>(
+    &self,
+    options: &AnalyzeOptions,
+  ) -> Vec<D::SaliencyRegion> {
+    self.extract_saliency_regions::<D>(
       unsafe { self.requests.objectness_saliency.results() },
-      self.opts.objectness_saliency(),
+      options.objectness_saliency(),
     )
   }
 
-  fn extract_saliency_regions(
+  fn extract_saliency_regions<D: Detections>(
     &self,
     observations: Option<Retained<NSArray<VNSaliencyImageObservation>>>,
     opts: AppleVisionSaliencyOptions,
-  ) -> Vec<SaliencyRegion> {
+  ) -> Vec<D::SaliencyRegion> {
     let Some(observations) = observations else {
       return Vec::new();
     };
@@ -2123,11 +2112,10 @@ impl VisionAnalyzer {
           continue;
         };
 
-        let Some(bbox) = vision_bbox_to_schema(unsafe { object.boundingBox() }.standardize())
-        else {
+        let Some(bbox) = vision_rect_to_bbox(unsafe { object.boundingBox() }.standardize()) else {
           continue;
         };
-        let Ok(region) = SaliencyRegion::try_new(bbox, confidence) else {
+        let Ok(region) = D::SaliencyRegion::try_new(bbox, confidence) else {
           continue;
         };
         regions.push(region);
@@ -2136,38 +2124,44 @@ impl VisionAnalyzer {
     regions
   }
 
-  fn extract_horizon(&self) -> HorizonInfo {
-    // Domain `HorizonInfo` has no `Default` impl — `try_new(0.0, 0.0)`
-    // is the canonical "no detection" sentinel (both arguments are
-    // trivially in-range, so the `try_new` cannot fail).
-    let empty = HorizonInfo::try_new(0.0, 0.0).expect("zero confidence + zero angle is in range");
+  fn extract_horizon<D: Detections>(&self, options: &AnalyzeOptions) -> Option<D::HorizonInfo> {
+    // `try_new(0.0, 0.0)` is the canonical "no detection" sentinel.
+    // When the output type was fixed and known to accept it this was
+    // an `expect`; an open vocabulary may refuse, and losing the slot
+    // beats panicking inside a worker thread.
+    let empty = || D::HorizonInfo::try_new(0.0, 0.0).ok();
     let Some(results) = (unsafe { self.requests.horizon.results() }) else {
-      return empty;
+      return empty();
     };
     let Some(observation) = results.iter().next() else {
-      return empty;
+      return empty();
     };
     let Some(confidence) = sanitize_confidence(
       unsafe { observation.confidence() },
-      self.opts.horizon().min_confidence(),
+      options.horizon().min_confidence(),
     ) else {
-      return empty;
+      return empty();
     };
 
     // Drop the horizon detection entirely if the angle is non-finite —
     // there is no sensible default for a horizon line and downstream
     // visualisation would render a bogus tilt.
     let Some(angle) = finite_f32(unsafe { observation.angle() } as f32) else {
-      return empty;
+      return empty();
     };
-    HorizonInfo::try_new(angle, confidence).unwrap_or(empty)
+    D::HorizonInfo::try_new(angle, confidence)
+      .ok()
+      .or_else(empty)
   }
 
-  fn extract_document_segments(&self) -> Vec<DocumentSegment> {
+  fn extract_document_segments<D: Detections>(
+    &self,
+    options: &AnalyzeOptions,
+  ) -> Vec<D::DocumentSegment> {
     let Some(results) = (unsafe { self.requests.document_segments.results() }) else {
       return Vec::new();
     };
-    let opts = self.opts.document_segments();
+    let opts = options.document_segments();
 
     // Effective cap: user-configured max_segments AND hard ceiling.
     // with_capacity, take, and the emission guard all share `cap`.
@@ -2193,19 +2187,19 @@ impl VisionAnalyzer {
       // — drop the whole detection rather than fabricate edge-aligned
       // corners that downstream validation would accept as real.
       let (Some(top_left), Some(top_right), Some(bottom_left), Some(bottom_right)) = (
-        vision_point_to_schema(
+        vision_point_to_normalized(
           unsafe { observation.topLeft() }.x,
           unsafe { observation.topLeft() }.y,
         ),
-        vision_point_to_schema(
+        vision_point_to_normalized(
           unsafe { observation.topRight() }.x,
           unsafe { observation.topRight() }.y,
         ),
-        vision_point_to_schema(
+        vision_point_to_normalized(
           unsafe { observation.bottomLeft() }.x,
           unsafe { observation.bottomLeft() }.y,
         ),
-        vision_point_to_schema(
+        vision_point_to_normalized(
           unsafe { observation.bottomRight() }.x,
           unsafe { observation.bottomRight() }.y,
         ),
@@ -2216,12 +2210,14 @@ impl VisionAnalyzer {
       // Even after per-corner clamping, the resulting quad can be
       // degenerate (coincident corners, zero shoelace area, or
       // self-intersecting) when Vision returned an off-screen segment
-      // or near-collinear corners. `DocumentSegment::try_new` runs the
-      // full geometry guards (collapsed corners, zero area, bow-tie /
-      // inconsistent winding); a failure means the quad is not a real
-      // document detection and the segment is dropped.
+      // or near-collinear corners. A validating vocabulary runs the
+      // geometry guards (collapsed corners, zero area, bow-tie /
+      // inconsistent winding); a refusal means the quad is not a real
+      // document detection and the segment is dropped. Note the
+      // corners go out in WINDING order — the locals above are bound
+      // in raster order.
       let Ok(segment) =
-        DocumentSegment::try_new(top_left, top_right, bottom_right, bottom_left, confidence)
+        D::DocumentSegment::try_new(top_left, top_right, bottom_right, bottom_left, confidence)
       else {
         continue;
       };
@@ -2231,10 +2227,9 @@ impl VisionAnalyzer {
     segments
   }
 
-  fn extract_aesthetics(&self) -> Aesthetics {
-    // Domain `Aesthetics` has no `Default` impl — `new(0.0, false)`
-    // is the canonical "no detection" sentinel.
-    let empty = Aesthetics::new(0.0, false);
+  fn extract_aesthetics<D: Detections>(&self, options: &AnalyzeOptions) -> D::Aesthetics {
+    // `new(0.0, false)` is the canonical "no detection" sentinel.
+    let empty = D::Aesthetics::new(0.0, false);
     let Some(results) = (unsafe { self.requests.aesthetics.results() }) else {
       return empty;
     };
@@ -2247,11 +2242,11 @@ impl VisionAnalyzer {
     let Some(overall_score) = finite_f32(unsafe { obs.overallScore() }) else {
       return empty;
     };
-    if overall_score < self.opts.aesthetics().min_overall_score() {
+    if overall_score < options.aesthetics().min_overall_score() {
       return empty;
     }
 
-    Aesthetics::new(overall_score, unsafe { obs.isUtility() })
+    D::Aesthetics::new(overall_score, unsafe { obs.isUtility() })
   }
 }
 
@@ -2276,11 +2271,11 @@ fn extract_body_pose_3d_coordinates(
 }
 
 #[cfg(target_vendor = "apple")]
-fn map_hand_chirality(chirality: VNChirality) -> HandChirality {
+fn map_hand_chirality(chirality: VNChirality) -> Chirality {
   match chirality {
-    VNChirality::Left => HandChirality::Left,
-    VNChirality::Right => HandChirality::Right,
-    _ => HandChirality::Unknown,
+    VNChirality::Left => Chirality::Left,
+    VNChirality::Right => Chirality::Right,
+    _ => Chirality::Unknown,
   }
 }
 
@@ -2291,12 +2286,12 @@ fn map_hand_chirality(chirality: VNChirality) -> HandChirality {
 /// face emits landmarks in the wrong place but still passes `[0, 1]`
 /// validation.
 #[cfg(target_vendor = "apple")]
-fn extract_face_landmark_regions(
+fn extract_face_landmark_regions<R: FaceLandmarkRegion>(
   landmarks: &VNFaceLandmarks2D,
   face_bbox_vision: CGRect,
   total_points_remaining: &mut usize,
   total_landmark_attempts: &mut usize,
-) -> Vec<FaceLandmarkRegion> {
+) -> Vec<R> {
   let mut regions = Vec::new();
   for (name, region) in [
     ("allPoints", unsafe { landmarks.allPoints() }),
@@ -2331,8 +2326,8 @@ fn extract_face_landmark_regions(
 }
 
 #[cfg(target_vendor = "apple")]
-fn push_face_landmark_region(
-  regions: &mut Vec<FaceLandmarkRegion>,
+fn push_face_landmark_region<R: FaceLandmarkRegion>(
+  regions: &mut Vec<R>,
   name: &'static str,
   region: Option<Retained<VNFaceLandmarkRegion2D>>,
   face_bbox_vision: CGRect,
@@ -2394,22 +2389,20 @@ fn push_face_landmark_region(
   // `validate_raw_slice_elems::<CGPoint>` above), so the slice
   // length fits both the FFI buffer and the `isize::MAX` contract.
   let points = unsafe { std::slice::from_raw_parts(points_ptr, region_cap) };
-  // Domain `FaceLandmarkRegion::try_new` stores points as
-  // `(NormCoord, NormCoord)` pairs — pass raw `(f32, f32)` tuples
-  // and let the validator handle the wrap. Every point is already
-  // sanitised through `vision_point_to_schema` (finite + clamped to
-  // `[0, 1]`), so the validator's `NormCoord::try_new` cannot reject.
+  // The seat takes raw `(f32, f32)` tuples. Every point is already
+  // sanitised through `vision_point_to_normalized` (finite + clamped
+  // to `[0, 1]`), so a validating vocabulary cannot reject one.
   let mut emitted_points: Vec<(f32, f32)> = Vec::with_capacity(region_cap);
   for point in points.iter() {
     // Apple's convention: landmark points are normalized within the
     // face's normalized bbox (NOT the image). Project to image-
     // normalized Vision coordinates first, THEN route through
-    // `vision_point_to_schema` for the top-left flip + clamp +
+    // `vision_point_to_normalized` for the top-left flip + clamp +
     // finite check. A non-finite raw or projected component drops
     // only the offending point; partial-point regions are still
     // meaningful.
     let projected = project_landmark_to_image(*point, face_bbox_vision);
-    if let Some((x, y)) = vision_point_to_schema(projected.x, projected.y) {
+    if let Some((x, y)) = vision_point_to_normalized(projected.x, projected.y) {
       emitted_points.push((x, y));
     }
   }
@@ -2417,7 +2410,7 @@ fn push_face_landmark_region(
     return;
   }
   let emitted_len = emitted_points.len();
-  let Ok(region) = FaceLandmarkRegion::try_new(name, emitted_points) else {
+  let Ok(region) = R::try_new(name, &emitted_points) else {
     return;
   };
   // Decrement the shared budget by the number of points actually
@@ -2430,24 +2423,25 @@ fn push_face_landmark_region(
 #[cfg(target_vendor = "apple")]
 fn map_body_pose_3d_height_estimation(
   estimation: VNHumanBodyPose3DObservationHeightEstimation,
-) -> BodyPose3DHeightEstimation {
+) -> HeightEstimation {
   if estimation == VNHumanBodyPose3DObservationHeightEstimation::Measured {
-    BodyPose3DHeightEstimation::Measured
+    HeightEstimation::Measured
   } else if estimation == VNHumanBodyPose3DObservationHeightEstimation::Reference {
-    BodyPose3DHeightEstimation::Reference
+    HeightEstimation::Reference
   } else {
-    BodyPose3DHeightEstimation::Unknown
+    HeightEstimation::Unknown
   }
 }
 
-/// Copy a Vision mask `CVPixelBuffer` into a packed `Bytes` payload plus
-/// a normalized bounding box of the foreground.
+/// Copy a Vision mask `CVPixelBuffer` into a packed byte payload plus
+/// a normalized bounding box of the foreground and the buffer's own
+/// `(width, height)`.
 ///
 /// The returned payload is **always** 8 bits per pixel
 /// (`width * height` bytes); Vision's two supported source formats
 /// (`OneComponent32Float`, `OneComponent8`) are both normalised to
 /// canonical u8 at the boundary so downstream consumers don't have
-/// to disambiguate from the [`Dimensions`] metadata alone. f32 input
+/// to disambiguate from the returned dimensions alone. f32 input
 /// is mapped `v` → `(v.clamp(0.0, 1.0) * 255.0).round() as u8` with
 /// non-finite values collapsing to `0` (background).
 ///
@@ -2460,10 +2454,10 @@ fn map_body_pose_3d_height_estimation(
 /// released by `Drop` on every exit path — including a panic — so the
 /// buffer cannot be left locked.
 #[cfg(target_vendor = "apple")]
-fn copy_instance_mask_buffer(
+fn copy_instance_mask_buffer<B: BoundingBox>(
   pixel_buffer: &CVPixelBuffer,
   remaining_byte_budget: usize,
-) -> Option<(BoundingBox, Dimensions, Bytes)> {
+) -> Option<(B, u32, u32, Vec<u8>)> {
   let guard = CVPixelBufferLockGuard::lock(pixel_buffer, CVPixelBufferLockFlags::ReadOnly)?;
   copy_instance_mask_buffer_locked(guard.buffer(), remaining_byte_budget)
 }
@@ -2478,16 +2472,16 @@ fn copy_instance_mask_buffer(
 /// (4 bytes/pixel) or `kCVPixelFormatType_OneComponent8`
 /// (1 byte/pixel); both are normalised to the canonical u8 wire
 /// representation so downstream consumers don't have to disambiguate
-/// from the [`Dimensions`] metadata alone. The f32 → u8 quantisation
+/// from the returned dimensions alone. The f32 → u8 quantisation
 /// is `(v.clamp(0.0, 1.0) * 255.0).round() as u8` with non-finite
 /// inputs collapsed to `0` (background); see
 /// [`process_mask_bytes_f32`] for the per-pixel logic.
 #[cfg(target_vendor = "apple")]
 #[allow(non_upper_case_globals)]
-fn copy_instance_mask_buffer_locked(
+fn copy_instance_mask_buffer_locked<B: BoundingBox>(
   pixel_buffer: &CVPixelBuffer,
   remaining_byte_budget: usize,
-) -> Option<(BoundingBox, Dimensions, Bytes)> {
+) -> Option<(B, u32, u32, Vec<u8>)> {
   let width = CVPixelBufferGetWidth(pixel_buffer);
   let height = CVPixelBufferGetHeight(pixel_buffer);
   if width == 0 || height == 0 {
@@ -2557,12 +2551,12 @@ fn copy_instance_mask_buffer_locked(
   // re-checks `width * height` against `MAX_MASK_BYTES`.
   let src = unsafe { std::slice::from_raw_parts(base_address, total_src_len) };
 
-  // The wire `Dimensions` stores `u32`. A mask whose width or height
-  // exceeds `u32::MAX` cannot be represented faithfully — we'd have
-  // to saturate the dimensions to a value smaller than the actual
-  // packed payload, which would silently desynchronise consumers
-  // that size buffers from the metadata. Reject overflow here so the
-  // detection is dropped rather than poisoning storage.
+  // The mask seat reports its dimensions as `u32`. A mask whose
+  // width or height exceeds `u32::MAX` cannot be represented
+  // faithfully — we'd have to saturate to a value smaller than the
+  // actual packed payload, which would silently desynchronise
+  // consumers that size buffers from the metadata. Reject overflow
+  // here so the detection is dropped rather than poisoning storage.
   let dim_width = u32::try_from(width).ok()?;
   let dim_height = u32::try_from(height).ok()?;
 
@@ -2574,11 +2568,7 @@ fn copy_instance_mask_buffer_locked(
     _ => return None,
   };
 
-  Some((
-    bbox,
-    Dimensions::new(dim_width, dim_height),
-    Bytes::from(packed),
-  ))
+  Some((bbox, dim_width, dim_height, packed))
 }
 
 /// Walk an `OneComponent32Float` mask, quantise each pixel to 8 bits,
@@ -2594,12 +2584,12 @@ fn copy_instance_mask_buffer_locked(
 /// confidence in foreground" convention and keeping the wire payload
 /// canonically 8-bit per pixel across both source pixel formats.
 #[cfg(target_vendor = "apple")]
-fn process_mask_bytes_f32(
+fn process_mask_bytes_f32<B: BoundingBox>(
   width: usize,
   height: usize,
   bytes_per_row: usize,
   src: &[u8],
-) -> Option<(BoundingBox, Vec<u8>)> {
+) -> Option<(B, Vec<u8>)> {
   let src_row_pixel_bytes = width.checked_mul(core::mem::size_of::<f32>())?;
   let packed_len = width.checked_mul(height)?;
   // Bounded allocation: cap at `MAX_MASK_BYTES` and use
@@ -2648,9 +2638,8 @@ fn process_mask_bytes_f32(
 
   if !has_foreground {
     // All-zero mask — skip the detection rather than emit one with a
-    // degenerate bbox. The validated domain `BoundingBox::try_new`
-    // rejects zero-extent boxes, so the previous
-    // `BoundingBox::default()` fallback would poison downstream
+    // degenerate bbox. A validating vocabulary rejects zero-extent
+    // boxes, so a `default()`-style fallback would poison downstream
     // conversion.
     return None;
   }
@@ -2661,12 +2650,12 @@ fn process_mask_bytes_f32(
 /// Walk an `OneComponent8` mask, copy it tightly packed, and derive a
 /// normalized foreground bbox. Returns `None` for an all-zero mask.
 #[cfg(target_vendor = "apple")]
-fn process_mask_bytes_u8(
+fn process_mask_bytes_u8<B: BoundingBox>(
   width: usize,
   height: usize,
   bytes_per_row: usize,
   src: &[u8],
-) -> Option<(BoundingBox, Vec<u8>)> {
+) -> Option<(B, Vec<u8>)> {
   let packed_len = width.checked_mul(height)?;
   // Bounded allocation: see `process_mask_bytes_f32` for the rationale.
   let mut packed = try_alloc_packed_mask(packed_len)?;
@@ -2704,7 +2693,7 @@ fn process_mask_bytes_u8(
 }
 
 /// Convert the foreground pixel bounds of a `CVPixelBuffer` mask into a
-/// normalized [`BoundingBox`] in the top-left schema convention.
+/// normalized bounding box in the top-left convention.
 ///
 /// `CVPixelBuffer` rows are stored top-to-bottom in memory (row 0 is the
 /// top of the image), so the natural mapping `min_y / height` is already
@@ -2721,19 +2710,18 @@ fn process_mask_bytes_u8(
 /// `f64` has 52 mantissa bits and represents every `usize` up to
 /// `2^52` exactly on 64-bit targets; only the final narrow to `f32`
 /// loses precision, which is invariant-safe because the result is
-/// in `[0, 1]`. Returns `None` if the final bbox fails the domain
-/// validator's `[0, 1]` + non-zero-extent invariants — a corrupted
-/// pixel-bound input cannot produce a wire bbox that downstream
+/// in `[0, 1]`. Returns `None` if the final box is refused — a
+/// corrupted pixel-bound input cannot produce a box that downstream
 /// storage would reject.
 #[cfg(target_vendor = "apple")]
-fn normalized_bbox_from_pixel_bounds(
+fn normalized_bbox_from_pixel_bounds<B: BoundingBox>(
   min_x: usize,
   min_y: usize,
   max_x: usize,
   max_y: usize,
   width: usize,
   height: usize,
-) -> Option<BoundingBox> {
+) -> Option<B> {
   if width == 0 || height == 0 {
     return None;
   }
@@ -2748,9 +2736,9 @@ fn normalized_bbox_from_pixel_bounds(
   // above the f32 mantissa exhaustion point (2^24+1, 2^25+1, …),
   // separate f32 narrowings of `min_x / width` and `(max_x + 1 - min_x)
   // / width` can land on (1.0, positive) for right-edge foreground,
-  // producing `x == 1.0 && w > 0.0` — a bbox the domain validator
-  // does NOT reliably reject (its `x + w` check is also f32 and
-  // rounds back to 1.0). Edge-based computation eliminates the
+  // producing `x == 1.0 && w > 0.0` — a box a validating
+  // vocabulary does NOT reliably reject (an `x + w` check is also
+  // f32 and rounds back to 1.0). Edge-based computation eliminates the
   // class entirely: the right edge is constructed directly as a
   // normalized value, not synthesised from `left + width`.
   //
@@ -2785,1003 +2773,43 @@ fn normalized_bbox_from_pixel_bounds(
   if !(w > 0.0 && h > 0.0) {
     return None;
   }
-  // The validating `try_new` IS the domain bbox — no wire fork to
-  // re-check.
-  BoundingBox::try_new(left, top, w, h).ok()
+  B::try_new(left, top, w, h).ok()
 }
 
 // ----- Non-macOS stub --------------------------------------------------------
 
 /// Non-macOS stub for [`VisionAnalyzer`]. Apple's Vision.framework is
 /// only available on macOS, so on every other target the analyzer
-/// always reports an [`ErrorCode::AppleVisionFailed`] platform error
-/// rather than producing detections. The README promises the crate
-/// compiles cleanly on non-macOS targets so downstream workspaces can
-/// keep `avanalyze` in their dep tree unconditionally; this stub is
-/// what makes that promise true.
+/// always reports [`AnalyzeErrorKind::Unsupported`] rather than
+/// producing detections. The README promises the crate compiles
+/// cleanly on non-macOS targets so downstream workspaces can keep
+/// `avanalyze` in their dep tree unconditionally; this stub is what
+/// makes that promise true.
 #[cfg(not(target_vendor = "apple"))]
 #[derive(Debug)]
-pub struct VisionAnalyzer {
-  // Keep the options around so a future native cross-platform
-  // engine can swap in here without breaking the public API.
-  #[allow(dead_code)]
-  opts: ServiceOptions,
-}
+pub struct VisionAnalyzer;
 
 #[cfg(not(target_vendor = "apple"))]
 impl VisionAnalyzer {
-  /// Construct a non-macOS stub analyzer. The configuration is
-  /// retained but unused — every `analyze_keyframe` call returns
-  /// [`ErrorCode::AppleVisionFailed`].
+  /// Constructs a non-macOS stub analyzer. The options are ignored —
+  /// every `analyze_keyframe` call reports
+  /// [`AnalyzeErrorKind::Unsupported`].
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn new(opts: ServiceOptions) -> Self {
-    Self { opts }
+  pub fn new(_options: &AnalyzeOptions) -> Self {
+    Self
   }
 
   /// Non-macOS stub: Apple's Vision.framework is only available on
-  /// macOS, so this always returns
-  /// [`ErrorCode::AppleVisionFailed`] with an explanatory message.
-  /// `_jpeg_data` is ignored.
-  pub fn analyze_keyframe(
+  /// macOS, so this always reports
+  /// [`AnalyzeErrorKind::Unsupported`]. `_jpeg_data` is ignored.
+  pub fn analyze_keyframe<D: Detections>(
     &self,
-    _scene_id: Uuid7,
-    _keyframe_id: Uuid7,
-    _pts: Timestamp,
-    _dimensions: Dimensions,
-    _extractor: KeyframeExtractor,
     _jpeg_data: &[u8],
-  ) -> Result<Keyframe, ErrorInfo> {
-    Err(apple_vision_error(
-      ErrorCode::AppleVisionFailed,
+    _options: &AnalyzeOptions,
+  ) -> Result<Analysis<D>, AnalyzeError> {
+    Err(AnalyzeError::new(
+      AnalyzeErrorKind::Unsupported,
       "Apple Vision.framework is only available on macOS",
     ))
-  }
-}
-
-#[cfg(test)]
-mod tests {
-  use mediaschema::domain::aggregates::video::{
-    BodyPose3DDetection, BodyPose3DHeightEstimation, HumanAnalysis,
-  };
-
-  /// Regression: `HumanAnalysis::with_body_poses_3d` previously dropped
-  /// its input on the floor in the wire-types era. The locked domain
-  /// builder must still persist the supplied detections. Platform-
-  /// independent — the builder does not depend on Vision.
-  #[test]
-  fn body_poses_3d_survives_through_human_analysis() {
-    let pose =
-      BodyPose3DDetection::try_new(0.5, 0.0, BodyPose3DHeightEstimation::Unknown, Vec::new())
-        .expect("validating ctor on canonical inputs");
-    let analysis = HumanAnalysis::new().with_body_poses_3d(vec![pose]);
-    assert_eq!(analysis.body_poses_3d_slice().len(), 1);
-  }
-
-  /// Non-macOS `VisionAnalyzer` stub must report an Apple-Vision
-  /// platform error on every `analyze_keyframe` call.
-  #[cfg(not(target_vendor = "apple"))]
-  #[test]
-  fn non_macos_stub_reports_unavailable() {
-    use super::*;
-    use core::num::NonZeroU32;
-    use mediatime::Timebase;
-    let analyzer = VisionAnalyzer::new(ServiceOptions::new());
-    let tb = Timebase::new(1, NonZeroU32::new(1000).expect("nonzero den"));
-    let err = analyzer
-      .analyze_keyframe(
-        Uuid7::new(),
-        Uuid7::new(),
-        Timestamp::new(0, tb),
-        Dimensions::new(320, 180),
-        KeyframeExtractor::Manual,
-        &[],
-      )
-      .expect_err("stub must return Err");
-    assert_eq!(err.code(), ErrorCode::AppleVisionFailed);
-  }
-}
-
-#[cfg(all(test, target_vendor = "apple"))]
-mod macos_tests {
-  use super::*;
-  use mediaschema::domain::aggregates::video::BoundingBox as DomainBoundingBox;
-  use objc2_core_foundation::{CGPoint, CGRect, CGSize};
-
-  /// #48: IoU of a box with itself is 1.0 — exact-duplicate detections (the
-  /// common case across the two Vision face passes) match perfectly.
-  #[test]
-  fn bbox_iou_identical_is_one() {
-    let a = DomainBoundingBox::try_new(0.1, 0.2, 0.3, 0.4).unwrap();
-    assert!(
-      (bbox_iou(&a, &a) - 1.0).abs() < 1e-6,
-      "iou = {}",
-      bbox_iou(&a, &a)
-    );
-  }
-
-  /// #48: IoU of disjoint boxes is 0.0.
-  #[test]
-  fn bbox_iou_disjoint_is_zero() {
-    let a = DomainBoundingBox::try_new(0.0, 0.0, 0.2, 0.2).unwrap();
-    let b = DomainBoundingBox::try_new(0.5, 0.5, 0.2, 0.2).unwrap();
-    assert_eq!(bbox_iou(&a, &b), 0.0);
-  }
-
-  /// #48: partial overlap. Two 0.2×0.2 boxes offset by 0.1 in x share a
-  /// 0.1×0.2 strip: inter = 0.02, union = 0.04 + 0.04 − 0.02 = 0.06 → IoU = 1/3.
-  #[test]
-  fn bbox_iou_partial_overlap() {
-    let a = DomainBoundingBox::try_new(0.0, 0.0, 0.2, 0.2).unwrap();
-    let b = DomainBoundingBox::try_new(0.1, 0.0, 0.2, 0.2).unwrap();
-    assert!(
-      (bbox_iou(&a, &b) - 1.0 / 3.0).abs() < 1e-5,
-      "iou = {}",
-      bbox_iou(&a, &b)
-    );
-  }
-
-  /// #48: a detected face is annotated with the quality of the overlapping
-  /// capture-quality observation, and the highest-IoU match wins.
-  #[test]
-  fn matched_capture_quality_takes_overlapping_score() {
-    let face = DomainBoundingBox::try_new(0.10, 0.10, 0.20, 0.20).unwrap();
-    let scored = vec![
-      (
-        DomainBoundingBox::try_new(0.50, 0.50, 0.20, 0.20).unwrap(),
-        0.2,
-      ), // disjoint
-      (
-        DomainBoundingBox::try_new(0.10, 0.10, 0.20, 0.20).unwrap(),
-        0.8,
-      ), // exact overlap
-    ];
-    assert!((matched_capture_quality(&face, &scored) - 0.8).abs() < 1e-6);
-  }
-
-  /// #48: a face the capture-quality pass did not cover annotates to 0.0 (so
-  /// the default `min_capture_quality` of 0.1 drops it, while 0.0 keeps it).
-  #[test]
-  fn matched_capture_quality_zero_without_overlap() {
-    let face = DomainBoundingBox::try_new(0.10, 0.10, 0.20, 0.20).unwrap();
-    let scored = vec![(
-      DomainBoundingBox::try_new(0.60, 0.60, 0.20, 0.20).unwrap(),
-      0.9,
-    )];
-    assert_eq!(matched_capture_quality(&face, &scored), 0.0);
-  }
-
-  /// `vision_bbox_to_schema` must flip y. A Vision rect of
-  /// `(0.1, 0.2, 0.3, 0.4)` (lower-left origin) maps to
-  /// `(0.1, 1.0 - (0.2 + 0.4), 0.3, 0.4)` = `(0.1, 0.4, 0.3, 0.4)`
-  /// in the schema's top-left convention.
-  #[test]
-  fn vision_bbox_to_schema_flips_y() {
-    let rect = CGRect::new(CGPoint::new(0.1, 0.2), CGSize::new(0.3, 0.4));
-    let bbox = vision_bbox_to_schema(rect).expect("in-range rect must clamp to itself");
-    assert!((bbox.x() - 0.1).abs() < 1e-6, "x: {}", bbox.x());
-    assert!((bbox.y() - 0.4).abs() < 1e-6, "y: {}", bbox.y());
-    assert!((bbox.width() - 0.3).abs() < 1e-6, "w: {}", bbox.width());
-    assert!((bbox.height() - 0.4).abs() < 1e-6, "h: {}", bbox.height());
-  }
-
-  /// Lock the flipped full-image result against the validating domain
-  /// `BoundingBox::try_new` to ensure the components still satisfy the
-  /// `[0, 1]` invariant after the flip.
-  #[test]
-  fn vision_bbox_to_schema_full_image_round_trip() {
-    let rect = CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(1.0, 1.0));
-    let bbox = vision_bbox_to_schema(rect).expect("unit rect must clamp to itself");
-    assert_eq!(bbox.x(), 0.0);
-    assert_eq!(bbox.y(), 0.0);
-    assert_eq!(bbox.width(), 1.0);
-    assert_eq!(bbox.height(), 1.0);
-    DomainBoundingBox::try_new(bbox.x(), bbox.y(), bbox.width(), bbox.height())
-      .expect("full-image bbox stays valid after flip");
-  }
-
-  /// A Vision rect that spills off the right edge (`origin.x + width > 1`)
-  /// must be clamped to the unit square. Domain `BoundingBox::try_new`
-  /// would reject the un-clamped result, so without clamping a partially
-  /// off-screen detection would poison downstream conversion.
-  #[test]
-  fn vision_bbox_clamps_right_spill() {
-    // Vision rect: origin (0.8, 0.4), size (0.5, 0.2) — right edge at 1.3.
-    let rect = CGRect::new(CGPoint::new(0.8, 0.4), CGSize::new(0.5, 0.2));
-    let bbox = vision_bbox_to_schema(rect).expect("partial overlap must produce a bbox");
-    // Clamped right edge is 1.0 → width = 0.2 (1.0 - 0.8).
-    assert!((bbox.x() - 0.8).abs() < 1e-6, "x: {}", bbox.x());
-    assert!((bbox.width() - 0.2).abs() < 1e-6, "w: {}", bbox.width());
-    // y in schema space: 1.0 - (0.4 + 0.2) = 0.4 (in-range, no clamp).
-    assert!((bbox.y() - 0.4).abs() < 1e-6, "y: {}", bbox.y());
-    assert!((bbox.height() - 0.2).abs() < 1e-6, "h: {}", bbox.height());
-    DomainBoundingBox::try_new(bbox.x(), bbox.y(), bbox.width(), bbox.height())
-      .expect("clamped bbox satisfies the [0,1] invariant");
-  }
-
-  /// A Vision rect that spills off the bottom (`origin.y < 0` in
-  /// Vision = `y + height > 1` in schema) must be clamped to the unit
-  /// square so the domain validator does not reject it.
-  #[test]
-  fn vision_bbox_clamps_bottom_spill() {
-    // Vision rect: origin (0.1, -0.1), size (0.3, 0.4) — Vision bottom edge
-    // at y = -0.1, top edge at y = 0.3.
-    // Schema: top = 1.0 - (−0.1 + 0.4) = 0.7, bottom = 1.0 - (−0.1) = 1.1.
-    let rect = CGRect::new(CGPoint::new(0.1, -0.1), CGSize::new(0.3, 0.4));
-    let bbox = vision_bbox_to_schema(rect).expect("partial overlap must produce a bbox");
-    // Bottom clamped to 1.0 → height = 1.0 - 0.7 = 0.3.
-    assert!((bbox.x() - 0.1).abs() < 1e-6, "x: {}", bbox.x());
-    assert!((bbox.y() - 0.7).abs() < 1e-6, "y: {}", bbox.y());
-    assert!((bbox.width() - 0.3).abs() < 1e-6, "w: {}", bbox.width());
-    assert!((bbox.height() - 0.3).abs() < 1e-6, "h: {}", bbox.height());
-    DomainBoundingBox::try_new(bbox.x(), bbox.y(), bbox.width(), bbox.height())
-      .expect("clamped bbox satisfies the [0,1] invariant");
-  }
-
-  /// A Vision rect entirely outside the unit square must yield `None`
-  /// so the detection is skipped rather than producing a degenerate
-  /// wire bbox.
-  #[test]
-  fn vision_bbox_fully_offscreen_yields_none() {
-    let rect = CGRect::new(CGPoint::new(1.5, 0.5), CGSize::new(0.3, 0.4));
-    assert!(vision_bbox_to_schema(rect).is_none());
-  }
-
-  /// A Vision rect that intersects the unit square only at a single
-  /// edge must yield `None` (the intersection has zero width).
-  #[test]
-  fn vision_bbox_edge_only_yields_none() {
-    // Right edge at exactly x = 1.0, left edge at x = 1.0 — zero width.
-    let rect = CGRect::new(CGPoint::new(1.0, 0.5), CGSize::new(0.0, 0.4));
-    assert!(vision_bbox_to_schema(rect).is_none());
-  }
-
-  /// `NaN` from Vision (occasionally seen for off-image rects) must
-  /// not propagate — the helper sanitises non-finite components to
-  /// `0.0`. A `NaN` `origin.x` collapses left and right to 0.0, so the
-  /// rectangle has zero width after clamping and is reported as
-  /// `None` (the detection is dropped).
-  #[test]
-  fn vision_bbox_handles_nan_origin() {
-    let rect = CGRect::new(CGPoint::new(f64::NAN, 0.0), CGSize::new(0.3, 0.4));
-    assert!(vision_bbox_to_schema(rect).is_none());
-  }
-
-  /// `NaN` in a single size component still produces a usable
-  /// rectangle iff the surviving edges enclose a non-zero area. A
-  /// finite `origin.x`/`width` keeps the horizontal extent live; a
-  /// `NaN` `origin.y` collapses the vertical extent to zero and the
-  /// rectangle is dropped.
-  #[test]
-  fn vision_bbox_handles_nan_y_origin() {
-    let rect = CGRect::new(CGPoint::new(0.1, f64::NAN), CGSize::new(0.3, 0.4));
-    assert!(vision_bbox_to_schema(rect).is_none());
-  }
-
-  /// 2D points flip y AND clamp to `[0, 1]`. A Vision point that lands
-  /// outside `[0, 1]` after the flip is clamped to the unit edge so
-  /// downstream validation accepts it.
-  #[test]
-  fn vision_point_to_schema_flips_y_only() {
-    let (x, y) = vision_point_to_schema(0.25, 0.75).expect("finite point");
-    assert!((x - 0.25).abs() < 1e-6);
-    assert!((y - 0.25).abs() < 1e-6);
-  }
-
-  /// Out-of-range Vision points clamp to `[0, 1]`.
-  #[test]
-  fn vision_point_to_schema_clamps_out_of_range() {
-    let (x, y) = vision_point_to_schema(1.2, -0.3).expect("finite point");
-    assert_eq!(x, 1.0);
-    // `y = 1.0 - (-0.3) = 1.3` → clamped to 1.0.
-    assert_eq!(y, 1.0);
-  }
-
-  /// Non-finite Vision points are rejected at the source: a `NaN`,
-  /// `+Inf`, or `-Inf` in either component returns `None` so the
-  /// caller can decide whether to drop the point or the whole
-  /// detection. Previously the helper collapsed the bad component to
-  /// `0.0` via `clamp01`, which fabricated edge-aligned coordinates
-  /// that the domain validator could not distinguish from real
-  /// detections.
-  #[test]
-  fn vision_point_to_schema_rejects_non_finite() {
-    assert!(vision_point_to_schema(f64::NAN, 0.5).is_none());
-    assert!(vision_point_to_schema(0.5, f64::NAN).is_none());
-    assert!(vision_point_to_schema(f64::INFINITY, 0.5).is_none());
-    assert!(vision_point_to_schema(0.5, f64::INFINITY).is_none());
-    assert!(vision_point_to_schema(f64::NEG_INFINITY, 0.5).is_none());
-    assert!(vision_point_to_schema(0.5, f64::NEG_INFINITY).is_none());
-    // Finite path still works.
-    assert!(vision_point_to_schema(0.1, 0.2).is_some());
-  }
-
-  /// A document quad with even one non-finite corner must be dropped
-  /// in its entirety — a quad is geometrically meaningless without
-  /// all four corners. This test mirrors the per-detection pattern
-  /// the extractor uses (`let (Some(tl), Some(tr), Some(bl),
-  /// Some(br)) = (...) else { continue; }`): if any corner returns
-  /// `None`, the whole quad is rejected. Partial-corner emission
-  /// would be a regression.
-  #[test]
-  fn document_quad_with_non_finite_corner_is_dropped() {
-    // Three good corners + one NaN corner — overall the quad must
-    // be dropped. We exercise each corner position to confirm the
-    // "any None drops the whole quad" semantics.
-    let good = (0.1_f64, 0.1_f64);
-    let bad = (f64::NAN, 0.5_f64);
-
-    for (tl, tr, bl, br) in [
-      (bad, good, good, good),
-      (good, bad, good, good),
-      (good, good, bad, good),
-      (good, good, good, bad),
-    ] {
-      let result = (
-        vision_point_to_schema(tl.0, tl.1),
-        vision_point_to_schema(tr.0, tr.1),
-        vision_point_to_schema(bl.0, bl.1),
-        vision_point_to_schema(br.0, br.1),
-      );
-      assert!(
-        !matches!(result, (Some(_), Some(_), Some(_), Some(_))),
-        "quad with non-finite corner survived: {result:?}",
-      );
-    }
-  }
-
-  /// `normalized_bbox_from_pixel_bounds` must NOT flip the y axis —
-  /// `CVPixelBuffer` rows are top-to-bottom, so row 0 is the top edge
-  /// and the natural mapping `min_y / height` is already in top-left
-  /// convention.
-  #[test]
-  fn pixel_bounds_to_normalized_bbox_does_not_flip() {
-    // A 100x100 mask with the foreground rectangle in rows 10..=29,
-    // columns 5..=24. The expected normalized bbox is
-    // `(5/100, 10/100, 20/100, 20/100)` in top-left convention.
-    let bbox = normalized_bbox_from_pixel_bounds(5, 10, 24, 29, 100, 100).expect("valid bbox");
-    assert!((bbox.x() - 0.05).abs() < 1e-6);
-    assert!((bbox.y() - 0.10).abs() < 1e-6);
-    assert!((bbox.width() - 0.20).abs() < 1e-6);
-    assert!((bbox.height() - 0.20).abs() < 1e-6);
-  }
-
-  /// An all-zero 8-bit mask must yield `None` so the caller skips the
-  /// detection. Previously the buffer returned `Some` with
-  /// `BoundingBox::default()` (a zero-extent box), which the domain
-  /// `BoundingBox::try_new` would later reject.
-  #[test]
-  fn empty_8bit_mask_yields_none() {
-    let src = vec![0u8; 4 * 4]; // 4×4 all-zero mask, tight stride.
-    assert!(process_mask_bytes_u8(4, 4, 4, &src).is_none());
-  }
-
-  /// An all-zero 32-bit-float mask must also yield `None`. Same
-  /// rationale as the 8-bit case.
-  #[test]
-  fn empty_32fp_mask_yields_none() {
-    let src = vec![0u8; 4 * 4 * 4]; // 4×4 all-zero f32 mask.
-    assert!(process_mask_bytes_f32(4, 4, 16, &src).is_none());
-  }
-
-  /// An 8-bit mask with one foreground pixel at row 1, col 2 of a
-  /// 4×4 buffer must round-trip the bbox and the packed bytes.
-  #[test]
-  fn single_pixel_8bit_mask_round_trip() {
-    let mut src = vec![0u8; 16];
-    // Row 1, column 2 — stride 4.
-    src[6] = 0xFF;
-    let (bbox, packed) = process_mask_bytes_u8(4, 4, 4, &src).expect("foreground produces Some");
-    assert!((bbox.x() - 0.5).abs() < 1e-6, "x: {}", bbox.x());
-    assert!((bbox.y() - 0.25).abs() < 1e-6, "y: {}", bbox.y());
-    assert!((bbox.width() - 0.25).abs() < 1e-6, "w: {}", bbox.width());
-    assert!((bbox.height() - 0.25).abs() < 1e-6, "h: {}", bbox.height());
-    // Packed bytes mirror the input (tight stride === input stride).
-    assert_eq!(packed, src);
-  }
-
-  /// A 32-fp mask with one foreground pixel quantises to a single u8
-  /// in the canonical 8-bit-per-pixel wire payload. `0.75 * 255 =
-  /// 191.25 → 191` after `round()`. The packed buffer is `width *
-  /// height` bytes, NOT `width * height * size_of::<f32>()`, since
-  /// the f32 source is normalised to u8 at the boundary.
-  #[test]
-  fn single_pixel_32fp_mask_round_trip() {
-    let mut src = vec![0u8; 4 * 4 * 4];
-    let value: f32 = 0.75;
-    let bytes = value.to_le_bytes();
-    // Row 1, column 2 — 4 bytes per pixel, 16 bytes per row.
-    let src_offset = 16 + 8;
-    src[src_offset..src_offset + 4].copy_from_slice(&bytes);
-    let (bbox, packed) = process_mask_bytes_f32(4, 4, 16, &src).expect("foreground produces Some");
-    assert!((bbox.x() - 0.5).abs() < 1e-6, "x: {}", bbox.x());
-    assert!((bbox.y() - 0.25).abs() < 1e-6, "y: {}", bbox.y());
-    // Canonical 8-bit payload: 4×4 = 16 bytes.
-    assert_eq!(packed.len(), 4 * 4);
-    // Row 1, column 2 — 4 bytes per row in the u8 output, so offset = 4 + 2.
-    let dst_offset = 4 + 2;
-    assert_eq!(packed[dst_offset], 191, "0.75 → 191 after u8 quantisation");
-    // Every other byte stays at 0 (background).
-    for (idx, &b) in packed.iter().enumerate() {
-      if idx != dst_offset {
-        assert_eq!(b, 0, "background pixel {idx} must be 0");
-      }
-    }
-  }
-
-  /// f32 mask values at the canonical interior {0.0, 0.5, 1.0} plus a
-  /// `NaN` background pixel must quantise to {0, 128, 255, 0} in the
-  /// u8 wire payload. Pins the brief's documented mapping.
-  #[test]
-  fn f32_mask_quantises_canonical_values_and_nan() {
-    // 4×1 row: [0.0, 0.5, 1.0, NaN].
-    let mut src = vec![0u8; 4 * 4];
-    src[0..4].copy_from_slice(&0.0_f32.to_le_bytes());
-    src[4..8].copy_from_slice(&0.5_f32.to_le_bytes());
-    src[8..12].copy_from_slice(&1.0_f32.to_le_bytes());
-    src[12..16].copy_from_slice(&f32::NAN.to_le_bytes());
-    let (_, packed) = process_mask_bytes_f32(4, 1, 16, &src).expect("foreground present");
-    assert_eq!(packed.len(), 4, "canonical 8-bit-per-pixel payload");
-    assert_eq!(packed[0], 0, "0.0 → 0");
-    // 0.5 * 255 = 127.5; `round()` ties-to-even on .5 in Rust uses
-    // banker's rounding... actually `f32::round()` is half-away-
-    // from-zero: 127.5 → 128.
-    assert_eq!(packed[1], 128, "0.5 → 128");
-    assert_eq!(packed[2], 255, "1.0 → 255");
-    assert_eq!(packed[3], 0, "NaN → 0 (background)");
-  }
-
-  /// f32 mask values outside `[0, 1]` (e.g. a glitched Vision frame
-  /// with negative or super-saturated mask probabilities) must clamp
-  /// to the endpoints in the u8 output rather than wrap or silently
-  /// produce garbage. `+Inf` and `-Inf` collapse to `0` (background)
-  /// like `NaN`.
-  #[test]
-  fn f32_mask_quantises_out_of_range_and_infinity() {
-    // 4×1 row: [-0.5, 1.5, +Inf, -Inf].
-    let mut src = vec![0u8; 4 * 4];
-    src[0..4].copy_from_slice(&(-0.5_f32).to_le_bytes());
-    src[4..8].copy_from_slice(&1.5_f32.to_le_bytes());
-    src[8..12].copy_from_slice(&f32::INFINITY.to_le_bytes());
-    src[12..16].copy_from_slice(&f32::NEG_INFINITY.to_le_bytes());
-    // Foreground = packed[1] (1.5 clamps to 255). The rest collapse
-    // to 0 (background), so the mask is technically a single-pixel
-    // foreground at column 1.
-    let (_, packed) = process_mask_bytes_f32(4, 1, 16, &src).expect("foreground at col 1");
-    assert_eq!(packed[0], 0, "-0.5 clamps to 0");
-    assert_eq!(packed[1], 255, "1.5 clamps to 255");
-    assert_eq!(packed[2], 0, "+Inf → 0 (background)");
-    assert_eq!(packed[3], 0, "-Inf → 0 (background)");
-  }
-
-  /// A stride wider than `width * bytes_per_pixel` (the buffer has
-  /// per-row padding) must still produce the correct tightly-packed
-  /// output.
-  #[test]
-  fn padded_stride_8bit_mask_packs_correctly() {
-    // 3×2 mask, stride = 8 (5 bytes of right-padding per row).
-    let mut src = vec![0u8; 16];
-    src[0] = 1; // row 0, col 0.
-    src[10] = 1; // row 1, col 2 (offset 8 + 2).
-    let (bbox, packed) = process_mask_bytes_u8(3, 2, 8, &src).expect("foreground produces Some");
-    assert_eq!(packed.len(), 3 * 2);
-    assert_eq!(packed, [1, 0, 0, 0, 0, 1]);
-    // Foreground spans cols 0..=2 and rows 0..=1 — bbox is the whole mask.
-    assert!((bbox.x() - 0.0).abs() < 1e-6);
-    assert!((bbox.y() - 0.0).abs() < 1e-6);
-    assert!((bbox.width() - 1.0).abs() < 1e-6);
-    assert!((bbox.height() - 1.0).abs() < 1e-6);
-  }
-
-  /// A pose with only one surviving joint cannot derive a non-degenerate
-  /// bbox. The helper must report `None` so the pose extractor skips
-  /// it instead of emitting a zero-extent box that the domain
-  /// validator would reject.
-  #[test]
-  fn pose_bbox_from_single_joint_yields_none() {
-    assert!(pose_bbox_from_joint_bounds(0.5, 0.5, 0.5, 0.5).is_none());
-  }
-
-  /// A pose where every joint shares the same x (perfectly vertical
-  /// limbs) has zero-width bbox and must be reported as `None`.
-  #[test]
-  fn pose_bbox_from_vertical_joints_yields_none() {
-    assert!(pose_bbox_from_joint_bounds(0.5, 0.1, 0.5, 0.9).is_none());
-  }
-
-  /// A pose where every joint shares the same y has zero-height bbox
-  /// and must be reported as `None`.
-  #[test]
-  fn pose_bbox_from_horizontal_joints_yields_none() {
-    assert!(pose_bbox_from_joint_bounds(0.1, 0.5, 0.9, 0.5).is_none());
-  }
-
-  /// A pose with at least one joint per axis produces a valid bbox.
-  #[test]
-  fn pose_bbox_from_diagonal_joints_is_valid() {
-    let bbox =
-      pose_bbox_from_joint_bounds(0.1, 0.2, 0.4, 0.6).expect("non-degenerate joints yield Some");
-    assert!((bbox.x() - 0.1).abs() < 1e-6);
-    assert!((bbox.y() - 0.2).abs() < 1e-6);
-    assert!((bbox.width() - 0.3).abs() < 1e-6);
-    assert!((bbox.height() - 0.4).abs() < 1e-6);
-    mediaschema::domain::aggregates::video::BoundingBox::try_new(
-      bbox.x(),
-      bbox.y(),
-      bbox.width(),
-      bbox.height(),
-    )
-    .expect("pose-derived bbox satisfies domain invariants");
-  }
-
-  /// Non-finite joint coordinates (NaN/Inf from a glitched Vision
-  /// observation) must short-circuit before reaching the
-  /// `BoundingBox::new` constructor.
-  #[test]
-  fn pose_bbox_from_nan_joints_yields_none() {
-    assert!(pose_bbox_from_joint_bounds(f32::NAN, 0.5, 0.5, 0.5).is_none());
-    assert!(pose_bbox_from_joint_bounds(0.1, 0.1, f32::INFINITY, 0.5).is_none());
-  }
-
-  /// A document quad whose corners survive per-coord clamp but
-  /// collapse to a degenerate shape (e.g. all four corners on a
-  /// vertical line because they all clamped to `x = 0.0`) must be
-  /// rejected by the domain validator, which the extractor runs
-  /// pre-emission.
-  #[test]
-  fn document_quad_with_collapsed_corners_is_rejected_by_domain() {
-    // All four corners at (0.0, 0.0) — collapsed quad.
-    let p = (0.0_f32, 0.0_f32);
-    assert!(
-      mediaschema::domain::aggregates::video::DocumentSegment::try_new(p, p, p, p, 0.9).is_err()
-    );
-  }
-
-  /// A bow-tie quad (TL & BR swapped) is self-intersecting; the
-  /// domain validator rejects it, so the extractor must skip it.
-  #[test]
-  fn document_quad_bowtie_is_rejected_by_domain() {
-    let tl = (0.1_f32, 0.1_f32);
-    let tr = (0.9_f32, 0.1_f32);
-    let br = (0.1_f32, 0.9_f32);
-    let bl = (0.9_f32, 0.9_f32);
-    assert!(
-      mediaschema::domain::aggregates::video::DocumentSegment::try_new(tl, tr, br, bl, 0.9)
-        .is_err()
-    );
-  }
-
-  /// A well-formed quad passes the domain validator and produces a
-  /// valid wire segment.
-  #[test]
-  fn document_quad_well_formed_is_accepted_by_domain() {
-    let tl = (0.1_f32, 0.1_f32);
-    let tr = (0.9_f32, 0.1_f32);
-    let br = (0.9_f32, 0.9_f32);
-    let bl = (0.1_f32, 0.9_f32);
-    mediaschema::domain::aggregates::video::DocumentSegment::try_new(tl, tr, br, bl, 0.9)
-      .expect("well-formed unit quad is valid");
-  }
-
-  // ──────────────── R6 fixes (codex round 6) ────────────────
-
-  /// `finite_f32` returns `Some(v)` only for finite inputs. NaN and
-  /// both infinities collapse to `None`.
-  #[test]
-  fn finite_f32_rejects_non_finite() {
-    assert_eq!(finite_f32(0.0), Some(0.0));
-    assert_eq!(finite_f32(-1.5), Some(-1.5));
-    assert_eq!(finite_f32(1.0), Some(1.0));
-    assert_eq!(finite_f32(f32::NAN), None);
-    assert_eq!(finite_f32(f32::INFINITY), None);
-    assert_eq!(finite_f32(f32::NEG_INFINITY), None);
-  }
-
-  /// `try_alloc_packed_mask` enforces a hard upper bound. A request
-  /// above `MAX_MASK_BYTES` returns `None` immediately without
-  /// touching the allocator, so a corrupted dimensions value cannot
-  /// drive the worker into the allocator's abort path.
-  #[test]
-  fn try_alloc_packed_mask_rejects_oversize() {
-    assert!(try_alloc_packed_mask(MAX_MASK_BYTES).is_some());
-    assert!(try_alloc_packed_mask(MAX_MASK_BYTES + 1).is_none());
-  }
-
-  /// Within the cap, `try_alloc_packed_mask` returns a zero-init
-  /// buffer of the requested length.
-  #[test]
-  fn try_alloc_packed_mask_zero_inits_at_requested_length() {
-    let buf = try_alloc_packed_mask(64).expect("64 byte allocation");
-    assert_eq!(buf.len(), 64);
-    assert!(buf.iter().all(|&b| b == 0));
-  }
-
-  /// `process_mask_bytes_u8` and `process_mask_bytes_f32` propagate
-  /// the bounded allocation: feeding dimensions whose product
-  /// exceeds the cap returns `None` instead of attempting the alloc.
-  /// We pick a dimension product just above `MAX_MASK_BYTES`. The
-  /// source slice need not be filled with content past the cap —
-  /// the function returns at the allocation step before reading any
-  /// pixel.
-  #[test]
-  fn process_mask_bytes_u8_caps_allocation() {
-    // (MAX_MASK_BYTES + 1) bytes of packed output. Choose dims that
-    // multiply to that value.
-    let width = MAX_MASK_BYTES + 1;
-    let height = 1;
-    // Empty src is fine — the function returns before reading it.
-    assert!(process_mask_bytes_u8(width, height, width, &[]).is_none());
-  }
-
-  /// Project a face-bbox-relative landmark point into the image's
-  /// normalized Vision coordinates. A landmark at the face's centre
-  /// (`0.5, 0.5` face-relative) on a face bbox of
-  /// `(origin = (0.2, 0.3), size = (0.4, 0.2))` (Vision lower-left)
-  /// projects to `(0.2 + 0.5 * 0.4, 0.3 + 0.5 * 0.2) = (0.4, 0.4)`.
-  #[test]
-  fn project_landmark_to_image_centres_landmark() {
-    let face = CGRect::new(CGPoint::new(0.2, 0.3), CGSize::new(0.4, 0.2));
-    let projected = project_landmark_to_image(CGPoint::new(0.5, 0.5), face);
-    assert!((projected.x - 0.4).abs() < 1e-9);
-    assert!((projected.y - 0.4).abs() < 1e-9);
-  }
-
-  /// Projection composes with the schema flip. A landmark at the
-  /// face's lower-left corner (`(0, 0)` face-relative) on a non-unit
-  /// face bbox lands at the face's lower-left in image-normalized
-  /// coords. After the schema-side y-flip, the schema-y equals
-  /// `1.0 - (face.origin.y + 0 * face.height)`.
-  #[test]
-  fn project_landmark_then_schema_flip_matches_face_corner() {
-    // Face bbox in Vision lower-left: origin (0.2, 0.3), size 0.4×0.2.
-    // Face's lower-left landmark = (0, 0) face-relative.
-    let face = CGRect::new(CGPoint::new(0.2, 0.3), CGSize::new(0.4, 0.2));
-    let projected = project_landmark_to_image(CGPoint::new(0.0, 0.0), face);
-    let (sx, sy) =
-      vision_point_to_schema(projected.x, projected.y).expect("projected lower-left is finite");
-    assert!((sx - 0.2).abs() < 1e-6, "schema-x: {sx}");
-    // Vision lower-left at face y = 0.3 → schema-y = 1.0 - 0.3 = 0.7.
-    assert!((sy - 0.7).abs() < 1e-6, "schema-y: {sy}");
-  }
-
-  /// A non-finite landmark component drops the offending point at
-  /// the schema-flip stage even when the face bbox is well-formed.
-  /// `project_landmark_to_image` propagates the non-finite component
-  /// (`0.2 + NaN * 0.4 = NaN`) and `vision_point_to_schema` rejects
-  /// it.
-  #[test]
-  fn projected_non_finite_landmark_is_rejected() {
-    let face = CGRect::new(CGPoint::new(0.2, 0.3), CGSize::new(0.4, 0.2));
-    let projected = project_landmark_to_image(CGPoint::new(f64::NAN, 0.5), face);
-    assert!(vision_point_to_schema(projected.x, projected.y).is_none());
-  }
-
-  // ──────────────── R7 fixes (codex round 7) ────────────────
-
-  /// `sanitize_capture_quality` distinguishes absent from corrupt:
-  /// `None` (Vision did not provide a value) collapses to `Some(0.0)`
-  /// — fail-closed against any positive threshold; `Some(non_finite)`
-  /// collapses to `None` so the caller drops the detection
-  /// unconditionally (any `min_capture_quality = 0.0` configuration
-  /// would otherwise admit a non-finite reading as a 0.0-quality
-  /// face).
-  #[test]
-  fn sanitize_capture_quality_absent_maps_to_zero() {
-    assert_eq!(sanitize_capture_quality(None), Some(0.0));
-  }
-
-  #[test]
-  fn sanitize_capture_quality_finite_passes_through() {
-    assert_eq!(sanitize_capture_quality(Some(0.75)), Some(0.75));
-    assert_eq!(sanitize_capture_quality(Some(0.0)), Some(0.0));
-    assert_eq!(sanitize_capture_quality(Some(1.0)), Some(1.0));
-  }
-
-  /// THE key regression: a non-finite captureQuality must NOT be
-  /// substituted with a real value. The previous R6 code returned
-  /// `unwrap_or(0.0)` which passed any `min_capture_quality = 0.0`
-  /// configuration and admitted the detection. `sanitize_capture_quality`
-  /// returns `None` so the caller's `let Some(_) = ... else { continue }`
-  /// drops the detection regardless of the configured threshold.
-  #[test]
-  fn sanitize_capture_quality_non_finite_returns_none() {
-    assert_eq!(sanitize_capture_quality(Some(f32::NAN)), None);
-    assert_eq!(sanitize_capture_quality(Some(f32::INFINITY)), None);
-    assert_eq!(sanitize_capture_quality(Some(f32::NEG_INFINITY)), None);
-  }
-
-  /// A finite body_height pairs with whatever height_estimation enum
-  /// Vision reported. The pair is forwarded unchanged.
-  #[test]
-  fn sanitize_body_height_pair_finite_preserves_estimation() {
-    let measured = BodyPose3DHeightEstimation::Measured;
-    let (h, e) = sanitize_body_height_pair(1.75, measured);
-    assert!((h - 1.75).abs() < 1e-6);
-    assert_eq!(e, measured);
-
-    let reference = BodyPose3DHeightEstimation::Reference;
-    let (h, e) = sanitize_body_height_pair(0.42, reference);
-    assert!((h - 0.42).abs() < 1e-6);
-    assert_eq!(e, reference);
-  }
-
-  /// THE key regression: when body_height is non-finite, the
-  /// estimation enum MUST be forced to UNKNOWN. Preserving
-  /// MEASURED/REFERENCE while substituting 0.0 would tell consumers
-  /// there is a known 0-metre subject — a worse semantic than
-  /// "unknown estimate".
-  #[test]
-  fn sanitize_body_height_pair_non_finite_forces_unknown() {
-    for raw in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-      // Even with a Measured input the result must be UNKNOWN.
-      let (h, e) = sanitize_body_height_pair(raw, BodyPose3DHeightEstimation::Measured);
-      assert_eq!(h, 0.0, "non-finite must collapse to 0.0 (raw = {raw:?})");
-      assert_eq!(
-        e,
-        BodyPose3DHeightEstimation::Unknown,
-        "non-finite must force UNKNOWN (raw = {raw:?})",
-      );
-      // Same for Reference.
-      let (h, e) = sanitize_body_height_pair(raw, BodyPose3DHeightEstimation::Reference);
-      assert_eq!(h, 0.0);
-      assert_eq!(e, BodyPose3DHeightEstimation::Unknown);
-    }
-  }
-
-  /// `validate_mask_dims_for_slice` rejects an output-payload that
-  /// would exceed `MAX_MASK_BYTES`, even when the source slice length
-  /// is small. This guards the bounded allocator from being asked
-  /// for an impossible amount.
-  #[test]
-  fn validate_mask_dims_rejects_oversize_output() {
-    assert!(validate_mask_dims_for_slice(MAX_MASK_BYTES, 1, 0).is_some());
-    assert!(validate_mask_dims_for_slice(MAX_MASK_BYTES + 1, 1, 0).is_none());
-  }
-
-  /// `validate_mask_dims_for_slice` rejects a source-slice length
-  /// over `isize::MAX`. This is the `from_raw_parts` contract; a
-  /// corrupted `CVPixelBuffer` reporting a huge `bytes_per_row *
-  /// height` must be dropped before the unsafe slice construction.
-  #[test]
-  fn validate_mask_dims_rejects_isize_overflow_source() {
-    assert!(validate_mask_dims_for_slice(1, 1, isize::MAX as usize).is_some());
-    assert!(validate_mask_dims_for_slice(1, 1, (isize::MAX as usize).wrapping_add(1)).is_none());
-  }
-
-  /// `width * height` overflow returns `None` (the `checked_mul`
-  /// inside).
-  #[test]
-  fn validate_mask_dims_rejects_dim_overflow() {
-    assert!(validate_mask_dims_for_slice(usize::MAX, 2, 0).is_none());
-  }
-
-  // ──────────────── R8 fixes (codex round 8) ────────────────
-
-  /// `validate_raw_slice_bytes` rejects payloads above the cap and
-  /// above `isize::MAX`, in either order. Re-uses `MAX_MASK_BYTES`
-  /// as a representative caller-side ceiling; the helper is generic
-  /// and the cap value itself is not load-bearing for this test.
-  #[test]
-  fn validate_raw_slice_bytes_rejects_over_cap() {
-    assert!(validate_raw_slice_bytes(0, MAX_MASK_BYTES).is_some());
-    assert!(validate_raw_slice_bytes(MAX_MASK_BYTES, MAX_MASK_BYTES).is_some());
-    assert!(validate_raw_slice_bytes(MAX_MASK_BYTES + 1, MAX_MASK_BYTES).is_none());
-  }
-
-  /// `validate_raw_slice_bytes` rejects `byte_len > isize::MAX` even
-  /// when the caller's cap is `usize::MAX` (i.e. no cap). This pins
-  /// the FFI-side `from_raw_parts` contract independently of the
-  /// caller-side ceiling.
-  #[test]
-  fn validate_raw_slice_bytes_rejects_isize_overflow() {
-    assert!(validate_raw_slice_bytes(isize::MAX as usize, usize::MAX).is_some());
-    assert!(validate_raw_slice_bytes((isize::MAX as usize).wrapping_add(1), usize::MAX).is_none());
-  }
-
-  /// `validate_raw_slice_elems::<CGPoint>` rejects element counts
-  /// above the caller-provided max regardless of the size_of math.
-  #[test]
-  fn validate_raw_slice_elems_rejects_over_cap() {
-    assert!(
-      validate_raw_slice_elems::<CGPoint>(MAX_LANDMARK_POINTS, MAX_LANDMARK_POINTS).is_some()
-    );
-    assert!(
-      validate_raw_slice_elems::<CGPoint>(MAX_LANDMARK_POINTS + 1, MAX_LANDMARK_POINTS).is_none()
-    );
-  }
-
-  /// `validate_raw_slice_elems::<u8>` rejects when `elem_count *
-  /// size_of::<T>()` overflows usize. For `T = u8` size_of is 1 so
-  /// the overflow surfaces only on the isize::MAX check.
-  #[test]
-  fn validate_raw_slice_elems_rejects_byte_overflow() {
-    // `usize::MAX / 2 + 2` * 16 (size_of CGPoint with two f64) overflows.
-    assert!(validate_raw_slice_elems::<CGPoint>(usize::MAX, usize::MAX).is_none());
-  }
-
-  /// The key R8 regression: a 2^24+1-pixel-wide mask with foreground
-  /// in the rightmost column previously produced `x = 1.0` with
-  /// positive width (because `f32` cannot distinguish `2^24` from
-  /// `2^24 + 1`). The f64-intermediate fix should now produce a
-  /// `[0, 1]`-valid bbox OR drop the detection — never emit
-  /// `x + width > 1.0`.
-  #[test]
-  fn normalized_bbox_handles_2pow24_plus_one_width() {
-    // 2^24 = 16,777,216. Pick a width slightly above the f32
-    // mantissa exhaustion point. Foreground = rightmost column.
-    let width: usize = (1 << 24) + 1;
-    let height: usize = 1;
-    let right_col = width - 1;
-    let bbox = normalized_bbox_from_pixel_bounds(right_col, 0, right_col, 0, width, height)
-      .expect("valid bbox at right edge");
-    // Without the f64 fix this would have been `x = 1.0`. With the
-    // fix `x = (2^24) / (2^24 + 1)` ≈ 0.99999994 (f32).
-    assert!(
-      bbox.x() < 1.0,
-      "x must remain strictly less than 1.0: {}",
-      bbox.x()
-    );
-    assert!(
-      bbox.width() > 0.0,
-      "positive foreground width: {}",
-      bbox.width()
-    );
-    // `x + width` MUST satisfy the schema `<= 1.0` invariant
-    // (in fact equals 1.0 modulo f32 representation).
-    let right_edge = bbox.x() + bbox.width();
-    assert!(
-      right_edge <= 1.0 + 1e-6,
-      "right edge exceeds image: {right_edge}"
-    );
-  }
-
-  /// The normalizer rejects degenerate input (width or height zero,
-  /// or max < min) by returning `None` rather than emitting a wire
-  /// bbox the domain validator would reject.
-  #[test]
-  fn normalized_bbox_rejects_degenerate_input() {
-    assert!(normalized_bbox_from_pixel_bounds(0, 0, 10, 10, 0, 100).is_none());
-    assert!(normalized_bbox_from_pixel_bounds(0, 0, 10, 10, 100, 0).is_none());
-    // max < min (corrupted input)
-    assert!(normalized_bbox_from_pixel_bounds(20, 0, 10, 10, 100, 100).is_none());
-  }
-
-  // ──────────────── R9 fixes (codex round 9) ────────────────
-
-  /// R8's f64 intermediate fixed the canonical 2^24+1 case but
-  /// codex round 9 surfaced that the SAME class returns at
-  /// 2^25+1 — `left = 2^25 / (2^25 + 1)` narrows to `1.0` in f32
-  /// while `width = 1 / (2^25 + 1)` remains positive. R9's
-  /// edge-based fix derives width as `right - left` AFTER both
-  /// narrow to f32, AND explicitly rejects `left >= 1.0` after
-  /// the narrow.
-  ///
-  /// Test inputs intentionally span the f32 mantissa-exhaustion
-  /// power-of-two boundaries (2^24, 2^25, 2^26) plus the cap
-  /// edge — every one must either emit a valid `[0, 1]` bbox OR
-  /// return `None`, never `x = 1.0` with positive width.
-  #[test]
-  fn normalized_bbox_handles_mantissa_exhaustion_boundaries() {
-    // Span the boundaries the codex finding called out.
-    for shift in 24u32..=25 {
-      let width: usize = (1 << shift) + 1;
-      let height: usize = 1;
-      let right_col = width - 1;
-      let result = normalized_bbox_from_pixel_bounds(right_col, 0, right_col, 0, width, height);
-      match result {
-        None => {
-          // Acceptable: the rounding pushed `left` to >= 1.0 and
-          // the explicit guard caught it. The detection is dropped,
-          // which is the safe semantic.
-        }
-        Some(bbox) => {
-          // If we DO emit a bbox, every invariant must hold —
-          // a `[0, 1]`-valid box with positive extent and a right
-          // edge that does not exceed the image.
-          assert!(
-            bbox.x() < 1.0,
-            "shift={shift}: x must be < 1.0, got {}",
-            bbox.x()
-          );
-          assert!(
-            bbox.width() > 0.0,
-            "shift={shift}: width must be > 0.0, got {}",
-            bbox.width()
-          );
-          // f32-safe right-edge check: edge computed directly,
-          // not as left + width.
-          let right_edge = bbox.x() + bbox.width();
-          assert!(
-            right_edge <= 1.0 + 1e-6,
-            "shift={shift}: right edge exceeds image: {right_edge}",
-          );
-        }
-      }
-    }
-  }
-
-  /// Same intent at width close to the 64 MiB cap (the largest
-  /// allowed width / height combination, where f32 precision
-  /// is most degraded).
-  #[test]
-  fn normalized_bbox_handles_max_mask_bytes_boundary() {
-    let width = MAX_MASK_BYTES; // 64 MiB worth of 1-row mask.
-    let height = 1usize;
-    let right_col = width - 1;
-    let result = normalized_bbox_from_pixel_bounds(right_col, 0, right_col, 0, width, height);
-    if let Some(bbox) = result {
-      assert!(
-        bbox.x() < 1.0,
-        "x must remain strictly less than 1.0: {}",
-        bbox.x()
-      );
-      assert!(
-        bbox.width() > 0.0,
-        "positive foreground width: {}",
-        bbox.width()
-      );
-      let right_edge = bbox.x() + bbox.width();
-      assert!(
-        right_edge <= 1.0 + 1e-6,
-        "right edge exceeds image: {right_edge}"
-      );
-    }
-    // `None` is also acceptable — see the previous test's rationale.
-  }
-
-  /// `max_x + 1 > width` (corrupted input) must return `None`.
-  #[test]
-  fn normalized_bbox_rejects_max_above_dimensions() {
-    // max_x = width - 1 is OK (right edge); max_x = width is corrupt.
-    assert!(normalized_bbox_from_pixel_bounds(0, 0, 100, 0, 100, 1).is_none());
-    assert!(normalized_bbox_from_pixel_bounds(0, 0, 0, 100, 1, 100).is_none());
-  }
-
-  /// Regression pin: `SimdFloat4x4::ENCODING` must format as
-  /// `{?=[4]}` to match Clang's `@encode(simd_float4x4)` and the
-  /// runtime metadata of `-[VNHumanBodyRecognizedPoint3D position]`.
-  /// The previous `Encoding::Unknown` element rendered as `{?=[4?]}`
-  /// and silently broke every msg_send for that selector under
-  /// `catch_unwind`. Pinning the string here so a future objc2
-  /// upgrade or accidental edit surfaces as a test failure.
-  #[test]
-  fn simd_float4x4_encoding_matches_clang_at_encode() {
-    assert_eq!(SimdFloat4::ENCODING.to_string(), "");
-    assert_eq!(SimdFloat4x4::ENCODING.to_string(), "{?=[4]}");
-  }
-
-  /// `guard_vision_ffi` passes a non-raising closure's value through
-  /// untouched (the common, no-exception path).
-  #[test]
-  fn guard_vision_ffi_returns_closure_value_when_no_exception() {
-    let got = guard_vision_ffi("test_detector", Vec::<u8>::new(), || vec![1u8, 2, 3]);
-    assert_eq!(got, vec![1u8, 2, 3]);
-  }
-
-  /// The core of the process-abort fix: a real Objective-C `NSException`
-  /// raised inside the guarded closure is caught and converted to the
-  /// `fallback`, NOT propagated. `std::panic::catch_unwind` cannot do
-  /// this — a foreign exception escaping it aborts the process with
-  /// `fatal runtime error: Rust cannot catch foreign exceptions`.
-  ///
-  /// `-[NSArray objectAtIndex:]` on an empty array raises
-  /// `NSRangeException` — a genuine foreign exception via a *valid*
-  /// selector, so objc2's debug-build msg_send verification passes and
-  /// the runtime raises for real in BOTH debug and release builds
-  /// (unlike the encoding-mismatched `VNHumanBodyRecognizedPoint3D`
-  /// selector, which only raises in release). If `guard_vision_ffi`
-  /// did not wrap the call in `objc2::exception::catch`, this test
-  /// would abort the whole test binary instead of returning.
-  #[test]
-  fn guard_vision_ffi_catches_objc_exception_and_returns_fallback() {
-    let empty: Retained<NSArray<objc2::runtime::NSObject>> = NSArray::new();
-    let got = guard_vision_ffi("test_detector", 7u32, || {
-      // Out-of-bounds access raises NSRangeException across the FFI.
-      let _ = empty.objectAtIndex(0);
-      0u32
-    });
-    assert_eq!(
-      got, 7u32,
-      "guard must return the fallback after catching the NSException"
-    );
   }
 }

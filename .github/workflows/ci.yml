@@ -25,8 +25,8 @@ env:
   RUST_BACKTRACE: 1
 
 # avanalyze is a macOS-only Apple Vision wrapper — every Vision call is
-# `cfg(target_os = "macos")`-gated and the non-macOS surface is a structured
-# `ErrorCode::AppleVisionFailed` stub. So:
+# `cfg(target_vendor = "apple")`-gated and the non-macOS surface is a structured
+# `AnalyzeErrorKind::Unsupported` stub. So:
 #
 # - macOS jobs run the real test surface (clippy, tests, doc, feature matrix).
 # - Linux job verifies the cfg-gated stub still compiles — keeps the crate

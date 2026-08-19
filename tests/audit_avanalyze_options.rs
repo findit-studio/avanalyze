@@ -1,7 +1,7 @@
 //! AUDIT: Options exhaustive coverage (R26-R27)
 //!
 //! Tests every Options struct: defaults, builder, setter, accessor,
-//! const fn, Copy/Clone, Debug, and ServiceOptions composition.
+//! const fn, Copy/Clone, Debug, and AnalyzeOptions composition.
 
 #![allow(unused_imports)]
 
@@ -381,36 +381,36 @@ fn person_segmentation_builder() {
   assert_eq!(o.min_confidence(), 0.7);
 }
 
-// ===== R27: ServiceOptions composition =====
+// ===== R27: AnalyzeOptions composition =====
 
 #[test]
 fn service_options_default_num_workers() {
-  let o = ServiceOptions::new();
+  let o = AnalyzeOptions::new();
   assert_eq!(o.num_workers(), 1);
 }
 
 #[test]
 fn service_options_num_workers_zero_coerces_to_one() {
-  let o = ServiceOptions::new().with_workers(0);
+  let o = AnalyzeOptions::new().with_workers(0);
   assert_eq!(o.num_workers(), 1, "num_workers=0 must coerce to 1");
 }
 
 #[test]
 fn service_options_set_workers_zero_coerces() {
-  let mut o = ServiceOptions::new();
+  let mut o = AnalyzeOptions::new();
   o.set_workers(0);
   assert_eq!(o.num_workers(), 1);
 }
 
 #[test]
 fn service_options_num_workers_large() {
-  let o = ServiceOptions::new().with_workers(64);
+  let o = AnalyzeOptions::new().with_workers(64);
   assert_eq!(o.num_workers(), 64);
 }
 
 #[test]
 fn service_options_all_sub_option_accessors() {
-  let o = ServiceOptions::new();
+  let o = AnalyzeOptions::new();
   // Verify every sub-option accessor returns without panicking
   let _ = o.classifications();
   let _ = o.face_capture();
@@ -435,7 +435,7 @@ fn service_options_all_sub_option_accessors() {
 
 #[test]
 fn service_options_mut_accessors_modify() {
-  let mut o = ServiceOptions::new();
+  let mut o = AnalyzeOptions::new();
   o.classifications_mut().set_min_confidence(0.9);
   assert_eq!(o.classifications().min_confidence(), 0.9);
   o.face_capture_mut().set_min_capture_quality(0.5);
@@ -455,21 +455,21 @@ fn service_options_mut_accessors_modify() {
 
 #[test]
 fn service_options_clone() {
-  let o = ServiceOptions::new().with_workers(4);
+  let o = AnalyzeOptions::new().with_workers(4);
   let o2 = o.clone();
   assert_eq!(o.num_workers(), o2.num_workers());
 }
 
 #[test]
 fn service_options_debug() {
-  let o = ServiceOptions::new();
+  let o = AnalyzeOptions::new();
   let dbg = format!("{o:?}");
-  assert!(dbg.contains("ServiceOptions"));
+  assert!(dbg.contains("AnalyzeOptions"));
 }
 
 #[test]
 fn service_options_default_trait() {
-  let o = ServiceOptions::default();
+  let o = AnalyzeOptions::default();
   assert_eq!(o.num_workers(), 1);
 }
 
