@@ -34,7 +34,7 @@ pub struct Analysis<D: Detections> {
   person_instance_masks: Vec<D::PersonInstanceMaskDetection>,
   person_segmentation_masks: Vec<D::PersonSegmentationMask>,
   animal_subjects: Vec<D::SubjectDetection>,
-  animal_body_poses: Vec<D::BodyPoseDetection>,
+  animal_body_poses: Vec<D::AnimalPoseDetection>,
   text_detections: Vec<D::TextDetection>,
   barcodes: Vec<D::BarcodeDetection>,
   attention_saliency: Vec<D::SaliencyRegion>,
@@ -163,11 +163,12 @@ impl<D: Detections> Analysis<D> {
     animal_subjects, animal_subjects_mut, set_animal_subjects, with_animal_subjects:
       D::SubjectDetection;
 
-    /// Animal 2-D body poses. Same type as
-    /// [`body_poses`](Analysis::body_poses) — the slot is what
-    /// distinguishes animal from human.
+    /// Animal 2-D body poses. Its own bundle seat rather than a second
+    /// use of [`body_poses`](Analysis::body_poses)' type: an animal
+    /// skeleton's joints are a different roster from a human's, so the
+    /// two poses are only the same type if the vocabulary says so.
     animal_body_poses, animal_body_poses_mut, set_animal_body_poses,
-      with_animal_body_poses: D::BodyPoseDetection;
+      with_animal_body_poses: D::AnimalPoseDetection;
 
     /// Recognised text runs. One Vision observation can contribute
     /// several candidates, all sharing that observation's box.
@@ -270,6 +271,7 @@ where
   D::BodyPoseDetection: fmt::Debug,
   D::HandPoseDetection: fmt::Debug,
   D::BodyPose3DDetection: fmt::Debug,
+  D::AnimalPoseDetection: fmt::Debug,
   D::PersonInstanceMaskDetection: fmt::Debug,
   D::PersonSegmentationMask: fmt::Debug,
   D::TextDetection: fmt::Debug,

@@ -50,10 +50,13 @@ fn interior_bbox<B: BoundingBox>() -> B {
   }
 }
 
-fn joint_2d<J: BodyPoseJoint>() -> J {
+/// Builds the in-range 2-D joint the pose family reuses. `seat` names
+/// the bundle slot the type came from: the three 2-D joint seats are
+/// three independent types, so a failure has to say which one refused.
+fn joint_2d<J: BodyPoseJoint>(seat: &str) -> J {
   match J::try_new("neck", 0.5, 0.5, 0.5) {
     Ok(joint) => joint,
-    Err(_) => panic!("BodyPoseJoint::try_new refused an in-range joint"),
+    Err(_) => panic!("BodyPoseJoint::try_new refused an in-range joint (seat: {seat})"),
   }
 }
 
@@ -141,47 +144,69 @@ pub fn assert_faces_accept<D: Detections>() {
   );
 }
 
-/// The four pose shapes, including 3-D's metre-scale coordinates and
-/// the coupled `(0.0, Unknown)` height fallback.
+/// The four pose shapes, each over its own joint seat — including
+/// 3-D's metre-scale coordinates and the coupled `(0.0, Unknown)`
+/// height fallback.
+///
+/// The seats are exercised one by one because the bundle no longer
+/// collapses them: a vocabulary may name four distinct joint types, and
+/// each must accept what its own extractor emits.
 pub fn assert_poses_accept<D: Detections>() {
-  let joint = joint_2d::<D::BodyPoseJoint>();
+  let joint = joint_2d::<D::BodyJoint>("Detections::BodyJoint");
   assert_eq!(
     joint.name(),
     "neck",
-    "BodyPoseJoint::name must read back what it was built from — the engine sorts on it"
+    "BodyJoint's name must read back what it was built from — the engine sorts on it"
   );
   assert!(
     D::BodyPoseDetection::try_new(interior_bbox::<D::BoundingBox>(), 0.0, vec![joint]).is_ok(),
     "BodyPoseDetection::try_new must accept a zero-confidence pose"
   );
 
+  let joint = joint_2d::<D::AnimalJoint>("Detections::AnimalJoint");
+  assert_eq!(
+    joint.name(),
+    "neck",
+    "AnimalJoint's name must read back what it was built from — the engine sorts on it"
+  );
+  assert!(
+    D::AnimalPoseDetection::try_new(interior_bbox::<D::BoundingBox>(), 0.0, vec![joint]).is_ok(),
+    "AnimalPoseDetection::try_new must accept a zero-confidence pose"
+  );
+
+  let joint = joint_2d::<D::HandJoint>("Detections::HandJoint");
+  assert_eq!(
+    joint.name(),
+    "neck",
+    "HandJoint's name must read back what it was built from — the engine sorts on it"
+  );
   for chirality in [Chirality::Unknown, Chirality::Left, Chirality::Right] {
     assert!(
       D::HandPoseDetection::try_new(
         interior_bbox::<D::BoundingBox>(),
         0.0,
         chirality,
-        vec![joint_2d::<D::BodyPoseJoint>()],
+        vec![joint_2d::<D::HandJoint>("Detections::HandJoint")],
       )
       .is_ok(),
       "HandPoseDetection::try_new must accept every chirality"
     );
   }
 
-  let Ok(joint_3d) = D::BodyPose3DJoint::try_new("root", -1.5, 2.5, 0.75, 0.5) else {
-    panic!("BodyPose3DJoint::try_new refused model-space metres — 3-D joints are not normalized");
+  let Ok(joint_3d) = D::Body3Joint::try_new("root", -1.5, 2.5, 0.75, 0.5) else {
+    panic!("Body3Joint::try_new refused model-space metres — 3-D joints are not normalized");
   };
   assert_eq!(
     joint_3d.name(),
     "root",
-    "BodyPose3DJoint::name must read back what it was built from — the engine sorts on it"
+    "Body3Joint's name must read back what it was built from — the engine sorts on it"
   );
   assert!(
     D::BodyPose3DDetection::try_new(0.5, 1.75, HeightEstimation::Measured, vec![joint_3d]).is_ok(),
     "BodyPose3DDetection::try_new must accept a measured height in metres"
   );
-  let Ok(joint_3d) = D::BodyPose3DJoint::try_new("root", 0.0, 0.0, 0.0, 0.0) else {
-    panic!("BodyPose3DJoint::try_new refused a zeroed joint");
+  let Ok(joint_3d) = D::Body3Joint::try_new("root", 0.0, 0.0, 0.0, 0.0) else {
+    panic!("Body3Joint::try_new refused a zeroed joint");
   };
   assert!(
     D::BodyPose3DDetection::try_new(0.0, 0.0, HeightEstimation::Unknown, vec![joint_3d]).is_ok(),
@@ -314,18 +339,30 @@ pub fn assert_confidence_refusals<D: Detections>() {
 
 /// Normalized coordinates must be finite and inside `0.0..=1.0`.
 /// 3-D joints are exempt: they are model-space metres.
+///
+/// All three 2-D joint seats are checked: they may be three distinct
+/// types, and a validating vocabulary that guards only one of them
+/// leaves the other two open.
 pub fn assert_coordinate_refusals<D: Detections>() {
-  assert!(
-    D::BodyPoseJoint::try_new("neck", f32::NAN, 0.5, 0.5).is_err(),
-    "BodyPoseJoint::try_new must refuse a non-finite coordinate"
-  );
-  assert!(
-    D::BodyPoseJoint::try_new("neck", 1.5, 0.5, 0.5).is_err(),
-    "BodyPoseJoint::try_new must refuse a coordinate outside 0.0..=1.0"
-  );
+  assert_joint_2d_coordinate_refusals::<D::BodyJoint>("Detections::BodyJoint");
+  assert_joint_2d_coordinate_refusals::<D::HandJoint>("Detections::HandJoint");
+  assert_joint_2d_coordinate_refusals::<D::AnimalJoint>("Detections::AnimalJoint");
   assert!(
     D::FaceLandmarkRegion::try_new("nose", &[(0.5, 0.5), (f32::NAN, 0.5)]).is_err(),
     "FaceLandmarkRegion::try_new must refuse a non-finite point"
+  );
+}
+
+/// One 2-D joint seat's coordinate refusals, named by the seat it came
+/// from.
+fn assert_joint_2d_coordinate_refusals<J: BodyPoseJoint>(seat: &str) {
+  assert!(
+    J::try_new("neck", f32::NAN, 0.5, 0.5).is_err(),
+    "BodyPoseJoint::try_new must refuse a non-finite coordinate (seat: {seat})"
+  );
+  assert!(
+    J::try_new("neck", 1.5, 0.5, 0.5).is_err(),
+    "BodyPoseJoint::try_new must refuse a coordinate outside 0.0..=1.0 (seat: {seat})"
   );
 }
 
