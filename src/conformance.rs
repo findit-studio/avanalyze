@@ -122,28 +122,29 @@ pub fn assert_detection_accepts<D: Detections>() {
   let _ = D::SubjectDetection::new(detection, interior_bbox::<D::BoundingBox>());
 }
 
-/// Faces, including the `0.0` capture quality the engine writes for a
-/// face the capture-quality pass did not cover, signed pose angles,
-/// and the pose-angle absence the contract seat exists to represent.
+/// Faces: capture quality's three-way truth (`Some(q)` measured,
+/// `Some(0.0)` measured-and-terrible, `None` never measured), signed
+/// pose angles, and the pose-angle absence the contract seat exists to
+/// represent.
 pub fn assert_faces_accept<D: Detections>() {
   assert!(
     D::FaceDetection::try_new(
       interior_bbox::<D::BoundingBox>(),
       1.0,
-      0.0,
+      None,
       Some(-0.5),
       Some(0.25),
       Some(3.0),
     )
     .is_ok(),
-    "FaceDetection::try_new must accept an unmatched capture quality (0.0) and signed \
-     roll/yaw/pitch radians"
+    "FaceDetection::try_new must accept a face the capture-quality pass never covered — \
+     `None`, not `Some(0.0)` — alongside signed roll/yaw/pitch radians"
   );
   assert!(
     D::FaceDetection::try_new(
       interior_bbox::<D::BoundingBox>(),
       1.0,
-      0.0,
+      Some(0.0),
       None,
       None,
       None
@@ -156,7 +157,7 @@ pub fn assert_faces_accept<D: Detections>() {
     D::FaceDetection::try_new(
       interior_bbox::<D::BoundingBox>(),
       1.0,
-      0.0,
+      Some(0.0),
       Some(0.0),
       None,
       Some(-1.2),
@@ -164,6 +165,28 @@ pub fn assert_faces_accept<D: Detections>() {
     .is_ok(),
     "FaceDetection::try_new must accept angles that are present, absent, and genuinely \
      zero on the SAME face — Vision reports roll/yaw/pitch independently"
+  );
+  let measured = D::FaceDetection::try_new(
+    interior_bbox::<D::BoundingBox>(),
+    1.0,
+    Some(0.0),
+    Some(0.1),
+    Some(0.1),
+    Some(0.1),
+  );
+  let unmatched = D::FaceDetection::try_new(
+    interior_bbox::<D::BoundingBox>(),
+    1.0,
+    None,
+    Some(0.1),
+    Some(0.1),
+    Some(0.1),
+  );
+  assert!(
+    measured.is_ok() && unmatched.is_ok(),
+    "FaceDetection::try_new must accept a measured-and-terrible face (`Some(0.0)`) and an \
+     unmatched face (`None`) as independently representable values in the SAME detection \
+     set — the two must never collapse to the same wire value"
   );
 
   let points = [(0.0_f32, 0.0_f32), (1.0, 1.0), (0.42, 0.13)];

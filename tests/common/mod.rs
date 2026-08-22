@@ -65,7 +65,7 @@ pub struct Subject {
 pub struct Face {
   pub bbox: Bbox,
   pub confidence: f32,
-  pub capture_quality: f32,
+  pub capture_quality: Option<f32>,
   pub roll: Option<f32>,
   pub yaw: Option<f32>,
   pub pitch: Option<f32>,
@@ -269,7 +269,7 @@ impl FaceDetection for Face {
   fn try_new(
     bbox: Self::BoundingBox,
     confidence: f32,
-    capture_quality: f32,
+    capture_quality: Option<f32>,
     roll: Option<f32>,
     yaw: Option<f32>,
     pitch: Option<f32>,

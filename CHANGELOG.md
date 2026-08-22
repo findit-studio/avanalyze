@@ -2,7 +2,8 @@
 
 ## Unreleased
 
-Face-pose angles stop pretending "not computed" is "measured level."
+Face-pose angles and capture quality stop pretending "not measured" is
+"measured at zero."
 
 ### Breaking
 
@@ -29,6 +30,32 @@ Face-pose angles stop pretending "not computed" is "measured level."
   boundary — a limitation of the pinned dependency, not a reopening of this
   crate's loss. `mediaschema` / `mediagraph` adopt the `Option` shape in
   their own knife once this publishes.
+- **`FaceDetection::try_new`'s `capture_quality` becomes `Option<f32>`** —
+  the same collapse, found in the same #18 census, fixed in the same window
+  (#20). `sanitize_capture_quality` no longer maps a nil Vision reading to
+  `Some(0.0)`, and `matched_capture_quality` no longer annotates a face the
+  capture-quality pass never covered with `0.0`; both now produce `None`.
+  `Some(0.0)` means Vision measured this face's capture quality and found it
+  terrible; `None` means Vision never measured it, whether the raw reading
+  was nil or no capture-quality observation overlapped the face's box (a
+  join-miss). The two were previously indistinguishable downstream — a
+  consumer filtering "quality below X" could not tell a genuinely
+  zero-scored face from one the quality pass skipped entirely.
+- `extract_faces`'s `min_capture_quality` filter keeps its prior observable
+  behaviour: an unmeasured face still compares as `0.0` against the
+  threshold, so the default (0.1) still drops it and `min_capture_quality
+  == 0.0` still keeps it. What changes is what a face that DOES clear the
+  filter unmeasured now carries to the contract seat: `None`, not
+  `Some(0.0)`.
+- `conformance::assert_faces_accept` follows the seat: it passes
+  `Option<f32>` for capture quality and gains an unmatched (`None`) case
+  plus a mixed case — a measured-and-terrible (`Some(0.0)`) face and an
+  unmatched (`None`) face built in the same detection set, proving the two
+  remain independently representable.
+- `tests/common::Face` stores `capture_quality` as `Option<f32>` and
+  round-trips the absence; `src/tests/reference.rs`'s `mediaschema`-backed
+  adapter collapses `None` to `0.0` at the same pinned-dependency boundary
+  as the angles, for the same reason.
 
 **Semver.** This breaks a published API — 0.3.0 is on crates.io — so it
 rides the next breaking line (0.4.0). The version is not bumped here; the

@@ -135,8 +135,17 @@ pub trait SubjectDetection: Sized {
 ///
 /// `capture_quality` does **not** come from the same Vision
 /// observation as `bbox`: the engine runs a separate capture-quality
-/// pass and joins it to the detection spine by box overlap, using
-/// `0.0` for a face the quality pass did not cover.
+/// pass and joins it to the detection spine by box overlap.
+/// `capture_quality` is an `Option<f32>` representing the three states
+/// that join can produce: `Some(q)` — Vision measured this face's
+/// capture quality and reported `q`; `Some(0.0)` — Vision measured it
+/// and found it terrible, a real zero reading; `None` — Vision never
+/// measured this face's capture quality at all, whether because the
+/// raw reading was nil or because no capture-quality observation
+/// overlapped this face's box (a join-miss). `Some(0.0)` and `None`
+/// are not interchangeable: collapsing `None` to `Some(0.0)` tells
+/// every "quality below X" query that a face the quality pass never
+/// covered was scored at the worst possible value.
 ///
 /// `roll` / `yaw` / `pitch` are each an `Option<f32>` in radians.
 /// Vision estimates the three independently, and which it reports
@@ -152,12 +161,14 @@ pub trait FaceDetection: Sized {
   /// The geometry type this face is built from.
   type BoundingBox: BoundingBox;
 
-  /// Builds a face detection. `roll` / `yaw` / `pitch` are `None`
-  /// where Vision did not compute that angle.
+  /// Builds a face detection. `capture_quality` is `None` where
+  /// Vision never measured this face's capture quality; `roll` /
+  /// `yaw` / `pitch` are `None` where Vision did not compute that
+  /// angle.
   fn try_new(
     bbox: Self::BoundingBox,
     confidence: f32,
-    capture_quality: f32,
+    capture_quality: Option<f32>,
     roll: Option<f32>,
     yaw: Option<f32>,
     pitch: Option<f32>,
