@@ -1248,18 +1248,21 @@ impl VisionAnalyzer {
       if capture_quality < capture_opts.min_capture_quality() {
         continue;
       }
+      // `None` at every stage means the same thing to a consumer: no
+      // usable angle. Vision omitting the `NSNumber?` entirely and
+      // Vision reporting a non-finite reading both collapse to `None`
+      // here, and neither is defaulted to `0.0` — that default is
+      // exactly the collapse this seat exists to stop making (see
+      // `contract::FaceDetection`).
       let roll = unsafe { obs.roll() }
         .map(|v| v.floatValue())
-        .and_then(finite_f32)
-        .unwrap_or(0.0);
+        .and_then(finite_f32);
       let yaw = unsafe { obs.yaw() }
         .map(|v| v.floatValue())
-        .and_then(finite_f32)
-        .unwrap_or(0.0);
+        .and_then(finite_f32);
       let pitch = unsafe { obs.pitch() }
         .map(|v| v.floatValue())
-        .and_then(finite_f32)
-        .unwrap_or(0.0);
+        .and_then(finite_f32);
       if let Ok(face) =
         D::FaceDetection::try_new(bbox, confidence, capture_quality, roll, yaw, pitch)
       {

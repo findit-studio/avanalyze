@@ -66,9 +66,9 @@ pub struct Face {
   pub bbox: Bbox,
   pub confidence: f32,
   pub capture_quality: f32,
-  pub roll: f32,
-  pub yaw: f32,
-  pub pitch: f32,
+  pub roll: Option<f32>,
+  pub yaw: Option<f32>,
+  pub pitch: Option<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -270,9 +270,9 @@ impl FaceDetection for Face {
     bbox: Self::BoundingBox,
     confidence: f32,
     capture_quality: f32,
-    roll: f32,
-    yaw: f32,
-    pitch: f32,
+    roll: Option<f32>,
+    yaw: Option<f32>,
+    pitch: Option<f32>,
   ) -> Result<Self, Self::Error> {
     Ok(Self {
       bbox,

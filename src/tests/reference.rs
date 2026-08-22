@@ -69,6 +69,14 @@ impl SubjectDetection for ms::SubjectDetection {
   }
 }
 
+/// `mediaschema` 0.2.1 has no seat for pose-angle absence — its own
+/// `FaceDetection::try_new` takes plain `f32`. Collapsing `None` to
+/// `0.0` here is this ONE reference vocabulary's limitation, not a
+/// reopening of the loss `contract::FaceDetection` exists to close:
+/// the engine now hands this impl a real `Option<f32>`, and a
+/// vocabulary that CAN represent the absence (`tests/common::Face`)
+/// receives it intact. `mediaschema` / `mediagraph` adopt the
+/// `Option` shape in their own knife once this crate's 0.4 publishes.
 impl FaceDetection for ms::FaceDetection {
   type Error = DetectionError;
   type BoundingBox = ms::BoundingBox;
@@ -77,11 +85,18 @@ impl FaceDetection for ms::FaceDetection {
     bbox: Self::BoundingBox,
     confidence: f32,
     capture_quality: f32,
-    roll: f32,
-    yaw: f32,
-    pitch: f32,
+    roll: Option<f32>,
+    yaw: Option<f32>,
+    pitch: Option<f32>,
   ) -> Result<Self, Self::Error> {
-    ms::FaceDetection::try_new(bbox, confidence, capture_quality, roll, yaw, pitch)
+    ms::FaceDetection::try_new(
+      bbox,
+      confidence,
+      capture_quality,
+      roll.unwrap_or(0.0),
+      yaw.unwrap_or(0.0),
+      pitch.unwrap_or(0.0),
+    )
   }
 }
 
