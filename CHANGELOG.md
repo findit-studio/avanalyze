@@ -1,5 +1,54 @@
 # Changelog
 
+## Unreleased
+
+The joint seats stop pretending the four skeletons are one.
+
+### Breaking
+
+- **The `Detections` bundle names four joint types where it named two.**
+  `BodyPoseJoint` and `BodyPose3DJoint` give way to `BodyJoint`, `HandJoint`,
+  `AnimalJoint` and `Body3Joint`, and every pose seat binds its own: body poses
+  collect `BodyJoint`, hand poses `HandJoint`, animal poses `AnimalJoint`, 3-D
+  poses `Body3Joint`. The old single 2-D seat asserted an identity that does not
+  exist — Apple names a different joint roster for each skeleton — and so forced
+  a vocabulary that models them as three types to collapse them into one. The
+  compile-time same-source guarantee is untouched *within* a skeleton family and
+  gone across families, which is where it never belonged.
+- **New bundle seat: `AnimalPoseDetection`.** Animal 2-D poses had been reusing
+  `BodyPoseDetection`'s type; they get their own seat over the same
+  `BodyPoseDetection` trait — one trait because the payload is one, two seats
+  because the joints are two. `Analysis::animal_body_poses` and its four
+  accessors are typed `D::AnimalPoseDetection`.
+- **`Detections` therefore names twenty-two output types, up from nineteen.**
+  The per-part trait set is unchanged at nineteen: no trait was added, renamed,
+  or reshaped — only the bundle's seats and the equalities between them moved.
+
+Migrating a vocabulary that already models one joint type per skeleton is a set
+of renames. A vocabulary with a single joint type names it in all three 2-D
+seats, names one pose type in both 2-D pose seats, and keeps compiling: the
+contract still *permits* the identity, it merely stops *imposing* it. The
+reference implementation in `src/tests/reference.rs` is exactly that case.
+
+**Semver.** This breaks a published API — 0.2.0 is on crates.io — so it rides a
+**0.3.0**. The version is not bumped here; the release stamp is its own commit.
+
+### Changed
+
+- `conformance::assert_poses_accept` exercises the four joint seats one by one,
+  and `assert_coordinate_refusals` now checks all three 2-D seats — a validating
+  vocabulary that guards only one joint type hears about the other two. Both
+  panic with the seat that refused, not just the trait.
+- `tests/common`, the vocabulary written from outside the crate, names four
+  genuinely distinct joint types, so the decoupling is compiled rather than
+  merely asserted.
+
+### Unchanged
+
+Engine behaviour is preserved verbatim: the same Vision passes, the same
+filtering, the same joint sort, the same eighteen `Analysis` slots. Only which
+type each joint is built into changed.
+
 ## 0.2.0 — 2026-08-20
 
 The engine stops assembling and stops depending.

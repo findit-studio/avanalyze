@@ -194,7 +194,13 @@ pub trait FaceLandmarksDetection: Sized {
   ) -> Result<Self, Self::Error>;
 }
 
-/// One 2-D pose joint — shared by body, hand, and animal poses.
+/// One 2-D pose joint — the shape body, hand, and animal joints share.
+///
+/// The shape is shared; the vocabularies are not. Apple names a
+/// different joint set per skeleton, so the bundle seats them
+/// separately — [`Detections::BodyJoint`], [`Detections::HandJoint`],
+/// [`Detections::AnimalJoint`]. A vocabulary that keeps one joint type
+/// for all three is still legal: it names that type three times.
 ///
 /// The name is Apple's joint identifier, verbatim. The engine sorts
 /// joints by this name before building the enclosing pose, because
@@ -212,7 +218,12 @@ pub trait BodyPoseJoint: Sized {
   fn name(&self) -> &str;
 }
 
-/// A 2-D pose — used for human bodies and for animal bodies alike.
+/// A 2-D pose — the shape human bodies and animal bodies share.
+///
+/// The two are separate bundle seats
+/// ([`Detections::BodyPoseDetection`] and
+/// [`Detections::AnimalPoseDetection`]) because they collect different
+/// joints; the trait is one because the payload is.
 ///
 /// Vision does not report a box for a pose. The engine synthesises one
 /// from the bounds of the joints that survived filtering, so the box
@@ -237,6 +248,10 @@ pub trait BodyPoseDetection: Sized {
 }
 
 /// One 3-D body-pose joint.
+///
+/// A vocabulary of its own, seated as [`Detections::Body3Joint`]: the
+/// 3-D skeleton is neither the 2-D body's joint set nor its coordinate
+/// system.
 ///
 /// `x` / `y` / `z` are model-space **metres**, not normalized
 /// coordinates: no flip, no clamp, no `0.0..=1.0` invariant. Only
@@ -278,9 +293,11 @@ pub trait BodyPose3DDetection: Sized {
 
 /// A hand pose.
 ///
-/// Reuses [`BodyPoseJoint`] — Apple's hand joints differ from body
-/// joints only by name — and, like [`BodyPoseDetection`], carries a
-/// box synthesised from the surviving joints.
+/// Built from [`BodyPoseJoint`]s of its own kind — Apple's hand joint
+/// set is a different vocabulary from the body's, which is why the
+/// bundle seats it as [`Detections::HandJoint`] — and, like
+/// [`BodyPoseDetection`], carries a box synthesised from the surviving
+/// joints.
 pub trait HandPoseDetection: Sized {
   /// Why a pose was refused.
   type Error;
@@ -451,9 +468,18 @@ pub trait Aesthetics: Sized {
 /// Implement this on a unit struct that ties together the types you
 /// want the engine to build. The associated-type bounds force the
 /// parts to agree — a face and a saliency region must be built from
-/// the *same* `BoundingBox`, a hand pose and a body pose from the same
-/// joint — so a mismatched bundle is a compile error rather than a
-/// runtime surprise.
+/// the *same* `BoundingBox`, and every pose is built from *its own
+/// skeleton's* joint — so a mismatched bundle is a compile error
+/// rather than a runtime surprise.
+///
+/// The joint guarantee is per skeleton family, not across families.
+/// Apple's four joint rosters are four different sets, so a body joint
+/// and a hand joint are not required to be the same type: body poses
+/// collect [`BodyJoint`](Detections::BodyJoint), hand poses
+/// [`HandJoint`](Detections::HandJoint), animal poses
+/// [`AnimalJoint`](Detections::AnimalJoint), 3-D poses
+/// [`Body3Joint`](Detections::Body3Joint). A vocabulary with one joint
+/// type for every skeleton names it in every seat and loses nothing.
 pub trait Detections {
   /// Geometry shared by every boxed detection.
   type BoundingBox: BoundingBox;
@@ -468,16 +494,24 @@ pub trait Detections {
   type FaceLandmarkRegion: FaceLandmarkRegion;
   /// A face and its landmark regions.
   type FaceLandmarksDetection: FaceLandmarksDetection<BoundingBox = Self::BoundingBox, Region = Self::FaceLandmarkRegion>;
-  /// One 2-D joint, shared by body, hand, and animal poses.
-  type BodyPoseJoint: BodyPoseJoint;
-  /// Human and animal 2-D poses.
-  type BodyPoseDetection: BodyPoseDetection<BoundingBox = Self::BoundingBox, Joint = Self::BodyPoseJoint>;
+  /// One joint of the human 2-D body skeleton.
+  type BodyJoint: BodyPoseJoint;
+  /// Human 2-D poses.
+  type BodyPoseDetection: BodyPoseDetection<BoundingBox = Self::BoundingBox, Joint = Self::BodyJoint>;
+  /// One joint of the hand skeleton.
+  type HandJoint: BodyPoseJoint;
   /// Hand poses.
-  type HandPoseDetection: HandPoseDetection<BoundingBox = Self::BoundingBox, Joint = Self::BodyPoseJoint>;
-  /// One 3-D joint, in model-space metres.
-  type BodyPose3DJoint: BodyPose3DJoint;
+  type HandPoseDetection: HandPoseDetection<BoundingBox = Self::BoundingBox, Joint = Self::HandJoint>;
+  /// One joint of the animal 2-D body skeleton.
+  type AnimalJoint: BodyPoseJoint;
+  /// Animal 2-D poses. Same trait as
+  /// [`BodyPoseDetection`](Detections::BodyPoseDetection), its own
+  /// seat: the joint rosters differ.
+  type AnimalPoseDetection: BodyPoseDetection<BoundingBox = Self::BoundingBox, Joint = Self::AnimalJoint>;
+  /// One joint of the 3-D body skeleton, in model-space metres.
+  type Body3Joint: BodyPose3DJoint;
   /// 3-D body poses.
-  type BodyPose3DDetection: BodyPose3DDetection<Joint = Self::BodyPose3DJoint>;
+  type BodyPose3DDetection: BodyPose3DDetection<Joint = Self::Body3Joint>;
   /// Per-instance person masks.
   type PersonInstanceMaskDetection: PersonInstanceMaskDetection<BoundingBox = Self::BoundingBox>;
   /// Whole-frame person masks.

@@ -293,10 +293,17 @@ impl Detections for MediaSchema {
   type FaceDetection = ms::FaceDetection;
   type FaceLandmarkRegion = ms::FaceLandmarkRegion;
   type FaceLandmarksDetection = ms::FaceLandmarksDetection;
-  type BodyPoseJoint = ms::BodyPoseJoint;
+  // mediaschema keeps one 2-D joint type for every skeleton, so the
+  // three seats name it three times. That a bundle may still collapse
+  // them is half the point of splitting the seats: the contract permits
+  // the identity, it no longer imposes it.
+  type BodyJoint = ms::BodyPoseJoint;
   type BodyPoseDetection = ms::BodyPoseDetection;
+  type HandJoint = ms::BodyPoseJoint;
   type HandPoseDetection = ms::HandPoseDetection;
-  type BodyPose3DJoint = ms::BodyPose3DJoint;
+  type AnimalJoint = ms::BodyPoseJoint;
+  type AnimalPoseDetection = ms::BodyPoseDetection;
+  type Body3Joint = ms::BodyPose3DJoint;
   type BodyPose3DDetection = ms::BodyPose3DDetection;
   type PersonInstanceMaskDetection = ms::PersonInstanceMaskDetection;
   type PersonSegmentationMask = ms::PersonSegmentationMask;

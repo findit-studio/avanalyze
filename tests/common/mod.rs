@@ -13,6 +13,14 @@
 //! satisfies `assert_contract` and is expected to fail
 //! `assert_refuses_invalid`, which is exactly the split those two
 //! families document.
+//!
+//! And it names **four distinct joint types** — [`BodyJoint`],
+//! [`HandJoint`], [`AnimalJoint`], [`Body3Joint`]. Nothing forces that;
+//! it is here so that the decoupling is compiled, not merely asserted.
+//! A bundle whose skeletons carry genuinely different joint vocabularies
+//! must type-check, and the reference implementation in
+//! `src/tests/reference.rs` proves the other half — one joint type in
+//! every seat is still legal.
 
 // Each test binary that includes this module uses a different subset
 // of the vocabulary; the unused remainder is not dead code, it is the
@@ -76,8 +84,29 @@ pub struct FaceLandmarks {
   pub regions: Vec<LandmarkRegion>,
 }
 
+/// A joint of the human 2-D skeleton. Same shape as [`HandJoint`] and
+/// [`AnimalJoint`], deliberately not the same type: the three rosters
+/// name different joints, and a body joint has no business in a hand.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Joint {
+pub struct BodyJoint {
+  pub name: String,
+  pub x: f32,
+  pub y: f32,
+  pub confidence: f32,
+}
+
+/// A joint of the hand skeleton.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HandJoint {
+  pub name: String,
+  pub x: f32,
+  pub y: f32,
+  pub confidence: f32,
+}
+
+/// A joint of the animal 2-D skeleton.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AnimalJoint {
   pub name: String,
   pub x: f32,
   pub y: f32,
@@ -88,7 +117,14 @@ pub struct Joint {
 pub struct Pose {
   pub bbox: Bbox,
   pub confidence: f32,
-  pub joints: Vec<Joint>,
+  pub joints: Vec<BodyJoint>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AnimalPose {
+  pub bbox: Bbox,
+  pub confidence: f32,
+  pub joints: Vec<AnimalJoint>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -96,11 +132,12 @@ pub struct HandPose {
   pub bbox: Bbox,
   pub confidence: f32,
   pub chirality: Chirality,
-  pub joints: Vec<Joint>,
+  pub joints: Vec<HandJoint>,
 }
 
+/// A joint of the 3-D body skeleton, in model-space metres.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Joint3 {
+pub struct Body3Joint {
   pub name: String,
   pub x: f32,
   pub y: f32,
@@ -113,7 +150,7 @@ pub struct Pose3 {
   pub confidence: f32,
   pub body_height: f32,
   pub height_estimation: HeightEstimation,
-  pub joints: Vec<Joint3>,
+  pub joints: Vec<Body3Joint>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -277,7 +314,41 @@ impl FaceLandmarksDetection for FaceLandmarks {
   }
 }
 
-impl BodyPoseJoint for Joint {
+impl BodyPoseJoint for BodyJoint {
+  type Error = Infallible;
+
+  fn try_new(name: &str, x: f32, y: f32, confidence: f32) -> Result<Self, Self::Error> {
+    Ok(Self {
+      name: name.to_owned(),
+      x,
+      y,
+      confidence,
+    })
+  }
+
+  fn name(&self) -> &str {
+    &self.name
+  }
+}
+
+impl BodyPoseJoint for HandJoint {
+  type Error = Infallible;
+
+  fn try_new(name: &str, x: f32, y: f32, confidence: f32) -> Result<Self, Self::Error> {
+    Ok(Self {
+      name: name.to_owned(),
+      x,
+      y,
+      confidence,
+    })
+  }
+
+  fn name(&self) -> &str {
+    &self.name
+  }
+}
+
+impl BodyPoseJoint for AnimalJoint {
   type Error = Infallible;
 
   fn try_new(name: &str, x: f32, y: f32, confidence: f32) -> Result<Self, Self::Error> {
@@ -297,7 +368,25 @@ impl BodyPoseJoint for Joint {
 impl BodyPoseDetection for Pose {
   type Error = Infallible;
   type BoundingBox = Bbox;
-  type Joint = Joint;
+  type Joint = BodyJoint;
+
+  fn try_new(
+    bbox: Self::BoundingBox,
+    confidence: f32,
+    joints: Vec<Self::Joint>,
+  ) -> Result<Self, Self::Error> {
+    Ok(Self {
+      bbox,
+      confidence,
+      joints,
+    })
+  }
+}
+
+impl BodyPoseDetection for AnimalPose {
+  type Error = Infallible;
+  type BoundingBox = Bbox;
+  type Joint = AnimalJoint;
 
   fn try_new(
     bbox: Self::BoundingBox,
@@ -315,7 +404,7 @@ impl BodyPoseDetection for Pose {
 impl HandPoseDetection for HandPose {
   type Error = Infallible;
   type BoundingBox = Bbox;
-  type Joint = Joint;
+  type Joint = HandJoint;
 
   fn try_new(
     bbox: Self::BoundingBox,
@@ -332,7 +421,7 @@ impl HandPoseDetection for HandPose {
   }
 }
 
-impl BodyPose3DJoint for Joint3 {
+impl BodyPose3DJoint for Body3Joint {
   type Error = Infallible;
 
   fn try_new(name: &str, x: f32, y: f32, z: f32, confidence: f32) -> Result<Self, Self::Error> {
@@ -352,7 +441,7 @@ impl BodyPose3DJoint for Joint3 {
 
 impl BodyPose3DDetection for Pose3 {
   type Error = Infallible;
-  type Joint = Joint3;
+  type Joint = Body3Joint;
 
   fn try_new(
     confidence: f32,
@@ -495,10 +584,16 @@ impl Detections for Plain {
   type FaceDetection = Face;
   type FaceLandmarkRegion = LandmarkRegion;
   type FaceLandmarksDetection = FaceLandmarks;
-  type BodyPoseJoint = Joint;
+  // Four skeletons, four joint types, four pose types. The bundle used
+  // to require one joint type for the 2-D three; that it no longer does
+  // is what this impl compiles.
+  type BodyJoint = BodyJoint;
   type BodyPoseDetection = Pose;
+  type HandJoint = HandJoint;
   type HandPoseDetection = HandPose;
-  type BodyPose3DJoint = Joint3;
+  type AnimalJoint = AnimalJoint;
+  type AnimalPoseDetection = AnimalPose;
+  type Body3Joint = Body3Joint;
   type BodyPose3DDetection = Pose3;
   type PersonInstanceMaskDetection = InstanceMask;
   type PersonSegmentationMask = SegmentationMask;

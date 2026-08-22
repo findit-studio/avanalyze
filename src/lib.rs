@@ -1444,7 +1444,7 @@ impl VisionAnalyzer {
         max_x = max_x.max(x);
         max_y = max_y.max(y);
 
-        let Ok(joint) = D::BodyPoseJoint::try_new(&name, x, y, confidence) else {
+        let Ok(joint) = D::BodyJoint::try_new(&name, x, y, confidence) else {
           continue;
         };
         joints.push(joint);
@@ -1538,7 +1538,7 @@ impl VisionAnalyzer {
               continue;
             };
 
-            let Ok(joint) = D::BodyPose3DJoint::try_new(&name, x, y, z, confidence) else {
+            let Ok(joint) = D::Body3Joint::try_new(&name, x, y, z, confidence) else {
               continue;
             };
             joints.push(joint);
@@ -1636,7 +1636,7 @@ impl VisionAnalyzer {
         max_x = max_x.max(x);
         max_y = max_y.max(y);
 
-        let Ok(joint) = D::BodyPoseJoint::try_new(&name, x, y, confidence) else {
+        let Ok(joint) = D::HandJoint::try_new(&name, x, y, confidence) else {
           continue;
         };
         joints.push(joint);
@@ -1888,7 +1888,7 @@ impl VisionAnalyzer {
   fn extract_animal_body_poses<D: Detections>(
     &self,
     options: &AnalyzeOptions,
-  ) -> Vec<D::BodyPoseDetection> {
+  ) -> Vec<D::AnimalPoseDetection> {
     let Some(results) = (unsafe { self.requests.animal_body_pose.results() }) else {
       return Vec::new();
     };
@@ -1947,7 +1947,7 @@ impl VisionAnalyzer {
         max_x = max_x.max(x);
         max_y = max_y.max(y);
 
-        let Ok(joint) = D::BodyPoseJoint::try_new(&name, x, y, confidence) else {
+        let Ok(joint) = D::AnimalJoint::try_new(&name, x, y, confidence) else {
           continue;
         };
         joints.push(joint);
@@ -1965,7 +1965,7 @@ impl VisionAnalyzer {
       };
 
       joints.sort_by(|lhs, rhs| lhs.name().cmp(rhs.name()));
-      if let Ok(pose) = D::BodyPoseDetection::try_new(bbox, pose_confidence, joints) {
+      if let Ok(pose) = D::AnimalPoseDetection::try_new(bbox, pose_confidence, joints) {
         body_poses.push(pose);
       }
     }
