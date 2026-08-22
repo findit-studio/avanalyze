@@ -58,19 +58,24 @@ fn matched_capture_quality_takes_overlapping_score() {
       0.8,
     ), // exact overlap
   ];
-  assert!((matched_capture_quality(&face, &scored) - 0.8).abs() < 1e-6);
+  let got = matched_capture_quality(&face, &scored).expect("an overlapping observation must match");
+  assert!((got - 0.8).abs() < 1e-6);
 }
 
-/// #48: a face the capture-quality pass did not cover annotates to 0.0 (so
-/// the default `min_capture_quality` of 0.1 drops it, while 0.0 keeps it).
+/// #20: a face the capture-quality pass did not cover annotates to `None`
+/// — "unmatched" — never a real `Some(0.0)` measurement. (The
+/// `min_capture_quality` threshold gate still fails closed on `None` at
+/// the `extract_faces` call site: the default 0.1 drops it, while 0.0
+/// keeps it — see the comment there. This function's own contract is
+/// just the match outcome.)
 #[test]
-fn matched_capture_quality_zero_without_overlap() {
+fn matched_capture_quality_none_without_overlap() {
   let face = DomainBoundingBox::try_new(0.10, 0.10, 0.20, 0.20).unwrap();
   let scored = vec![(
     DomainBoundingBox::try_new(0.60, 0.60, 0.20, 0.20).unwrap(),
     0.9,
   )];
-  assert_eq!(matched_capture_quality(&face, &scored), 0.0);
+  assert_eq!(matched_capture_quality(&face, &scored), None);
 }
 
 /// `vision_rect_to_bbox` must flip y. A Vision rect of
@@ -589,16 +594,17 @@ fn projected_non_finite_landmark_is_rejected() {
 
 // ──────────────── R7 fixes (codex round 7) ────────────────
 
-/// `sanitize_capture_quality` distinguishes absent from corrupt:
-/// `None` (Vision did not provide a value) collapses to `Some(0.0)`
-/// — fail-closed against any positive threshold; `Some(non_finite)`
-/// collapses to `None` so the caller drops the detection
-/// unconditionally (any `min_capture_quality = 0.0` configuration
-/// would otherwise admit a non-finite reading as a 0.0-quality
-/// face).
+/// #20: `sanitize_capture_quality` no longer collapses absent into
+/// corrupt's old fallback — `None` (Vision did not provide a value)
+/// now stays `None`, the same "never measured" state a non-finite
+/// reading also collapses to (see
+/// `sanitize_capture_quality_non_finite_returns_none` below). Before
+/// this fix, `None` mapped to `Some(0.0)`, indistinguishable from a
+/// face Vision genuinely measured and scored at zero — the angles
+/// precedent (#18/#19) applied to this seat.
 #[test]
-fn sanitize_capture_quality_absent_maps_to_zero() {
-  assert_eq!(sanitize_capture_quality(None), Some(0.0));
+fn sanitize_capture_quality_absent_maps_to_none() {
+  assert_eq!(sanitize_capture_quality(None), None);
 }
 
 #[test]

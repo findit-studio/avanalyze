@@ -547,24 +547,20 @@ fn try_alloc_packed_mask(packed_len: usize) -> Option<Vec<u8>> {
 
 /// Sanitise a raw face captureQuality reading from Vision.
 ///
-/// Distinguishes three states explicitly:
-/// - `Some(finite)` — Vision provided a real measurement; pass it
-///   through.
-/// - `Some(0.0)` — Vision did NOT provide a value (the underlying
-///   `NSNumber?` was `None`). Map to `0.0` so the caller's threshold
-///   comparison fails closed for any positive minimum.
-/// - `None` — Vision provided a non-finite value (`NaN` / `±Inf`).
-///   Caller MUST drop the detection: a non-finite reading is not a
-///   real measurement, and substituting `0.0` would silently admit
-///   the detection through any `min_capture_quality = 0.0`
-///   configuration.
+/// `None` at every stage means the same thing to a consumer: no usable
+/// quality reading for this observation. Vision omitting the
+/// `NSNumber?` entirely (`raw = None`) and Vision reporting a
+/// non-finite value (`NaN` / `±Inf`) both collapse to `None` here, and
+/// neither is defaulted to `0.0` — that default is exactly the
+/// collapse this function exists to stop making (see
+/// `contract::FaceDetection`). `Some(v)` is a real, finite
+/// measurement, including a genuine `Some(0.0)` — Vision measured this
+/// capture and found it terrible, which is not the same claim as
+/// never having measured it.
 #[cfg(target_vendor = "apple")]
 #[inline]
 fn sanitize_capture_quality(raw: Option<f32>) -> Option<f32> {
-  match raw {
-    Some(v) => finite_f32(v),
-    None => Some(0.0),
-  }
+  raw.and_then(finite_f32)
 }
 
 /// Minimum intersection-over-union for a face-rectangle detection and a
@@ -589,19 +585,21 @@ fn bbox_iou<B: BoundingBox>(a: &B, b: &B) -> f32 {
   if union <= 0.0 { 0.0 } else { inter / union }
 }
 
-/// The capture quality to annotate a detected face `bbox` with: the quality of
+/// The capture quality to annotate a detected face `bbox` with: `Some` of
 /// the best-overlapping (IoU ≥ [`FACE_MATCH_MIN_IOU`]) capture-quality
-/// observation, or `0.0` when none overlaps. `scored` is the `(bbox, quality)`
-/// list from the capture-quality pass.
+/// observation's quality, or `None` when no observation overlaps — the
+/// face the capture-quality pass never covered ("unmatched"), not a face
+/// measured at `0.0`. `scored` is the `(bbox, quality)` list from the
+/// capture-quality pass.
 #[cfg(target_vendor = "apple")]
-fn matched_capture_quality<B: BoundingBox>(bbox: &B, scored: &[(B, f32)]) -> f32 {
+fn matched_capture_quality<B: BoundingBox>(bbox: &B, scored: &[(B, f32)]) -> Option<f32> {
   let mut best_iou = FACE_MATCH_MIN_IOU;
-  let mut best_quality = 0.0;
+  let mut best_quality = None;
   for (candidate, quality) in scored {
     let iou = bbox_iou(bbox, candidate);
     if iou >= best_iou {
       best_iou = iou;
-      best_quality = *quality;
+      best_quality = Some(*quality);
     }
   }
   best_quality
@@ -1199,11 +1197,16 @@ impl VisionAnalyzer {
   ///
   /// The face-rectangles pass is the detection spine — every detected face
   /// appears exactly once — and each face is annotated with the capture quality
-  /// of its best bounding-box-overlapping capture-quality observation (`0.0`
-  /// when the capture-quality pass did not cover it). `min_capture_quality` then
-  /// drops faces whose annotated quality is below it: the default (0.1) keeps
-  /// quality-scored faces, while `min_capture_quality == 0.0` keeps every
-  /// detected face.
+  /// of its best bounding-box-overlapping capture-quality observation, or
+  /// `None` when the capture-quality pass did not cover it (#20: a nil Vision
+  /// reading and a join-miss both reach the contract seat as `None`, never as a
+  /// `Some(0.0)` that would misrepresent "never measured" as "measured and
+  /// terrible"). `min_capture_quality` then drops faces whose quality compares
+  /// below it, treating an unmeasured face as `0.0` for THIS comparison only:
+  /// the default (0.1) still drops quality-scored-low and unmeasured faces
+  /// alike, while `min_capture_quality == 0.0` keeps every detected face. A
+  /// face that passes unmeasured still carries `None`, not `Some(0.0)`, to
+  /// `D::FaceDetection::try_new`.
   ///
   /// This replaces the previous TWO collections (`faces` from the capture-quality
   /// pass PLUS `face_rectangles` from the rectangles pass), which persisted a
@@ -1245,7 +1248,15 @@ impl VisionAnalyzer {
         continue;
       };
       let capture_quality = matched_capture_quality(&bbox, &scored);
-      if capture_quality < capture_opts.min_capture_quality() {
+      // The threshold gate is unchanged: an unmeasured (`None`) face
+      // compares as `0.0` here, so it fails any positive minimum
+      // exactly as a matched-and-zero face would (#20's fail-closed
+      // precedent, carried over from the old `sanitize_capture_quality`
+      // collapse). Only the COMPARISON substitutes `0.0` — the `Option`
+      // itself, not this local, is what reaches `try_new` below, so a
+      // face that clears a `min_capture_quality == 0.0` gate while
+      // unmeasured still arrives at the contract seat as `None`.
+      if capture_quality.unwrap_or(0.0) < capture_opts.min_capture_quality() {
         continue;
       }
       // `None` at every stage means the same thing to a consumer: no
