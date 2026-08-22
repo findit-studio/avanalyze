@@ -1,5 +1,39 @@
 # Changelog
 
+## Unreleased
+
+Face-pose angles stop pretending "not computed" is "measured level."
+
+### Breaking
+
+- **`FaceDetection::try_new`'s `roll` / `yaw` / `pitch` become `Option<f32>`.**
+  Vision reports each pose angle independently and optionally — availability
+  differs by OS version and by detection path, and some faces arrive with
+  none of the three computed. The engine previously collapsed that absence
+  with `unwrap_or(0.0)`, so "Vision never computed this angle" and "Vision
+  measured a level head" were both written as `0.0` and could not be told
+  apart downstream — a consumer filtering "pitched down more than 20°"
+  wrongly excluded a 30°-down face whose pitch was simply never computed.
+  `Some(0.0)` now means a head Vision actually measured as level; `None`
+  means Vision did not compute that angle.
+- `extract_faces` (the Vision face-rectangles pass) carries the absence
+  through to the contract seat instead of defaulting it away.
+- `conformance::assert_faces_accept` follows the seat: it passes
+  `Option<f32>` for every angle and gains two canonical cases — a face with
+  no angles computed at all, and a face mixing a genuinely-level `Some(0.0)`
+  roll with an absent yaw on the same detection.
+- `tests/common::Face`, the outside vocabulary, stores the three angles as
+  `Option<f32>` and round-trips the absence. `src/tests/reference.rs`'s
+  `mediaschema`-backed vocabulary cannot: `mediaschema` 0.2.1 has no seat for
+  the absence yet, so that one adapter collapses `None` to `0.0` at the
+  boundary — a limitation of the pinned dependency, not a reopening of this
+  crate's loss. `mediaschema` / `mediagraph` adopt the `Option` shape in
+  their own knife once this publishes.
+
+**Semver.** This breaks a published API — 0.3.0 is on crates.io — so it
+rides the next breaking line (0.4.0). The version is not bumped here; the
+release stamp is its own commit, matching the 0.3.0 precedent.
+
 ## 0.3.0 — 2026-08-22
 
 The joint seats stop pretending the four skeletons are one.

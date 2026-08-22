@@ -138,23 +138,29 @@ pub trait SubjectDetection: Sized {
 /// pass and joins it to the detection spine by box overlap, using
 /// `0.0` for a face the quality pass did not cover.
 ///
-/// `roll` / `yaw` / `pitch` are radians and default to `0.0` when the
-/// observation omits them — unlike geometry, a missing pose angle does
-/// not drop the face.
+/// `roll` / `yaw` / `pitch` are each an `Option<f32>` in radians.
+/// Vision estimates the three independently, and which it reports
+/// varies by OS version and by detection path — a face may arrive
+/// with all three, some, or none. `Some(0.0)` is a head Vision
+/// measured and found level; `None` is an angle Vision never
+/// computed. The two are not interchangeable: collapsing `None` to
+/// `0.0` tells every "pitched down more than 20°" query that a face
+/// Vision never looked at was measured perfectly upright.
 pub trait FaceDetection: Sized {
   /// Why a face was refused.
   type Error;
   /// The geometry type this face is built from.
   type BoundingBox: BoundingBox;
 
-  /// Builds a face detection.
+  /// Builds a face detection. `roll` / `yaw` / `pitch` are `None`
+  /// where Vision did not compute that angle.
   fn try_new(
     bbox: Self::BoundingBox,
     confidence: f32,
     capture_quality: f32,
-    roll: f32,
-    yaw: f32,
-    pitch: f32,
+    roll: Option<f32>,
+    yaw: Option<f32>,
+    pitch: Option<f32>,
   ) -> Result<Self, Self::Error>;
 }
 

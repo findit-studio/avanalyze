@@ -123,14 +123,47 @@ pub fn assert_detection_accepts<D: Detections>() {
 }
 
 /// Faces, including the `0.0` capture quality the engine writes for a
-/// face the capture-quality pass did not cover, and signed pose
-/// angles.
+/// face the capture-quality pass did not cover, signed pose angles,
+/// and the pose-angle absence the contract seat exists to represent.
 pub fn assert_faces_accept<D: Detections>() {
-  let bbox = interior_bbox::<D::BoundingBox>();
   assert!(
-    D::FaceDetection::try_new(bbox, 1.0, 0.0, -0.5, 0.25, 3.0).is_ok(),
+    D::FaceDetection::try_new(
+      interior_bbox::<D::BoundingBox>(),
+      1.0,
+      0.0,
+      Some(-0.5),
+      Some(0.25),
+      Some(3.0),
+    )
+    .is_ok(),
     "FaceDetection::try_new must accept an unmatched capture quality (0.0) and signed \
      roll/yaw/pitch radians"
+  );
+  assert!(
+    D::FaceDetection::try_new(
+      interior_bbox::<D::BoundingBox>(),
+      1.0,
+      0.0,
+      None,
+      None,
+      None
+    )
+    .is_ok(),
+    "FaceDetection::try_new must accept a face with no pose angles computed at all — the \
+     state this seat exists to represent, distinct from a head measured level"
+  );
+  assert!(
+    D::FaceDetection::try_new(
+      interior_bbox::<D::BoundingBox>(),
+      1.0,
+      0.0,
+      Some(0.0),
+      None,
+      Some(-1.2),
+    )
+    .is_ok(),
+    "FaceDetection::try_new must accept angles that are present, absent, and genuinely \
+     zero on the SAME face — Vision reports roll/yaw/pitch independently"
   );
 
   let points = [(0.0_f32, 0.0_f32), (1.0, 1.0), (0.42, 0.13)];
