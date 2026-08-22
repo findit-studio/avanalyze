@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 — 2026-08-22
 
 Face-pose angles and capture quality stop pretending "not measured" is
 "measured at zero."
