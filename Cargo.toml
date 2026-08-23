@@ -85,7 +85,7 @@ tempfile = "3"
 # Follows mediaschema, not the newest release: the reference implementation
 # hands mediaframe types (the `Dimensions` family) to mediaschema's
 # constructors, so the two must link the SAME mediaframe — 0.2 pins 0.1.
-mediaframe = { version = "0.1", default-features = false, features = ["std"] }
+mediaframe = { version = "0.5", default-features = false, features = ["std"] }
 mediaschema = { version = "0.2", default-features = false, features = ["std", "video"] }
 
 [profile.bench]
