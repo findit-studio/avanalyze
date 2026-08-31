@@ -89,6 +89,19 @@ impl AnalyzeError {
   }
 }
 
+/// The single refusal every entry point returns off Apple: Vision.framework
+/// does not exist here, so nothing was analysed.
+///
+/// One function rather than one literal per stub, so the kind and the
+/// message cannot drift between entry points.
+#[cfg(not(target_vendor = "apple"))]
+pub(crate) fn unsupported<T>() -> Result<T, AnalyzeError> {
+  Err(AnalyzeError::new(
+    AnalyzeErrorKind::Unsupported,
+    "Apple Vision.framework is only available on macOS",
+  ))
+}
+
 impl fmt::Display for AnalyzeError {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     write!(f, "{}: {}", self.kind, self.message)

@@ -2,13 +2,19 @@ use core::fmt;
 
 use crate::contract::Detections;
 
-/// Everything one frame produced, in eighteen flat slots.
+/// Everything one batched pass produced, in eight flat slots.
 ///
 /// The engine builds this and stops. It does not know what a keyframe
 /// is, does not mint identifiers, and does not nest the human or
 /// animal slots into an aggregate — assembling those into whatever
 /// record the caller stores is the caller's job, and the caller is the
 /// only party that knows the frame's identity.
+///
+/// Eight slots, not eighteen: these are the cheap detections
+/// [`VisionAnalyzer`](crate::VisionAnalyzer) runs in one batch. Text,
+/// barcodes, faces, landmarks, poses and masks each have their own
+/// entry point and return their own `Vec`, so a consumer of one of
+/// them never allocates this carton at all.
 ///
 /// Slots start empty ([`Analysis::new`]) and are filled by
 /// `set_*`. Nothing here is `Option` except [`horizon`](Analysis::horizon)
@@ -21,22 +27,12 @@ use crate::contract::Detections;
 /// accessors:
 ///
 /// ```ignore
-/// let faces = core::mem::take(analysis.faces_mut());
+/// let tags = core::mem::take(analysis.classifications_mut());
 /// ```
 pub struct Analysis<D: Detections> {
   classifications: Vec<D::Detection>,
   human_subjects: Vec<D::SubjectDetection>,
-  faces: Vec<D::FaceDetection>,
-  face_landmarks: Vec<D::FaceLandmarksDetection>,
-  body_poses: Vec<D::BodyPoseDetection>,
-  hand_poses: Vec<D::HandPoseDetection>,
-  body_poses_3d: Vec<D::BodyPose3DDetection>,
-  person_instance_masks: Vec<D::PersonInstanceMaskDetection>,
-  person_segmentation_masks: Vec<D::PersonSegmentationMask>,
   animal_subjects: Vec<D::SubjectDetection>,
-  animal_body_poses: Vec<D::AnimalPoseDetection>,
-  text_detections: Vec<D::TextDetection>,
-  barcodes: Vec<D::BarcodeDetection>,
   attention_saliency: Vec<D::SaliencyRegion>,
   objectness_saliency: Vec<D::SaliencyRegion>,
   document_segments: Vec<D::DocumentSegment>,
@@ -95,17 +91,7 @@ impl<D: Detections> Analysis<D> {
     Self {
       classifications: Vec::new(),
       human_subjects: Vec::new(),
-      faces: Vec::new(),
-      face_landmarks: Vec::new(),
-      body_poses: Vec::new(),
-      hand_poses: Vec::new(),
-      body_poses_3d: Vec::new(),
-      person_instance_masks: Vec::new(),
-      person_segmentation_masks: Vec::new(),
       animal_subjects: Vec::new(),
-      animal_body_poses: Vec::new(),
-      text_detections: Vec::new(),
-      barcodes: Vec::new(),
       attention_saliency: Vec::new(),
       objectness_saliency: Vec::new(),
       document_segments: Vec::new(),
@@ -125,58 +111,10 @@ impl<D: Detections> Analysis<D> {
     human_subjects, human_subjects_mut, set_human_subjects, with_human_subjects:
       D::SubjectDetection;
 
-    /// Detected faces, one record per face: the face-rectangles pass
-    /// is the spine, annotated with capture quality joined from the
-    /// separate capture-quality pass.
-    faces, faces_mut, set_faces, with_faces: D::FaceDetection;
-
-    /// Faces carrying their landmark regions. A separate Vision pass
-    /// from [`faces`](Analysis::faces) — the two are not joined, so a
-    /// face may appear in one and not the other.
-    face_landmarks, face_landmarks_mut, set_face_landmarks, with_face_landmarks:
-      D::FaceLandmarksDetection;
-
-    /// Human 2-D body poses.
-    body_poses, body_poses_mut, set_body_poses, with_body_poses: D::BodyPoseDetection;
-
-    /// Hand poses.
-    hand_poses, hand_poses_mut, set_hand_poses, with_hand_poses: D::HandPoseDetection;
-
-    /// Human 3-D body poses, in model-space metres.
-    body_poses_3d, body_poses_3d_mut, set_body_poses_3d, with_body_poses_3d:
-      D::BodyPose3DDetection;
-
-    /// Per-instance person masks.
-    person_instance_masks, person_instance_masks_mut, set_person_instance_masks,
-      with_person_instance_masks: D::PersonInstanceMaskDetection;
-
-    /// Whole-frame person masks. Shares a per-frame resource budget
-    /// with [`person_instance_masks`](Analysis::person_instance_masks),
-    /// so a mask-heavy frame can exhaust the budget in the instance
-    /// pass and leave this slot short.
-    person_segmentation_masks, person_segmentation_masks_mut,
-      set_person_segmentation_masks, with_person_segmentation_masks:
-      D::PersonSegmentationMask;
-
     /// Animals detected as subjects, labelled with Apple's species
     /// identifier verbatim.
     animal_subjects, animal_subjects_mut, set_animal_subjects, with_animal_subjects:
       D::SubjectDetection;
-
-    /// Animal 2-D body poses. Its own bundle seat rather than a second
-    /// use of [`body_poses`](Analysis::body_poses)' type: an animal
-    /// skeleton's joints are a different roster from a human's, so the
-    /// two poses are only the same type if the vocabulary says so.
-    animal_body_poses, animal_body_poses_mut, set_animal_body_poses,
-      with_animal_body_poses: D::AnimalPoseDetection;
-
-    /// Recognised text runs. One Vision observation can contribute
-    /// several candidates, all sharing that observation's box.
-    text_detections, text_detections_mut, set_text_detections, with_text_detections:
-      D::TextDetection;
-
-    /// Decoded barcodes.
-    barcodes, barcodes_mut, set_barcodes, with_barcodes: D::BarcodeDetection;
 
     /// Attention-based salient regions.
     attention_saliency, attention_saliency_mut, set_attention_saliency,
@@ -266,16 +204,6 @@ impl<D: Detections> fmt::Debug for Analysis<D>
 where
   D::Detection: fmt::Debug,
   D::SubjectDetection: fmt::Debug,
-  D::FaceDetection: fmt::Debug,
-  D::FaceLandmarksDetection: fmt::Debug,
-  D::BodyPoseDetection: fmt::Debug,
-  D::HandPoseDetection: fmt::Debug,
-  D::BodyPose3DDetection: fmt::Debug,
-  D::AnimalPoseDetection: fmt::Debug,
-  D::PersonInstanceMaskDetection: fmt::Debug,
-  D::PersonSegmentationMask: fmt::Debug,
-  D::TextDetection: fmt::Debug,
-  D::BarcodeDetection: fmt::Debug,
   D::SaliencyRegion: fmt::Debug,
   D::DocumentSegment: fmt::Debug,
   D::HorizonInfo: fmt::Debug,
@@ -285,17 +213,7 @@ where
     f.debug_struct("Analysis")
       .field("classifications", &self.classifications)
       .field("human_subjects", &self.human_subjects)
-      .field("faces", &self.faces)
-      .field("face_landmarks", &self.face_landmarks)
-      .field("body_poses", &self.body_poses)
-      .field("hand_poses", &self.hand_poses)
-      .field("body_poses_3d", &self.body_poses_3d)
-      .field("person_instance_masks", &self.person_instance_masks)
-      .field("person_segmentation_masks", &self.person_segmentation_masks)
       .field("animal_subjects", &self.animal_subjects)
-      .field("animal_body_poses", &self.animal_body_poses)
-      .field("text_detections", &self.text_detections)
-      .field("barcodes", &self.barcodes)
       .field("attention_saliency", &self.attention_saliency)
       .field("objectness_saliency", &self.objectness_saliency)
       .field("document_segments", &self.document_segments)

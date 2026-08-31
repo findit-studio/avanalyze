@@ -73,39 +73,80 @@ mod serde_coercion_tests {
     let json = r#"{
       "num_workers": 4,
       "classifications": {"min_confidence": 0.5, "max_results": 20},
-      "face_capture": {"min_confidence": 0.3, "min_capture_quality": 0.6},
-      "face_rectangles": {"min_confidence": 0.4},
-      "face_landmarks": {"min_confidence": 0.2, "min_region_count": 3},
       "human_subjects": {"min_confidence": 0.5},
       "animals": {"min_confidence": 0.7},
-      "text": {"min_text_len": 5, "max_candidates_per_observation": 3},
-      "body_pose": {"min_joint_confidence": 0.3},
-      "hand_pose": {"min_joint_confidence": 0.4, "maximum_hand_count": 4},
-      "animal_pose": {"min_joint_confidence": 0.2},
-      "body_pose_3d": {"min_joint_confidence": 0.3},
-      "barcodes": {"min_confidence": 0.5, "min_payload_len": 5},
       "attention_saliency": {"min_confidence": 0.3, "max_regions": 32},
       "objectness_saliency": {"min_confidence": 0.2, "max_regions": 16},
       "horizon": {"min_confidence": 0.4},
       "document_segments": {"min_confidence": 0.3, "max_segments": 8},
-      "aesthetics": {"min_overall_score": 0.0},
-      "person_instance_masks": {"min_confidence": 0.5, "max_instances_per_observation": 8},
-      "person_segmentation_masks": {"min_confidence": 0.4}
+      "aesthetics": {"min_overall_score": 0.0}
     }"#;
     let o: AnalyzeOptions = serde_json::from_str(json).unwrap();
     assert_eq!(o.num_workers(), 4);
     assert_eq!(o.classifications().min_confidence(), 0.5);
     assert_eq!(o.classifications().max_results(), 20);
-    assert_eq!(o.face_capture().min_confidence(), 0.3);
-    assert_eq!(o.face_capture().min_capture_quality(), 0.6);
-    assert_eq!(o.face_landmarks().min_region_count(), 3);
-    assert_eq!(o.text().min_text_len(), 5);
-    assert_eq!(o.text().max_candidates_per_observation(), 3);
-    assert_eq!(o.hand_pose().maximum_hand_count(), 4);
-    assert_eq!(o.barcodes().min_payload_len(), 5);
+    assert_eq!(o.human_subjects().min_confidence(), 0.5);
+    assert_eq!(o.animals().min_confidence(), 0.7);
     assert_eq!(o.attention_saliency().max_regions(), 32);
+    assert_eq!(o.objectness_saliency().max_regions(), 16);
+    assert_eq!(o.horizon().min_confidence(), 0.4);
     assert_eq!(o.document_segments().max_segments(), 8);
-    assert_eq!(o.person_instance_masks().max_instances_per_observation(), 8);
+    assert_eq!(o.aesthetics().min_overall_score(), 0.0);
+  }
+
+  /// The knobs that left `AnalyzeOptions` are still configurable —
+  /// through the entry point that reads them.
+  #[test]
+  fn serde_per_entry_options_with_custom_values() {
+    let face: AppleVisionFaceOptions = serde_json::from_str(
+      r#"{
+        "rectangles": {"min_confidence": 0.4},
+        "capture": {"min_confidence": 0.3, "min_capture_quality": 0.6},
+        "keypoints": {"min_confidence": 0.2}
+      }"#,
+    )
+    .unwrap();
+    assert_eq!(face.rectangles().min_confidence(), 0.4);
+    assert_eq!(face.capture().min_capture_quality(), 0.6);
+    assert_eq!(face.keypoints().min_confidence(), 0.2);
+
+    let landmarks: AppleVisionFaceLandmarkOptions =
+      serde_json::from_str(r#"{"min_confidence": 0.2, "min_region_count": 3}"#).unwrap();
+    assert_eq!(landmarks.min_region_count(), 3);
+
+    let text: AppleVisionTextOptions =
+      serde_json::from_str(r#"{"min_text_len": 5, "max_candidates_per_observation": 3}"#).unwrap();
+    assert_eq!(text.min_text_len(), 5);
+    assert_eq!(text.max_candidates_per_observation(), 3);
+
+    let barcodes: AppleVisionBarcodeOptions =
+      serde_json::from_str(r#"{"min_confidence": 0.5, "min_payload_len": 5}"#).unwrap();
+    assert_eq!(barcodes.min_payload_len(), 5);
+
+    let poser: AppleVisionBodyPoserOptions = serde_json::from_str(
+      r#"{"pose_2d": {"min_joint_confidence": 0.3}, "pose_3d": {"min_joint_confidence": 0.3}}"#,
+    )
+    .unwrap();
+    assert_eq!(poser.pose_2d().min_joint_confidence(), 0.3);
+    assert_eq!(poser.pose_3d().min_joint_confidence(), 0.3);
+
+    let hand: AppleVisionHandPoseOptions =
+      serde_json::from_str(r#"{"min_joint_confidence": 0.4, "maximum_hand_count": 4}"#).unwrap();
+    assert_eq!(hand.maximum_hand_count(), 4);
+
+    let animal: AppleVisionAnimalPoseOptions =
+      serde_json::from_str(r#"{"min_joint_confidence": 0.2}"#).unwrap();
+    assert_eq!(animal.min_joint_confidence(), 0.2);
+
+    let masker: AppleVisionPersonMaskerOptions = serde_json::from_str(
+      r#"{
+        "instances": {"min_confidence": 0.5, "max_instances_per_observation": 8},
+        "segmentation": {"min_confidence": 0.4}
+      }"#,
+    )
+    .unwrap();
+    assert_eq!(masker.instances().max_instances_per_observation(), 8);
+    assert_eq!(masker.segmentation().min_confidence(), 0.4);
   }
 }
 
@@ -141,12 +182,12 @@ fn mut_accessor_idempotent() {
 #[test]
 fn modifying_one_option_does_not_affect_others() {
   let mut o = AnalyzeOptions::new();
-  let original_barcode = o.barcodes().min_confidence();
+  let original_animals = o.animals().min_confidence();
   o.classifications_mut().set_min_confidence(0.99);
   assert_eq!(
-    o.barcodes().min_confidence(),
-    original_barcode,
-    "modifying classifications must not affect barcodes"
+    o.animals().min_confidence(),
+    original_animals,
+    "modifying classifications must not affect animals"
   );
 }
 
@@ -160,12 +201,12 @@ fn new_equals_default_for_all_fields() {
     b.classifications().min_confidence()
   );
   assert_eq!(
-    a.hand_pose().maximum_hand_count(),
-    b.hand_pose().maximum_hand_count()
+    a.document_segments().max_segments(),
+    b.document_segments().max_segments()
   );
   assert_eq!(
-    a.barcodes().min_payload_len(),
-    b.barcodes().min_payload_len()
+    a.aesthetics().min_overall_score(),
+    b.aesthetics().min_overall_score()
   );
 }
 
@@ -201,10 +242,10 @@ fn options_with_subnormal_float() {
 fn serde_roundtrip_service_options_full() {
   let mut opts = AnalyzeOptions::new().with_workers(8);
   opts.classifications_mut().set_min_confidence(0.7);
-  opts.hand_pose_mut().set_maximum_hand_count(4);
+  opts.document_segments_mut().set_max_segments(4);
   let json = serde_json::to_string_pretty(&opts).unwrap();
   let back: AnalyzeOptions = serde_json::from_str(&json).unwrap();
   assert_eq!(back.num_workers(), 8);
   assert_eq!(back.classifications().min_confidence(), 0.7);
-  assert_eq!(back.hand_pose().maximum_hand_count(), 4);
+  assert_eq!(back.document_segments().max_segments(), 4);
 }
