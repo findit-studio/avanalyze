@@ -57,6 +57,19 @@ pub(crate) const MAX_POSE_JOINTS: usize = 256;
 /// crash.
 pub(crate) const MAX_INPUT_IMAGE_BYTES: usize = 64 * 1024 * 1024;
 
+/// Upper bound on the decoded-pixel byte count a JPEG's SOF marker may
+/// declare before [`check_decoded_dimensions`] refuses it.
+/// [`MAX_INPUT_IMAGE_BYTES`] bounds the *compressed* input, but a small
+/// JPEG can still declare gigantic *decoded* dimensions in its SOF
+/// marker — Vision / ImageIO allocates buffers proportional to
+/// `width × height` once it decodes the frame, before any downstream
+/// cap in this crate runs. 512 MiB (≈134 MP at the 8-bit-precision
+/// baseline rate of 4 bytes/pixel — see [`decoded_bytes_per_pixel`] for
+/// the higher-precision rate) is far past any real keyframe but bounded
+/// rather than unbounded, so a hostile or corrupted SOF cannot drive the
+/// worker into memory pressure or OOM through the decode alone.
+pub(crate) const MAX_DECODED_IMAGE_BYTES: u64 = 512 * 1024 * 1024;
+
 /// Upper bound on the byte length of an FFI-sourced `NSString`
 /// before we refuse to convert it to a Rust `SmolStr` / `String`.
 /// Apple's Vision-emitted strings (OCR text, barcode payloads,
@@ -712,6 +725,281 @@ fn check_input_len(jpeg: &[u8]) -> Result<(), AnalyzeError> {
   Ok(())
 }
 
+// ----- the decoded-dimension SOF preflight -----------------------------------
+//
+// A JPEG stream is SOI (`FF D8`), then a sequence of marker segments, each
+// `FF <code>` optionally followed by a big-endian u16 length (counting
+// itself) and that many bytes of payload. This walk reads only that
+// structure — never the entropy-coded scan data a real decoder would need —
+// to reach the first SOF (Start Of Frame) marker and its declared
+// dimensions. It is allocation-free (every read comes straight out of
+// `jpeg`) and total: every exit is a `Result`, never a panic or an
+// out-of-bounds read, no matter how the input is truncated or how its
+// length fields lie.
+//
+// Two primitives do every bounds-checked read in the walk: [`next_byte`]
+// (one byte, `pos` advanced by one) and [`bounded_slice`] (a range, its end
+// computed with checked addition). Every other helper is built from those
+// two, so there is exactly one place that indexes a single byte and one
+// place that slices a range.
+
+/// Bytes ImageIO's decode allocates per pixel in the worst case, as a
+/// function of the SOF's sample `precision` (bits per component) — its
+/// worst-case buffer is 4 channels (RGBA-family) at either 1 or 2 bytes
+/// per channel. Channel count is fixed at 4 rather than read from the
+/// JPEG's own `Nf` component count: a hostile SOF could under-report `Nf`
+/// (claim grayscale) to shrink the declared budget while Vision still
+/// allocates the wider buffer, so the bound has to assume the worst case
+/// regardless of what the file claims.
+///
+/// Precision, unlike `Nf`, does change the multiplier: baseline JPEGs
+/// declare 8-bit precision and ImageIO decodes them at 4 bytes/pixel
+/// (8-bit RGBA), but SOF1 and SOF3 (and the other extended/lossless SOF
+/// markers) permit 9-16 bit precision, and ImageIO decodes those at
+/// 16-bit/component — 8 bytes/pixel, double the baseline case. Charging
+/// only 4 bytes/pixel for a 12- or 16-bit-precision frame would let a
+/// nominal at-cap frame's real decode land at roughly twice
+/// [`MAX_DECODED_IMAGE_BYTES`], so any precision above 8 bits charges the
+/// wider rate.
+fn decoded_bytes_per_pixel(precision: u8) -> u64 {
+  const CHANNELS: u64 = 4;
+  let bytes_per_channel: u64 = if precision > 8 { 2 } else { 1 };
+  CHANNELS * bytes_per_channel
+}
+
+/// SOF-family marker codes: 0xC0..=0xCF minus the three reserved for other
+/// purposes — 0xC4 (DHT, Define Huffman Table), 0xC8 (JPG, reserved and
+/// never emitted), 0xCC (DAC, Define Arithmetic Coding). The remaining
+/// thirteen (SOF0-3, SOF5-7, SOF9-11, SOF13-15) cover every real frame type
+/// — baseline, extended, progressive, lossless, their differential
+/// variants, and both entropy codings — and all thirteen share the same
+/// header shape: precision, height, width, `Nf`. That shape is all this
+/// preflight reads.
+fn is_sof_marker(code: u8) -> bool {
+  matches!(code, 0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF)
+}
+
+fn no_sof_marker() -> AnalyzeError {
+  AnalyzeError::new(
+    AnalyzeErrorKind::RequestFailed,
+    "input image has no valid JPEG SOF marker",
+  )
+}
+
+fn malformed_marker_length() -> AnalyzeError {
+  AnalyzeError::new(
+    AnalyzeErrorKind::RequestFailed,
+    "input image has a malformed JPEG marker length",
+  )
+}
+
+fn deferred_sof_dimension() -> AnalyzeError {
+  AnalyzeError::new(
+    AnalyzeErrorKind::RequestFailed,
+    "input image's SOF marker declares a dimension of zero",
+  )
+}
+
+fn hierarchical_jpeg_unsupported() -> AnalyzeError {
+  AnalyzeError::new(
+    AnalyzeErrorKind::RequestFailed,
+    "input image uses hierarchical JPEG (DHP), which this preflight does not support",
+  )
+}
+
+/// Reads the byte at `*pos` and advances it by one. The only place in this
+/// module that indexes a single byte — every walk step that is not a
+/// checked-range read ([`bounded_slice`]) goes through this, so a
+/// truncated buffer always surfaces as [`no_sof_marker`] here rather than a
+/// panic.
+fn next_byte(jpeg: &[u8], pos: &mut usize) -> Result<u8, AnalyzeError> {
+  let byte = *jpeg.get(*pos).ok_or_else(no_sof_marker)?;
+  *pos = pos.checked_add(1).ok_or_else(malformed_marker_length)?;
+  Ok(byte)
+}
+
+/// A bounds-checked subslice: `start` and `len` are combined with checked
+/// addition before the range ever reaches indexing, so a forged or
+/// oversized length can only ever produce [`malformed_marker_length`],
+/// never an out-of-bounds read or an overflow panic.
+fn bounded_slice(jpeg: &[u8], start: usize, len: usize) -> Result<&[u8], AnalyzeError> {
+  let end = start.checked_add(len).ok_or_else(malformed_marker_length)?;
+  jpeg.get(start..end).ok_or_else(malformed_marker_length)
+}
+
+fn read_u16_be(jpeg: &[u8], pos: usize) -> Result<u16, AnalyzeError> {
+  let bytes = bounded_slice(jpeg, pos, 2)?;
+  Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
+}
+
+/// Reads one marker's code, absorbing any `0xFF` fill bytes the JPEG spec
+/// permits before it (`FF FF FF D8` is SOI preceded by two fill bytes).
+/// `*pos` must point at the marker's leading `0xFF`; on return it points
+/// just past the code byte.
+///
+/// Terminates because every branch either returns or calls [`next_byte`],
+/// which advances `*pos` by exactly one and errors the moment the buffer is
+/// exhausted — so this can read at most `jpeg.len() - *pos` bytes before
+/// one of those two things happens.
+fn read_marker_code(jpeg: &[u8], pos: &mut usize) -> Result<u8, AnalyzeError> {
+  if next_byte(jpeg, pos)? != 0xFF {
+    return Err(no_sof_marker());
+  }
+  loop {
+    let byte = next_byte(jpeg, pos)?;
+    if byte != 0xFF {
+      return Ok(byte);
+    }
+  }
+}
+
+/// Skips a generic length-prefixed marker segment: `pos` points at its
+/// 2-byte length field (which counts itself), so a well-formed segment
+/// always reports `seg_len >= 2`. Returns the position just past it.
+fn skip_segment(jpeg: &[u8], pos: usize) -> Result<usize, AnalyzeError> {
+  let seg_len = usize::from(read_u16_be(jpeg, pos)?);
+  if seg_len < 2 {
+    return Err(malformed_marker_length());
+  }
+  let next = pos
+    .checked_add(seg_len)
+    .ok_or_else(malformed_marker_length)?;
+  if next > jpeg.len() {
+    return Err(malformed_marker_length());
+  }
+  Ok(next)
+}
+
+/// The fields of a SOF payload this preflight needs: enough to compute a
+/// worst-case decoded byte count, and nothing else — no component
+/// specifiers, no quantization or Huffman tables, no scan/entropy data.
+struct SofFrame {
+  width: u16,
+  height: u16,
+  /// Sample precision in bits per component, straight from the SOF
+  /// payload. Feeds [`decoded_bytes_per_pixel`]; never validated against
+  /// a fixed vocabulary here, because any value this preflight has not
+  /// specifically accounted for must be treated as the untrusted worst
+  /// case, not silently normalized to a common one.
+  precision: u8,
+}
+
+/// Reads a SOF payload's fixed-offset fields: `pos` points at its 2-byte
+/// length field. Returns as soon as they are read — the component
+/// specifiers that follow are validated for length only, never read,
+/// because this is a dimension preflight, not a decoder.
+///
+/// Refuses a `width` or `height` of zero. Width is always fully specified
+/// in a JPEG SOF, so zero is simply degenerate. Height is not: JPEG
+/// permits a baseline SOF to declare `height = 0` and defer the real
+/// value to a DNL marker after the first scan (ITU-T T.81 §B.2.5). This
+/// preflight stops at the first SOF and never reads that far — reading
+/// forward would mean skipping entropy-coded scan data, which is decoder
+/// territory this preflight deliberately stays out of — so a deferred
+/// height is a height this preflight cannot establish, and a preflight
+/// that cannot establish a bound must refuse rather than default to
+/// treating an unknown value as zero.
+fn read_sof_dimensions(jpeg: &[u8], pos: usize) -> Result<SofFrame, AnalyzeError> {
+  // length(2) + precision(1) + height(2) + width(2) + Nf(1).
+  const FIXED_HEADER_LEN: usize = 8;
+
+  let seg_len = usize::from(read_u16_be(jpeg, pos)?);
+  if seg_len < FIXED_HEADER_LEN {
+    return Err(malformed_marker_length());
+  }
+  let payload_start = pos.checked_add(2).ok_or_else(malformed_marker_length)?;
+  let payload = bounded_slice(jpeg, payload_start, seg_len - 2)?;
+
+  let precision = payload[0];
+  let height = u16::from_be_bytes([payload[1], payload[2]]);
+  let width = u16::from_be_bytes([payload[3], payload[4]]);
+
+  // Read only to validate the segment's own declared length against its
+  // component count (`Nf` is capped at 255 by its one-byte width, so
+  // `3 * nf` cannot overflow `usize` on any target this crate builds for).
+  let nf = usize::from(payload[5]);
+  if seg_len < FIXED_HEADER_LEN + 3 * nf {
+    return Err(malformed_marker_length());
+  }
+
+  if width == 0 || height == 0 {
+    return Err(deferred_sof_dimension());
+  }
+
+  Ok(SofFrame {
+    width,
+    height,
+    precision,
+  })
+}
+
+/// Walks marker segments from the leading SOI onward until the first SOF
+/// ([`is_sof_marker`]), returning its declared [`SofFrame`]. Refuses the
+/// input — never panics — when: the buffer does not start `FF D8`; the
+/// walk runs off the end of the buffer before a SOF appears; SOS or EOI is
+/// reached first (real encoders always place SOF before both); a DHP
+/// marker appears (hierarchical JPEG, see below); a segment's length does
+/// not fit the remaining buffer; or the SOF itself declares a zero
+/// width/height (see [`read_sof_dimensions`]).
+///
+/// # Hierarchical JPEG (DHP) is refused, not parsed
+///
+/// A DHP marker (`0xDE`) introduces JPEG's hierarchical mode (ITU-T T.81
+/// Annex J): a sequence of multiple SOF-delimited frames at increasing
+/// resolution, with DHP itself — in the *same* precision/height/width/Nf
+/// shape as a SOF payload — declaring the dimensions of the *completed*
+/// (largest) image. A conforming hierarchical stream can carry an
+/// over-cap DHP ahead of an under-cap first SOF, so stopping at the first
+/// SOF as usual would budget the small frame and miss the real one.
+/// Correctly handling this means either trusting DHP's own declared
+/// completed size or walking every frame in the sequence for its
+/// maximum — both are hierarchical-mode-specific decoder knowledge this
+/// preflight deliberately does not carry (it is a SOF preflight, not a
+/// JPEG decoder). Refusing outright on DHP is the same choice already
+/// made for a deferred DNL height: when this walk cannot itself establish
+/// a trustworthy bound, it refuses rather than guesses.
+///
+/// Every step advances `pos` — one byte at a time through [`next_byte`], or
+/// by a checked, buffer-fitting segment length through [`skip_segment`] /
+/// [`read_sof_dimensions`] — so the walk cannot loop: each iteration either
+/// returns or strictly progresses toward `jpeg.len()`, bounding the total
+/// work at one pass over the input.
+fn find_sof_dimensions(jpeg: &[u8]) -> Result<SofFrame, AnalyzeError> {
+  if !jpeg.starts_with(&[0xFF, 0xD8]) {
+    return Err(no_sof_marker());
+  }
+  let mut pos = 2usize;
+  loop {
+    let code = read_marker_code(jpeg, &mut pos)?;
+    match code {
+      0xD8 => continue,                                    // stray SOI: no payload
+      0x01 | 0xD0..=0xD7 => continue,                      // TEM / RSTn: no payload
+      0xD9 | 0xDA => return Err(no_sof_marker()),          // EOI / SOS: no SOF before it
+      0xDE => return Err(hierarchical_jpeg_unsupported()), // DHP: see doc comment above
+      _ if is_sof_marker(code) => return read_sof_dimensions(jpeg, pos),
+      _ => pos = skip_segment(jpeg, pos)?,
+    }
+  }
+}
+
+/// Refuse a JPEG whose SOF marker declares decoded dimensions above
+/// [`MAX_DECODED_IMAGE_BYTES`], before `NSData::with_bytes` copies the
+/// compressed bytes and Vision/ImageIO allocates buffers proportional to
+/// the declared size.
+#[inline]
+pub(crate) fn check_decoded_dimensions(jpeg: &[u8]) -> Result<(), AnalyzeError> {
+  let frame = find_sof_dimensions(jpeg)?;
+  let bytes_per_pixel = decoded_bytes_per_pixel(frame.precision);
+  let decoded_bytes = u64::from(frame.width) * u64::from(frame.height) * bytes_per_pixel;
+  if decoded_bytes > MAX_DECODED_IMAGE_BYTES {
+    return Err(AnalyzeError::new(
+      AnalyzeErrorKind::RequestFailed,
+      "input image declares decoded dimensions above MAX_DECODED_IMAGE_BYTES",
+    ));
+  }
+  Ok(())
+}
+
 /// Whether the perform this call asked for actually ran.
 ///
 /// # The invariant
@@ -805,6 +1093,7 @@ pub(crate) fn with_image<R>(
   body: impl FnOnce(&VNSequenceRequestHandler, &NSData) -> Result<R, AnalyzeError>,
 ) -> Result<R, AnalyzeError> {
   check_input_len(jpeg)?;
+  check_decoded_dimensions(jpeg)?;
   objc2::rc::autoreleasepool(|_| {
     let ns_data = NSData::with_bytes(jpeg);
     let handler = unsafe { VNSequenceRequestHandler::new() };

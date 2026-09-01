@@ -757,4 +757,106 @@ mod real_inference {
         .expect_err("oversized input must be refused"),
     );
   }
+
+  /// The decoded-dimension ceiling (issue #2) is enforced by every entry
+  /// point too, through the same shared door as the compressed-byte cap
+  /// above: a SOF marker declaring dimensions past
+  /// `MAX_DECODED_IMAGE_BYTES` is refused before Vision ever sees the
+  /// frame.
+  #[test]
+  fn every_entry_point_refuses_over_cap_decoded_dimensions() {
+    use avanalyze::AnalyzeErrorKind;
+
+    // SOI + one SOF0 segment declaring 65535 × 65535, Nf = 1. No
+    // entropy-coded data follows — the preflight returns as soon as it
+    // reads the SOF, so none is needed.
+    #[rustfmt::skip]
+    let huge_dims: &[u8] = &[
+      0xFF, 0xD8,             // SOI
+      0xFF, 0xC0, 0x00, 0x0B, // SOF0, length 11
+      0x08,                   // precision
+      0xFF, 0xFF,             // height = 65535
+      0xFF, 0xFF,             // width  = 65535
+      0x01,                   // Nf = 1
+      0x01, 0x11, 0x00,       // one component: id, sampling, quant table
+    ];
+
+    fn check(err: avanalyze::AnalyzeError) {
+      assert_eq!(err.kind(), AnalyzeErrorKind::RequestFailed);
+      assert!(err.message().contains("MAX_DECODED_IMAGE_BYTES"));
+    }
+
+    let options = AnalyzeOptions::new();
+    check(
+      VisionAnalyzer::new(&options)
+        .analyze_keyframe::<Plain>(huge_dims, &options)
+        .expect_err("over-cap decoded dimensions must be refused"),
+    );
+
+    let text = AppleVisionTextOptions::new();
+    check(
+      TextRecognizer::new(&text)
+        .recognize::<Text>(huge_dims, &text)
+        .expect_err("over-cap decoded dimensions must be refused"),
+    );
+
+    let barcode = AppleVisionBarcodeOptions::new();
+    check(
+      BarcodeDetector::new(&barcode)
+        .detect::<Barcode>(huge_dims, &barcode)
+        .expect_err("over-cap decoded dimensions must be refused"),
+    );
+
+    let face = AppleVisionFaceOptions::new();
+    check(
+      FaceDetector::new(&face)
+        .detect::<Face>(huge_dims, &face)
+        .expect_err("over-cap decoded dimensions must be refused"),
+    );
+
+    let landmarks = AppleVisionFaceLandmarkOptions::new();
+    check(
+      FaceLandmarker::new(&landmarks)
+        .detect::<FaceLandmarks>(huge_dims, &landmarks)
+        .expect_err("over-cap decoded dimensions must be refused"),
+    );
+
+    let poser = AppleVisionBodyPoserOptions::new();
+    check(
+      BodyPoser::new(&poser)
+        .detect_2d::<Pose>(huge_dims, &poser)
+        .expect_err("over-cap decoded dimensions must be refused"),
+    );
+    check(
+      BodyPoser::new(&poser)
+        .detect_3d::<Pose3>(huge_dims, &poser)
+        .expect_err("over-cap decoded dimensions must be refused"),
+    );
+
+    let hand = AppleVisionHandPoseOptions::new();
+    check(
+      HandPoser::new(&hand)
+        .detect::<HandPose>(huge_dims, &hand)
+        .expect_err("over-cap decoded dimensions must be refused"),
+    );
+
+    let animal = AppleVisionAnimalPoseOptions::new();
+    check(
+      AnimalPoser::new(&animal)
+        .detect::<AnimalPose>(huge_dims, &animal)
+        .expect_err("over-cap decoded dimensions must be refused"),
+    );
+
+    let masker = AppleVisionPersonMaskerOptions::new();
+    check(
+      PersonMasker::new(&masker)
+        .instance_masks::<InstanceMask>(huge_dims, &masker)
+        .expect_err("over-cap decoded dimensions must be refused"),
+    );
+    check(
+      PersonMasker::new(&masker)
+        .segmentation_masks::<SegmentationMask>(huge_dims, &masker)
+        .expect_err("over-cap decoded dimensions must be refused"),
+    );
+  }
 }

@@ -16,13 +16,15 @@ use objc2_foundation::{
 };
 
 use crate::{
+  AnalyzeErrorKind,
   face_landmarks::MAX_LANDMARK_POINTS,
   ffi::{
-    MAX_POSE_JOINT_ATTEMPTS_PER_CALL, MAX_POSE_JOINT_NAME_BYTES_PER_CALL, MAX_POSE_JOINTS,
-    MAX_POSE_JOINTS_PER_CALL, MAX_VISION_RESULTS_PER_FRAME, Performed, PoseBudget, PoseJoints,
-    collect_dictionary_pairs, finite_f32, guard_vision_ffi, pose_bbox_from_joint_bounds,
-    project_landmark_to_image, read_pose_joints, run_requests, validate_raw_slice_bytes,
-    validate_raw_slice_elems, vision_point_to_normalized, vision_rect_to_bbox,
+    MAX_DECODED_IMAGE_BYTES, MAX_POSE_JOINT_ATTEMPTS_PER_CALL, MAX_POSE_JOINT_NAME_BYTES_PER_CALL,
+    MAX_POSE_JOINTS, MAX_POSE_JOINTS_PER_CALL, MAX_VISION_RESULTS_PER_FRAME, Performed, PoseBudget,
+    PoseJoints, check_decoded_dimensions, collect_dictionary_pairs, finite_f32, guard_vision_ffi,
+    pose_bbox_from_joint_bounds, project_landmark_to_image, read_pose_joints, run_requests,
+    validate_raw_slice_bytes, validate_raw_slice_elems, vision_point_to_normalized,
+    vision_rect_to_bbox, with_image,
   },
   person_mask::MAX_MASK_BYTES,
 };
@@ -1356,4 +1358,225 @@ fn entry_points_are_not_shareable_across_workers() {
   assert_not_sync::<_, crate::HandPoser>();
   assert_not_sync::<_, crate::AnimalPoser>();
   assert_not_sync::<_, crate::PersonMasker>();
+}
+
+// ----- the decoded-dimension SOF preflight (issue #2) ------------------------
+
+/// Builds the smallest well-formed JPEG prefix [`check_decoded_dimensions`]
+/// needs: SOI followed by one SOF0 segment declaring `width` × `height` at
+/// 8-bit precision, with a single component. No entropy-coded data
+/// follows — the walk returns as soon as it reads the SOF, so none is
+/// needed.
+fn crafted_sof0(width: u16, height: u16) -> Vec<u8> {
+  crafted_sof0_with_precision(width, height, 0x08)
+}
+
+/// As [`crafted_sof0`], with an explicit sample precision byte.
+fn crafted_sof0_with_precision(width: u16, height: u16, precision: u8) -> Vec<u8> {
+  let [h0, h1] = height.to_be_bytes();
+  let [w0, w1] = width.to_be_bytes();
+  vec![
+    0xFF, 0xD8, // SOI
+    0xFF, 0xC0, // SOF0
+    0x00,
+    0x0B, // length = 11: itself(2) + precision(1) + height(2) + width(2) + Nf(1) + one component(3)
+    precision, h0, h1, // height, big-endian
+    w0, w1,   // width, big-endian
+    0x01, // Nf = 1
+    0x01, 0x11, 0x00, // component: id=1, sampling=0x11, quant table=0
+  ]
+}
+
+/// Ticket test 1/5: a truncated or empty input fails cleanly — refused,
+/// not panicked on — before any Vision call is even attempted.
+#[test]
+fn sof_preflight_rejects_truncated_or_empty_input() {
+  let cases: [&[u8]; 4] = [&[], &[0xFF, 0xD8], &[0xFF], &[0x00, 0x01, 0x02]];
+  for jpeg in cases {
+    let err = check_decoded_dimensions(jpeg).expect_err("truncated/empty input must be refused");
+    assert_eq!(err.kind(), AnalyzeErrorKind::RequestFailed);
+  }
+}
+
+/// Ticket test 2/5: a valid JPEG under the cap passes.
+#[test]
+fn sof_preflight_passes_a_real_keyframe_under_the_cap() {
+  const JPEG: &[u8] = include_bytes!("../../tests/fixtures/airport_keyframe.jpg");
+  check_decoded_dimensions(JPEG).expect("a real keyframe under the cap must pass preflight");
+}
+
+/// Ticket test 3/5: a valid JPEG declaring dimensions over the cap is
+/// rejected before `NSData::with_bytes` — proven here by driving the
+/// refusal through [`with_image`] itself, the one function that calls it,
+/// and asserting its body closure never runs.
+#[test]
+fn sof_preflight_rejects_over_cap_dimensions_before_ns_data() {
+  use std::cell::Cell;
+
+  // 65535 × 65535 × 4 bytes/pixel ≈ 16 GiB, far past the 512 MiB cap —
+  // the issue's own credible hostile case.
+  let jpeg = crafted_sof0(u16::MAX, u16::MAX);
+  let body_ran = Cell::new(false);
+
+  let err = with_image(&jpeg, |_handler, _data| {
+    body_ran.set(true);
+    Ok(())
+  })
+  .expect_err("over-cap decoded dimensions must be refused");
+
+  assert!(
+    !body_ran.get(),
+    "the preflight must refuse before NSData::with_bytes hands data to the request body"
+  );
+  assert_eq!(err.kind(), AnalyzeErrorKind::RequestFailed);
+  assert!(err.message().contains("MAX_DECODED_IMAGE_BYTES"));
+}
+
+/// Ticket test 4/5: a malformed JPEG with no SOF marker at all — SOI, one
+/// harmless APP0 segment, then straight to EOI — is rejected.
+#[test]
+fn sof_preflight_rejects_input_with_no_sof_marker() {
+  #[rustfmt::skip]
+  let jpeg: [u8; 10] = [
+    0xFF, 0xD8,                          // SOI
+    0xFF, 0xE0, 0x00, 0x04, 0x4A, 0x46,  // APP0, length 4, 2-byte payload
+    0xFF, 0xD9,                          // EOI -- no SOF ever appeared
+  ];
+  let err = check_decoded_dimensions(&jpeg).expect_err("input with no SOF marker must be refused");
+  assert_eq!(err.kind(), AnalyzeErrorKind::RequestFailed);
+  assert!(err.message().contains("no valid JPEG SOF marker"));
+}
+
+/// Ticket test 5/5: a forged SOF length field is rejected without a panic
+/// or an out-of-bounds read, in both lying directions — a length that
+/// reaches past the end of the buffer, and one shorter than the fixed
+/// header it claims to hold. `catch_unwind` makes "never panics" an
+/// explicit assertion here rather than an implicit one.
+#[test]
+fn sof_preflight_rejects_forged_sof_length_without_panic_or_oob() {
+  use std::panic::{AssertUnwindSafe, catch_unwind};
+
+  #[rustfmt::skip]
+  let length_past_buffer_end: [u8; 12] = [
+    0xFF, 0xD8,             // SOI
+    0xFF, 0xC0, 0xFF, 0xFF, // SOF0, length = 0xFFFF -- nowhere near the 6 bytes actually here
+    0x08, 0x00, 0x10, 0x00, 0x10, 0x01,
+  ];
+  #[rustfmt::skip]
+  let length_shorter_than_header: [u8; 8] = [
+    0xFF, 0xD8,             // SOI
+    0xFF, 0xC0, 0x00, 0x04, // SOF0, length = 4 -- covers only itself + 2 bytes, not the 8-byte header
+    0x08, 0x00,
+  ];
+
+  for jpeg in [&length_past_buffer_end[..], &length_shorter_than_header[..]] {
+    let result = catch_unwind(AssertUnwindSafe(|| check_decoded_dimensions(jpeg)));
+    let err = result
+      .expect("a forged SOF length must never panic or read out of bounds")
+      .expect_err("a forged SOF length must be refused");
+    assert_eq!(err.kind(), AnalyzeErrorKind::RequestFailed);
+    assert!(err.message().contains("malformed JPEG marker length"));
+  }
+}
+
+/// Beyond the five: the marker walk must terminate on a pathological input
+/// that never presents a real marker code — an SOI followed entirely by
+/// `0xFF` fill bytes — rather than loop. If it looped, this test would
+/// hang instead of failing an assertion.
+#[test]
+fn sof_preflight_terminates_on_a_long_run_of_fill_bytes() {
+  let mut jpeg = vec![0xFFu8; 4098];
+  jpeg[1] = 0xD8; // SOI; every other byte stays a 0xFF fill byte
+
+  let err = check_decoded_dimensions(&jpeg)
+    .expect_err("a buffer with no real marker code must be refused, not hang");
+  assert_eq!(err.kind(), AnalyzeErrorKind::RequestFailed);
+}
+
+/// Beyond the five: the cap compares strictly-greater-than, matching the
+/// issue's own wording ("above `MAX_DECODED_IMAGE_BYTES`") — dimensions
+/// landing exactly on the cap pass, and one pixel row more is refused.
+#[test]
+fn sof_preflight_boundary_is_at_and_just_over_the_cap() {
+  assert_eq!(MAX_DECODED_IMAGE_BYTES, 512 * 1024 * 1024);
+
+  // 16384 × 8192 × 4 bytes/pixel = exactly 512 MiB.
+  let at_cap = crafted_sof0(16384, 8192);
+  check_decoded_dimensions(&at_cap).expect("dimensions landing exactly on the cap must pass");
+
+  // One more pixel row pushes the decoded size one row past the cap.
+  let over_cap = crafted_sof0(16384, 8193);
+  let err =
+    check_decoded_dimensions(&over_cap).expect_err("dimensions just over the cap must be refused");
+  assert!(err.message().contains("MAX_DECODED_IMAGE_BYTES"));
+}
+
+/// Codex R1 finding (high): a SOF declaring sample precision above 8 bits
+/// decodes through ImageIO at double the baseline byte rate (16-bit/component
+/// RGBA, confirmed against real ImageIO) — 16384 × 8192 lands exactly on the
+/// cap at the 8-bit rate but must be refused at 12-bit precision, where the
+/// real decode is twice the declared budget.
+#[test]
+fn sof_preflight_charges_the_wider_rate_for_high_precision_frames() {
+  let baseline = crafted_sof0_with_precision(16384, 8192, 8);
+  check_decoded_dimensions(&baseline)
+    .expect("8-bit precision at exactly the cap still passes at the 4 bytes/pixel rate");
+
+  for precision in [9u8, 12, 16, 255] {
+    let high_precision = crafted_sof0_with_precision(16384, 8192, precision);
+    let err = check_decoded_dimensions(&high_precision).unwrap_err();
+    assert!(
+      err.message().contains("MAX_DECODED_IMAGE_BYTES"),
+      "precision {precision} must be charged at the wider byte rate and refused at this cap-boundary size"
+    );
+  }
+}
+
+/// Codex R1 finding (medium): JPEG permits a baseline SOF to declare
+/// `height = 0` and defer the real value to a DNL marker after the first
+/// scan (ITU-T T.81 §B.2.5). This preflight never reads that far, so a
+/// deferred height must be refused outright rather than silently treated
+/// as zero decoded bytes — the DNL-deferral bypass this closes: a hostile
+/// SOF claiming height zero while the real, DNL-supplied height is huge.
+#[test]
+fn sof_preflight_rejects_a_deferred_zero_height() {
+  let deferred_height = crafted_sof0(16384, 0);
+  let err = check_decoded_dimensions(&deferred_height)
+    .expect_err("a zero-height SOF (deferred to a later DNL marker) must be refused");
+  assert_eq!(err.kind(), AnalyzeErrorKind::RequestFailed);
+
+  // Width has no analogous deferral mechanism in the JPEG spec, but zero
+  // is refused for the same reason: a preflight that cannot establish a
+  // dimension must refuse rather than compute a budget of zero from it.
+  let zero_width = crafted_sof0(0, 16384);
+  check_decoded_dimensions(&zero_width).expect_err("a zero-width SOF must be refused");
+}
+
+/// Codex R2 finding (medium): a DHP marker (ITU-T T.81 Annex J,
+/// hierarchical JPEG) declares the *completed* image's dimensions in the
+/// same precision/height/width/Nf shape as a SOF payload, but a
+/// conforming hierarchical stream's first actual SOF can be small — a
+/// walk that stops at the first SOF alone would budget the small frame
+/// and miss the oversized completed image DHP declared. This SOF0(16, 16)
+/// would pass trivially on its own, proving the refusal comes from
+/// seeing DHP first, not from anything about the SOF that follows it.
+#[test]
+fn sof_preflight_rejects_hierarchical_jpeg_via_dhp() {
+  #[rustfmt::skip]
+  let mut jpeg: Vec<u8> = vec![
+    0xFF, 0xD8,             // SOI
+    0xFF, 0xDE, 0x00, 0x0B, // DHP, length 11 -- same shape as a SOF payload
+    0x08,                   // precision
+    0xFF, 0xFF,             // "completed" height = 65535
+    0xFF, 0xFF,             // "completed" width  = 65535
+    0x01,                   // Nf = 1
+    0x01, 0x11, 0x00,       // one component
+  ];
+  // Everything after crafted_sof0's own SOI: a small, otherwise-valid SOF0.
+  jpeg.extend_from_slice(&crafted_sof0(16, 16)[2..]);
+
+  let err = check_decoded_dimensions(&jpeg)
+    .expect_err("a DHP marker must be refused even though the small first SOF alone would pass");
+  assert_eq!(err.kind(), AnalyzeErrorKind::RequestFailed);
+  assert!(err.message().to_lowercase().contains("hierarchical"));
 }
