@@ -1,5 +1,49 @@
 # Changelog
 
+## Unreleased
+
+Attempt accounting now precedes every rejection branch it guards.
+
+### Fixed
+
+- **The per-frame mask attempt budget is charged at each walk step's entry**,
+  not after the gates that can skip the step. The charge used to sit below the
+  `u32::try_from` narrowing in the instance walk and below the confidence gate
+  in both mask extractors, so an adversarial result set bought unmetered work
+  under a ceiling that claimed to bound it: up to
+  `MAX_NESTED_INSTANCES_PER_OBSERVATION` (64) index visits ×
+  `MAX_VISION_RESULTS_PER_FRAME` (4096) observations = 262,144 `NSIndexSet`
+  traversals, and 4096 observation visits per extractor, all against a 1,024
+  ceiling. `MAX_TOTAL_MASK_ATTEMPTS_PER_FRAME` now bounds the walk itself.
+- **A face-landmark region visit is charged one unit before it can be
+  refused.** A region Vision did not report, an empty region, an over-cap
+  `pointCount`, and a null point buffer each returned without charging, so 13
+  named regions × 4096 observations = 53,248 region visits moved neither
+  budget. That total stayed under `MAX_FACE_LANDMARK_ATTEMPTS_PER_FRAME` only
+  by arithmetic accident; the ceiling now bounds the walk by construction. The
+  visit unit is a floor on a region refused before it walks anything, never a
+  surcharge on one that walks: the point walk is sized against the budget as it
+  stood before the visit and only the balance is charged, so a region that
+  walks costs exactly the points it walks and the frame's point cap falls
+  exactly where it fell before.
+- **A configured `max_instances_per_observation` of zero no longer reads an
+  instance index it will only reject.** The instance walk short-circuits before
+  `allInstances` / `firstIndex`, and its single advancement site is now the top
+  of each iteration, so no index beyond the per-observation cap is ever
+  fetched.
+
+These are resource-accounting fixes: for conforming Vision output the emitted
+detections, the emission budgets, and every `try_new` call are unchanged — a
+real frame reaches neither ceiling. What changes is that a corrupted or
+adversarial observation set can no longer run a rejection path for free.
+
+### Internal
+
+- `charge_mask_walk_step`, `charge_landmark_region_visit` and
+  `charge_landmark_points` are the only places either attempt budget is
+  charged. Each fuses its ceiling test with its charge, so a walk step cannot
+  reach a rejection branch without having paid, and a refusal charges nothing.
+
 ## 0.4.0 — 2026-08-22
 
 Face-pose angles and capture quality stop pretending "not measured" is
