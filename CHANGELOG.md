@@ -245,6 +245,34 @@ exactly the entries it enumerates, which is what the bulk charge took. What
 changes is that a corrupted or adversarial observation set can no longer run a
 rejection path for free.
 
+- **A JPEG's SOF marker can no longer buy an oversized Vision decode.**
+  `MAX_INPUT_IMAGE_BYTES` (R18) already caps the *compressed* input every
+  entry point accepts, but a small JPEG could still declare gigantic
+  *decoded* dimensions in its SOF marker — Vision / ImageIO allocates
+  buffers proportional to `width × height` once it decodes the frame,
+  before any downstream cap in this crate runs. `with_image` — the one
+  door every entry point's `NSData::with_bytes` goes through — now walks
+  the marker segments, allocation-free, to the first SOF and refuses
+  anything declaring more than `MAX_DECODED_IMAGE_BYTES` (512 MiB) once
+  decoded. The walk is defensive against truncated input, a missing SOF,
+  and a forged length field: every exit is a structured refusal, never a
+  panic or an out-of-bounds read. The byte budget is precision-aware —
+  SOF1/SOF3 and the other extended/lossless markers permit sample
+  precision above 8 bits, and ImageIO decodes those at double the
+  baseline byte rate (confirmed against real ImageIO), so any precision
+  above 8 charges the wider rate rather than under-counting by 2×. A SOF
+  declaring a zero width or height is refused outright rather than
+  costed at zero decoded bytes: JPEG permits a baseline SOF to defer its
+  real height to a later DNL marker, which this preflight — stopping at
+  the first SOF, never reading into entropy-coded scan data — cannot see,
+  so an unreadable dimension is refused rather than treated as small. A
+  DHP marker (hierarchical JPEG, ITU-T T.81 Annex J) is refused outright
+  for the same reason: DHP declares the *completed* hierarchical image's
+  dimensions ahead of a sequence of SOF-delimited frames whose first
+  member can be small, so trusting only the first SOF once a DHP has been
+  seen would miss the real, larger completed size. Tracked as #2, the one
+  item PR #1 (R18) deferred.
+
 ### Internal
 
 - `MaskBudget::charge_walk_step`, `charge_landmark_region_visit`,
