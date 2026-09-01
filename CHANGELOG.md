@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.0 — 2026-09-02
 
 The one 18-seat bundle becomes nine entry points, each owning exactly its own
 Vision requests.
