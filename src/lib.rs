@@ -297,18 +297,22 @@ const MAX_TOTAL_MASKS_PER_FRAME: usize = 256;
 #[cfg(target_vendor = "apple")]
 const MAX_TOTAL_MASK_BYTES_PER_FRAME: usize = 256 * 1024 * 1024;
 
-/// Hard ceiling on the cumulative ATTEMPTED mask generations per
-/// frame, summed across both mask extractors. The emission-only
-/// counters (count, bytes) only increment after a successful copy
-/// and push; a corrupted Vision result whose generate-copy-u32-fit
-/// gates all fail would otherwise drive unbounded
-/// `generateMaskForInstances_error` calls (each forcing Vision to
-/// compute/allocate a mask buffer) while the emission counters
-/// stay below their caps. The attempt budget bounds the
-/// failure-path work itself (codex R15 + R16).
+/// Hard ceiling on the cumulative mask WALK STEPS attempted per frame,
+/// summed across both mask extractors. One step is one observation
+/// visited by either extractor, or one instance index visited inside
+/// the instance walk. The emission-only counters (count, bytes) only
+/// increment after a successful copy and push; a corrupted Vision
+/// result whose confidence / u32-fit / generate / copy gates all fail
+/// would otherwise drive unbounded traversal — `NSIndexSet` walks and
+/// `generateMaskForInstances_error` calls, each forcing Vision to
+/// compute/allocate a mask buffer — while the emission counters stay
+/// below their caps. The attempt budget bounds the failure-path work
+/// itself, and is charged at each step's entry so no rejection branch
+/// beneath it is free (codex R15 + R16 + R9).
 ///
 /// Sized as `4 * MAX_TOTAL_MASKS_PER_FRAME` (= 1024): each emitted
-/// mask gets up to 3 failed sibling attempts before the budget
+/// mask gets up to 3 further steps — a failed sibling attempt, the
+/// visit of the observation that carried it — before the budget
 /// trips, which leaves ample headroom for transient Vision
 /// failures while keeping the attempt cap tied to the emission
 /// cap rather than the much larger general results-array cap.
@@ -319,18 +323,20 @@ const MAX_TOTAL_MASK_BYTES_PER_FRAME: usize = 256 * 1024 * 1024;
 #[cfg(target_vendor = "apple")]
 const MAX_TOTAL_MASK_ATTEMPTS_PER_FRAME: usize = 4 * MAX_TOTAL_MASKS_PER_FRAME;
 
-/// Hard ceiling on the cumulative ATTEMPTED face-landmark points
-/// visited per frame across all detections × all 13 named regions.
-/// Symmetric with `MAX_TOTAL_MASK_ATTEMPTS_PER_FRAME`: a corrupted
-/// observation set where every region's points fail
-/// `vision_point_to_normalized`'s finite check (or where the parent
-/// detection later fails the bbox / min_region_count gates) would
-/// otherwise let the helper walk up to
+/// Hard ceiling on the cumulative face-landmark walk attempted per
+/// frame across all detections × all 13 named regions: one unit per
+/// region VISITED plus one per raw point walked. Symmetric with
+/// `MAX_TOTAL_MASK_ATTEMPTS_PER_FRAME`: a corrupted observation set
+/// where every region's points fail `vision_point_to_normalized`'s
+/// finite check (or where the parent detection later fails the bbox /
+/// min_region_count gates) would otherwise let the helper walk up to
 /// `4096 * 13 * MAX_LANDMARK_POINTS` raw points without the
 /// per-frame emission budget ever decreasing. Sized as
 /// `4 * MAX_FACE_LANDMARK_POINTS_PER_FRAME` so a successful frame
 /// can tolerate non-finite/dropped points before the attempt cap
-/// trips (codex R17 F1).
+/// trips (codex R17 F1). The per-visit unit is what keeps a region
+/// Vision refused — absent, empty, over-cap, or null-buffered — from
+/// costing nothing at all (codex R9).
 #[cfg(target_vendor = "apple")]
 const MAX_FACE_LANDMARK_ATTEMPTS_PER_FRAME: usize = 4 * MAX_FACE_LANDMARK_POINTS_PER_FRAME;
 
@@ -479,6 +485,121 @@ fn guard_vision_ffi<R>(detector: &'static str, fallback: R, f: impl FnOnce() -> 
 #[inline]
 fn effective_results_cap(user_max: usize) -> usize {
   user_max.min(MAX_VISION_RESULTS_PER_FRAME)
+}
+
+// ----- attempt accounting precedes every rejection branch --------------------
+//
+// An emission counter rises only on success, so it bounds what a frame
+// EMITS and nothing else. The failure paths — a confidence gate, a `u32`
+// narrowing, a Vision call that returns `Err`, a copy the byte budget
+// refuses, an over-cap self-reported length, a null buffer — each cost FFI
+// traversal, and an adversarial result set can reach them once per visited
+// item. Only an ATTEMPT counter bounds that, and only if it is charged
+// BEFORE the walk can branch: a charge that sits after an early `continue`
+// is not a bound on the loop, it is a bound on the loop's productive steps.
+//
+// The two helpers below are the only places either attempt budget is
+// charged. Each fuses the ceiling test and the charge into one call so a
+// call site cannot reach a rejection branch without having paid: the call is
+// the first statement of the walk step, and a refusal charges nothing.
+
+/// Gate one step of a mask walk on every per-frame mask ceiling and charge
+/// the frame's attempt budget for it, indivisibly.
+///
+/// A step is one observation visited by either mask extractor, or one
+/// instance index visited inside the instance walk. `false` means a ceiling
+/// is reached and the caller stops walking; the budget is left untouched, so
+/// a refusal charges nothing.
+///
+/// The count and byte ceilings are read, never charged, here — they are
+/// emission budgets that [`extract_person_instance_masks`] and
+/// [`extract_person_segmentation_masks`] advance on a successful push.
+#[cfg(target_vendor = "apple")]
+#[inline]
+fn charge_mask_walk_step(
+  total_mask_bytes: usize,
+  total_mask_count: usize,
+  total_mask_attempts: &mut usize,
+) -> bool {
+  if total_mask_count >= MAX_TOTAL_MASKS_PER_FRAME
+    || total_mask_bytes >= MAX_TOTAL_MASK_BYTES_PER_FRAME
+    || *total_mask_attempts >= MAX_TOTAL_MASK_ATTEMPTS_PER_FRAME
+  {
+    return false;
+  }
+  *total_mask_attempts = total_mask_attempts.saturating_add(1);
+  true
+}
+
+/// Gate one face-landmark region visit on the per-frame landmark budgets and
+/// charge the frame's attempt budget one unit for the visit itself,
+/// indivisibly.
+///
+/// Without the visit charge, a region Vision did not report, an empty
+/// region, an over-cap `pointCount`, and a null point buffer would each be
+/// free — reachable once per named region per observation, which is 13 ×
+/// [`MAX_VISION_RESULTS_PER_FRAME`] region visits that move neither budget.
+///
+/// Returns the attempt budget that was available BEFORE the visit, which is
+/// what [`charge_landmark_points`] sizes the point walk against. The visit
+/// unit is therefore a FLOOR on a region refused before it walks anything,
+/// never a SURCHARGE on one that walks: a region that walks its points costs
+/// exactly those points, and the frame's point cap lands in exactly the
+/// place it did before the visit unit existed.
+///
+/// `None` means a budget is exhausted and the caller stops; a refusal
+/// charges nothing.
+///
+/// `total_points_remaining` is read, never charged, here — it is the
+/// emission budget, spent only by points actually emitted.
+#[cfg(target_vendor = "apple")]
+#[inline]
+fn charge_landmark_region_visit(
+  total_points_remaining: usize,
+  total_landmark_attempts: &mut usize,
+) -> Option<usize> {
+  if total_points_remaining == 0 {
+    return None;
+  }
+  // `checked_sub` rather than `saturating_sub`: an over-counted budget (the
+  // conservative direction a caught Objective-C exception can leave behind)
+  // reads as exhausted, never as capacity.
+  let attempts_remaining =
+    MAX_FACE_LANDMARK_ATTEMPTS_PER_FRAME.checked_sub(*total_landmark_attempts)?;
+  if attempts_remaining == 0 {
+    return None;
+  }
+  *total_landmark_attempts = total_landmark_attempts.saturating_add(1);
+  Some(attempts_remaining)
+}
+
+/// Size one region's point walk against the frame's budgets and charge the
+/// balance of the attempt budget for it.
+///
+/// `attempts_remaining` is the value [`charge_landmark_region_visit`]
+/// returned — the budget as it stood BEFORE the visit unit. The walk is
+/// therefore capped exactly where it was capped before the visit unit
+/// existed, and only `region_cap - 1` is charged here, so the region's total
+/// cost is exactly `region_cap`: the points it walks, no more.
+///
+/// `None` means the frame cannot afford to walk a single point and the
+/// region is dropped whole.
+#[cfg(target_vendor = "apple")]
+#[inline]
+fn charge_landmark_points(
+  point_count: usize,
+  total_points_remaining: usize,
+  attempts_remaining: usize,
+  total_landmark_attempts: &mut usize,
+) -> Option<usize> {
+  let region_cap = point_count
+    .min(total_points_remaining)
+    .min(attempts_remaining);
+  if region_cap == 0 {
+    return None;
+  }
+  *total_landmark_attempts = total_landmark_attempts.saturating_add(region_cap - 1);
+  Some(region_cap)
 }
 
 /// Validate a byte-length payload pre-`from_raw_parts`. Two
@@ -1300,11 +1421,21 @@ impl VisionAnalyzer {
     //   and applied to the master only when the detection survives
     //   every gate).
     // - `total_landmark_attempts` — attempt budget; immediately
-    //   committed every time `push_face_landmark_region` visits a
-    //   region's slice, regardless of whether the parent detection
-    //   ultimately survives. Bounds the FAILURE-PATH work that the
-    //   emission budget alone could not catch (codex R17 F1, same
-    //   policy as `MAX_TOTAL_MASK_ATTEMPTS_PER_FRAME`).
+    //   committed every time `push_face_landmark_region` VISITS a
+    //   region (one unit, charged at entry) and again for every point
+    //   it walks, regardless of whether the region yields anything or
+    //   the parent detection ultimately survives. Bounds the
+    //   FAILURE-PATH work that the emission budget alone could not
+    //   catch (codex R17 F1 + R9, same policy as
+    //   `MAX_TOTAL_MASK_ATTEMPTS_PER_FRAME`).
+    //
+    // The observation-level gates below (absent landmarks, confidence,
+    // an invalid face bbox) are deliberately NOT charged: refusing a
+    // doomed observation before it can spend the landmark budget is
+    // codex R17 F1's own sub-recommendation, and the walk they bound
+    // is `MAX_VISION_RESULTS_PER_FRAME` (4096) observation visits —
+    // one sixteenth of this attempt ceiling, so no unmetered work
+    // escapes a ceiling that claims to bound it.
     let mut total_points_remaining: usize = MAX_FACE_LANDMARK_POINTS_PER_FRAME;
     let mut total_landmark_attempts: usize = 0;
     for obs in results.iter().take(MAX_VISION_RESULTS_PER_FRAME) {
@@ -1698,9 +1829,11 @@ impl VisionAnalyzer {
     // counters, so the cap holds across the keyframe as a whole.
     let mut masks = Vec::new();
     'outer: for observation in results.iter().take(MAX_VISION_RESULTS_PER_FRAME) {
-      if *total_mask_count >= MAX_TOTAL_MASKS_PER_FRAME
-        || *total_mask_bytes >= MAX_TOTAL_MASK_BYTES_PER_FRAME
-      {
+      // The walk step's first act: ceiling test AND attempt charge, before
+      // the confidence gate below can `continue` and before the inner
+      // instance walk can reject an index. Visiting an observation costs an
+      // FFI read whether or not it survives its gates.
+      if !charge_mask_walk_step(*total_mask_bytes, *total_mask_count, total_mask_attempts) {
         break;
       }
       let Some(confidence) =
@@ -1709,29 +1842,49 @@ impl VisionAnalyzer {
         continue;
       };
 
+      let inner_cap = opts
+        .max_instances_per_observation()
+        .min(MAX_NESTED_INSTANCES_PER_OBSERVATION);
+      // `max_instances_per_observation` is an unbounded `usize` knob, so a
+      // configured zero is a valid instruction to walk no instances at all.
+      // Short-circuit BEFORE `allInstances` / `firstIndex`, so a cap of zero
+      // cannot read an index it will only reject (codex R9 follow-up). The
+      // old loop emitted nothing in this case either — it broke on its first
+      // test — so the output is identical.
+      if inner_cap == 0 {
+        continue;
+      }
       let instances = unsafe { observation.allInstances() };
-      let mut instance_index = instances.firstIndex();
       // Track ATTEMPTS (every iteration), not just successful
       // emissions — otherwise a corrupted NSIndexSet whose entries
       // all fail generation/copy/u32 conversion can drive unbounded
       // traversal at full Vision-call cost per iteration
       // (codex R14 F2).
-      let mut visited = 0usize;
-      let inner_cap = opts
-        .max_instances_per_observation()
-        .min(MAX_NESTED_INSTANCES_PER_OBSERVATION);
-      while instance_index != NSNotFound as usize {
-        if visited >= inner_cap {
+      //
+      // The walk is bounded by `inner_cap` in the loop header, and the ONE
+      // advancement site is the top of each iteration after the first —
+      // so every rejection below is a plain `continue` that cannot forget
+      // to advance, and no index beyond the cap is ever fetched.
+      let mut instance_index = instances.firstIndex();
+      for visited in 0..inner_cap {
+        if visited > 0 {
+          instance_index = instances.indexGreaterThanIndex(instance_index);
+        }
+        if instance_index == NSNotFound as usize {
           break;
         }
-        visited += 1;
-        // Per-frame budget check: stop the entire extraction once
-        // any ceiling is reached (success-path counters OR the
-        // failure-path attempt counter from codex R15).
-        if *total_mask_count >= MAX_TOTAL_MASKS_PER_FRAME
-          || *total_mask_bytes >= MAX_TOTAL_MASK_BYTES_PER_FRAME
-          || *total_mask_attempts >= MAX_TOTAL_MASK_ATTEMPTS_PER_FRAME
-        {
+        // Per-frame budget check AND the attempt charge for this index,
+        // as one step, before ANY branch that can skip the index: the
+        // `u32` narrowing below, the Vision generation, and the copy are
+        // all rejection paths, and each visited index costs an
+        // `NSIndexSet` traversal whether or not it survives them.
+        //
+        // The charge used to sit after the `u32::try_from`
+        // early-`continue`, which left `inner_cap` × 4096 index visits
+        // uncharged against a 1,024 ceiling (codex R9). Stops the whole
+        // extraction when a ceiling is reached — success-path counters
+        // OR the failure-path attempt counter (codex R15).
+        if !charge_mask_walk_step(*total_mask_bytes, *total_mask_count, total_mask_attempts) {
           break 'outer;
         }
 
@@ -1739,21 +1892,16 @@ impl VisionAnalyzer {
         // or copying the mask — overflowing here would force a
         // costly retry per-iteration; cheaper to skip up-front.
         let Ok(wire_instance_index) = u32::try_from(instance_index) else {
-          instance_index = instances.indexGreaterThanIndex(instance_index);
           continue;
         };
 
-        // Charge the per-frame attempt budget BEFORE the
-        // expensive Vision call. Even if generation fails (Apple
-        // returns Err), it still costs Vision time + intermediate
-        // alloc, so the failure path must be frame-budgeted
-        // (codex R15 F1).
-        *total_mask_attempts = total_mask_attempts.saturating_add(1);
+        // The attempt budget is already charged above, so an `Err` from
+        // the expensive Vision call below — which still costs Vision time
+        // and an intermediate allocation — is frame-budgeted (codex R15 F1).
         let selected_instances = NSIndexSet::indexSetWithIndex(instance_index);
         let Ok(mask_buffer) =
           (unsafe { observation.generateMaskForInstances_error(&selected_instances) })
         else {
-          instance_index = instances.indexGreaterThanIndex(instance_index);
           continue;
         };
 
@@ -1764,7 +1912,6 @@ impl VisionAnalyzer {
         let Some((bbox, width, height, data)) =
           copy_instance_mask_buffer::<D::BoundingBox>(&mask_buffer, remaining_budget)
         else {
-          instance_index = instances.indexGreaterThanIndex(instance_index);
           continue;
         };
 
@@ -1789,8 +1936,6 @@ impl VisionAnalyzer {
             // model.
           }
         }
-
-        instance_index = instances.indexGreaterThanIndex(instance_index);
       }
     }
 
@@ -1815,10 +1960,14 @@ impl VisionAnalyzer {
     // R14 F1).
     let mut masks = Vec::new();
     for observation in results.iter().take(MAX_VISION_RESULTS_PER_FRAME) {
-      if *total_mask_count >= MAX_TOTAL_MASKS_PER_FRAME
-        || *total_mask_bytes >= MAX_TOTAL_MASK_BYTES_PER_FRAME
-        || *total_mask_attempts >= MAX_TOTAL_MASK_ATTEMPTS_PER_FRAME
-      {
+      // Ceiling test AND attempt charge as one step, before the confidence
+      // gate below can `continue`. The charge used to sit after that gate,
+      // which left 4096 observation visits uncharged against a 1,024
+      // ceiling (codex R9). Charging first also keeps the failure paths
+      // beneath it — the pixel-buffer pull and the copy, both of which cost
+      // FFI traversal and a bounded allocation — frame-budgeted (codex R15
+      // F1, same policy as the instance-mask extractor).
+      if !charge_mask_walk_step(*total_mask_bytes, *total_mask_count, total_mask_attempts) {
         break;
       }
       let Some(confidence) =
@@ -1827,12 +1976,6 @@ impl VisionAnalyzer {
         continue;
       };
 
-      // Charge the per-frame attempt budget before pulling the
-      // pixel buffer and running the copy. Even a failing copy
-      // path costs FFI traversal + bounded alloc, so the failure
-      // path must be frame-budgeted (codex R15 F1, same policy as
-      // the instance-mask extractor).
-      *total_mask_attempts = total_mask_attempts.saturating_add(1);
       let pixel_buffer = unsafe { observation.pixelBuffer() };
       // Pre-allocation budget check: refuse the mask before alloc
       // if it would overshoot the per-frame cumulative budget.
@@ -2348,11 +2491,18 @@ fn push_face_landmark_region<R: FaceLandmarkRegion>(
   total_points_remaining: &mut usize,
   total_landmark_attempts: &mut usize,
 ) {
-  if *total_points_remaining == 0
-    || *total_landmark_attempts >= MAX_FACE_LANDMARK_ATTEMPTS_PER_FRAME
-  {
+  // Ceiling test AND the visit's own attempt charge, as one step, before
+  // any of the four rejection branches below: a region Vision did not
+  // report, an empty region, an over-cap `pointCount`, and a null point
+  // buffer each cost an FFI read, and each is reachable once per named
+  // region per observation. `attempts_remaining` is the budget as it stood
+  // BEFORE that unit, so the point walk further down is capped exactly
+  // where it was capped before this charge existed.
+  let Some(attempts_remaining) =
+    charge_landmark_region_visit(*total_points_remaining, total_landmark_attempts)
+  else {
     return;
-  }
+  };
   let Some(region) = region else {
     return;
   };
@@ -2384,19 +2534,21 @@ fn push_face_landmark_region<R: FaceLandmarkRegion>(
   // already validated against MAX_LANDMARK_POINTS above. Also
   // bound by the remaining attempt budget so we never visit more
   // points than the frame can afford to walk.
-  let attempts_remaining =
-    MAX_FACE_LANDMARK_ATTEMPTS_PER_FRAME.saturating_sub(*total_landmark_attempts);
-  let region_cap = point_count
-    .min(*total_points_remaining)
-    .min(attempts_remaining);
-  if region_cap == 0 {
-    return;
-  }
-  // Charge the ATTEMPT budget for every point we're about to walk,
-  // up front and unconditionally. Whether the points later survive
-  // finite-checks or the parent detection survives its gates, the
+  //
+  // Charges the ATTEMPT budget for every point we're about to walk, up
+  // front and unconditionally, minus the one unit the visit already paid
+  // — so a region that walks costs exactly the points it walks, and the
+  // visit unit never shifts where the cap falls. Whether the points later
+  // survive finite-checks or the parent detection survives its gates, the
   // walk itself is bounded by this budget (codex R17 F1).
-  *total_landmark_attempts = total_landmark_attempts.saturating_add(region_cap);
+  let Some(region_cap) = charge_landmark_points(
+    point_count,
+    *total_points_remaining,
+    attempts_remaining,
+    total_landmark_attempts,
+  ) else {
+    return;
+  };
   // SAFETY: `points_ptr` points at `point_count` valid `CGPoint`s
   // (Vision API contract). `region_cap <= point_count` and
   // `region_cap <= MAX_LANDMARK_POINTS` (verified via

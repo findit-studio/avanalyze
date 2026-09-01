@@ -5,7 +5,9 @@
 //! (`mediaschema`) so the assertions exercise a real validating
 //! implementation rather than a permissive stub.
 
-use mediaschema::domain::aggregates::video::BoundingBox as DomainBoundingBox;
+use mediaschema::domain::aggregates::video::{
+  BoundingBox as DomainBoundingBox, FaceLandmarkRegion as DomainFaceLandmarkRegion,
+};
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 
 use crate::*;
@@ -926,5 +928,308 @@ fn guard_vision_ffi_catches_objc_exception_and_returns_fallback() {
   assert_eq!(
     got, 7u32,
     "guard must return the fallback after catching the NSException"
+  );
+}
+
+// ----- attempt accounting precedes every rejection branch --------------------
+//
+// Each test below is shaped as an adversarial walk: an input that reaches a
+// rejection branch on EVERY step and emits nothing at all. Under the previous
+// order every such step was free, so the walk ran to its structural cap
+// instead of its ceiling. The assertions pin the ceiling as the bound.
+
+/// A mask walk that emits nothing must still terminate at
+/// [`MAX_TOTAL_MASK_ATTEMPTS_PER_FRAME`].
+///
+/// This is the shape of an `NSIndexSet` whose every index is above
+/// `u32::MAX`: `u32::try_from` rejects each one, the emission counters
+/// (count, bytes) never move, and the walk advances by pure
+/// `indexGreaterThanIndex` traversal. The charge used to sit AFTER that
+/// early `continue`, so [`MAX_NESTED_INSTANCES_PER_OBSERVATION`] (64)
+/// indices × [`MAX_VISION_RESULTS_PER_FRAME`] (4096) observations =
+/// 262,144 index visits ran uncharged against a 1,024 ceiling. Charging at
+/// the step's entry bounds the same walk at 1,024.
+///
+/// The loop's own hard stop is that 262,144 — the reach the ceiling failed
+/// to bound — so a regression that drops the charge fails this test rather
+/// than hanging.
+#[test]
+fn mask_walk_that_emits_nothing_stops_at_the_attempt_ceiling() {
+  let old_order_reach = MAX_NESTED_INSTANCES_PER_OBSERVATION * MAX_VISION_RESULTS_PER_FRAME;
+  assert!(
+    old_order_reach > MAX_TOTAL_MASK_ATTEMPTS_PER_FRAME,
+    "the walk this test pins must be able to overrun the ceiling: {old_order_reach} visits vs a \
+     {MAX_TOTAL_MASK_ATTEMPTS_PER_FRAME} ceiling"
+  );
+
+  let mut total_mask_attempts = 0usize;
+  let mut steps = 0usize;
+  for _ in 0..old_order_reach {
+    // Emission counters stay at zero: nothing this walk visits is ever
+    // pushed, which is exactly why an emission budget cannot bound it.
+    if !charge_mask_walk_step(0, 0, &mut total_mask_attempts) {
+      break;
+    }
+    steps += 1;
+  }
+
+  assert_eq!(
+    steps, MAX_TOTAL_MASK_ATTEMPTS_PER_FRAME,
+    "an all-rejecting mask walk is bounded by the attempt ceiling, not by its structural cap"
+  );
+  assert_eq!(total_mask_attempts, MAX_TOTAL_MASK_ATTEMPTS_PER_FRAME);
+}
+
+/// Every one of the three mask ceilings refuses the step, and a refusal
+/// charges nothing — the budget a caller reads after a `false` is the one
+/// it had before.
+#[test]
+fn mask_walk_refusal_charges_nothing() {
+  let mut on_count = 0usize;
+  assert!(!charge_mask_walk_step(
+    0,
+    MAX_TOTAL_MASKS_PER_FRAME,
+    &mut on_count
+  ));
+  assert_eq!(on_count, 0, "the emitted-count ceiling charges nothing");
+
+  let mut on_bytes = 0usize;
+  assert!(!charge_mask_walk_step(
+    MAX_TOTAL_MASK_BYTES_PER_FRAME,
+    0,
+    &mut on_bytes
+  ));
+  assert_eq!(on_bytes, 0, "the emitted-bytes ceiling charges nothing");
+
+  let mut on_attempts = MAX_TOTAL_MASK_ATTEMPTS_PER_FRAME;
+  assert!(!charge_mask_walk_step(0, 0, &mut on_attempts));
+  assert_eq!(
+    on_attempts, MAX_TOTAL_MASK_ATTEMPTS_PER_FRAME,
+    "the attempt ceiling charges nothing"
+  );
+}
+
+/// The last step below the ceiling is admitted and lands exactly on it;
+/// the next is refused. An off-by-one here would either lose a legitimate
+/// mask or overrun the cap.
+#[test]
+fn mask_walk_admits_an_exact_fit_at_the_attempt_ceiling() {
+  let mut attempts = MAX_TOTAL_MASK_ATTEMPTS_PER_FRAME - 1;
+  assert!(charge_mask_walk_step(0, 0, &mut attempts));
+  assert_eq!(attempts, MAX_TOTAL_MASK_ATTEMPTS_PER_FRAME);
+  assert!(!charge_mask_walk_step(0, 0, &mut attempts));
+  assert_eq!(attempts, MAX_TOTAL_MASK_ATTEMPTS_PER_FRAME);
+}
+
+/// A region Vision did not report costs the frame one attempt unit — and
+/// nothing else. Under the previous order the absent region returned before
+/// any charge, so it was free.
+///
+/// This drives the fixed function itself: `None` is precisely what
+/// `landmarks.leftPupil()` and its twelve siblings return for a region
+/// Vision declined to compute, and it is one of the four rejection branches
+/// the visit charge now precedes (the others — an empty region, an over-cap
+/// `pointCount`, a null point buffer — need a lying `VNFaceLandmarkRegion2D`
+/// to reach, and share this branch's accounting).
+#[test]
+fn absent_landmark_region_still_charges_its_visit() {
+  let face = CGRect::new(CGPoint::new(0.1, 0.1), CGSize::new(0.5, 0.5));
+  let mut regions: Vec<DomainFaceLandmarkRegion> = Vec::new();
+  let mut total_points_remaining = MAX_FACE_LANDMARK_POINTS_PER_FRAME;
+  let mut total_landmark_attempts = 0usize;
+
+  push_face_landmark_region(
+    &mut regions,
+    "leftPupil",
+    None,
+    face,
+    &mut total_points_remaining,
+    &mut total_landmark_attempts,
+  );
+
+  assert_eq!(
+    total_landmark_attempts, 1,
+    "the visit is charged before the absent-region branch can return"
+  );
+  assert_eq!(
+    total_points_remaining, MAX_FACE_LANDMARK_POINTS_PER_FRAME,
+    "the EMISSION budget is untouched — a refused region emits no points, so it spends none"
+  );
+  assert!(regions.is_empty());
+}
+
+/// A face set whose every named region is refused must stop at
+/// [`MAX_FACE_LANDMARK_ATTEMPTS_PER_FRAME`] rather than run to its
+/// structural cap.
+///
+/// The structural cap is 13 named regions × [`MAX_VISION_RESULTS_PER_FRAME`]
+/// = 53,248 region visits, every one of them free under the previous order.
+/// That total sat below this ceiling only by arithmetic accident
+/// (13 × 4096 < 4 × 16,384); charging the visit makes the ceiling the bound
+/// by construction, so raising the results cap or lowering the landmark
+/// budget cannot silently reopen the gap.
+#[test]
+fn landmark_walk_whose_regions_are_all_refused_stops_at_the_attempt_ceiling() {
+  let face = CGRect::new(CGPoint::new(0.1, 0.1), CGSize::new(0.5, 0.5));
+  let mut regions: Vec<DomainFaceLandmarkRegion> = Vec::new();
+  let mut total_points_remaining = MAX_FACE_LANDMARK_POINTS_PER_FRAME;
+  let mut total_landmark_attempts = 0usize;
+
+  let mut visits = 0usize;
+  for _ in 0..MAX_FACE_LANDMARK_ATTEMPTS_PER_FRAME + 1 {
+    let before = total_landmark_attempts;
+    push_face_landmark_region(
+      &mut regions,
+      "leftPupil",
+      None,
+      face,
+      &mut total_points_remaining,
+      &mut total_landmark_attempts,
+    );
+    if total_landmark_attempts == before {
+      break;
+    }
+    visits += 1;
+  }
+
+  assert_eq!(
+    visits, MAX_FACE_LANDMARK_ATTEMPTS_PER_FRAME,
+    "an all-refusing landmark walk is bounded by the attempt ceiling"
+  );
+  assert_eq!(
+    total_landmark_attempts, MAX_FACE_LANDMARK_ATTEMPTS_PER_FRAME,
+    "and never past it"
+  );
+  assert!(regions.is_empty());
+  assert_eq!(
+    total_points_remaining, MAX_FACE_LANDMARK_POINTS_PER_FRAME,
+    "no points were emitted, so the emission budget never moved"
+  );
+}
+
+/// Both landmark ceilings refuse the visit, and a refusal charges nothing.
+#[test]
+fn landmark_region_visit_refusal_charges_nothing() {
+  let mut on_points = 0usize;
+  assert!(charge_landmark_region_visit(0, &mut on_points).is_none());
+  assert_eq!(
+    on_points, 0,
+    "an exhausted emission budget refuses the visit without charging"
+  );
+
+  let mut on_attempts = MAX_FACE_LANDMARK_ATTEMPTS_PER_FRAME;
+  assert!(charge_landmark_region_visit(1, &mut on_attempts).is_none());
+  assert_eq!(
+    on_attempts, MAX_FACE_LANDMARK_ATTEMPTS_PER_FRAME,
+    "the attempt ceiling refuses the visit without charging"
+  );
+
+  // An over-counted budget — the direction a caught Objective-C exception
+  // can leave a counter in — reads as exhausted, never as capacity.
+  let mut overcounted = MAX_FACE_LANDMARK_ATTEMPTS_PER_FRAME + 7;
+  assert!(charge_landmark_region_visit(1, &mut overcounted).is_none());
+  assert_eq!(overcounted, MAX_FACE_LANDMARK_ATTEMPTS_PER_FRAME + 7);
+}
+
+/// The visit unit is a FLOOR on a region refused before it walks anything,
+/// never a SURCHARGE on one that walks. A region whose points exactly fit
+/// the attempt budget available before the visit still walks every one of
+/// them, and its total cost is exactly the points it walked — the same
+/// total, and the same cap, as before the visit unit existed.
+#[test]
+fn a_region_that_walks_costs_exactly_the_points_it_walks() {
+  const POINT_COUNT: usize = 76;
+  for available in [POINT_COUNT + 1, POINT_COUNT, POINT_COUNT - 1] {
+    let mut attempts = MAX_FACE_LANDMARK_ATTEMPTS_PER_FRAME - available;
+    let before = attempts;
+    let attempts_remaining =
+      charge_landmark_region_visit(MAX_FACE_LANDMARK_POINTS_PER_FRAME, &mut attempts)
+        .expect("the budget admits the visit");
+    assert_eq!(
+      attempts_remaining, available,
+      "the walk is sized against the budget as it stood BEFORE the visit"
+    );
+
+    let region_cap = charge_landmark_points(
+      POINT_COUNT,
+      MAX_FACE_LANDMARK_POINTS_PER_FRAME,
+      attempts_remaining,
+      &mut attempts,
+    )
+    .expect("a positive cap walks");
+    assert_eq!(
+      region_cap,
+      POINT_COUNT.min(available),
+      "the cap falls exactly where it fell before the visit unit existed"
+    );
+    assert_eq!(
+      attempts - before,
+      region_cap,
+      "the region's total cost is exactly the points it walks"
+    );
+    assert!(
+      attempts <= MAX_FACE_LANDMARK_ATTEMPTS_PER_FRAME,
+      "and the ceiling is never overshot: {attempts}"
+    );
+  }
+}
+
+/// The emission budget caps the walk the same way, and a frame that cannot
+/// afford a single point drops the region whole rather than emitting an
+/// empty one.
+#[test]
+fn landmark_point_charge_respects_the_emission_budget_and_drops_at_zero() {
+  let mut attempts = 0usize;
+  let capped = charge_landmark_points(500, 12, MAX_FACE_LANDMARK_ATTEMPTS_PER_FRAME, &mut attempts)
+    .expect("a positive cap walks");
+  assert_eq!(capped, 12, "the emission budget caps the walk");
+  assert_eq!(attempts, 11, "minus the one unit the visit already paid");
+
+  let mut none_left = 40usize;
+  assert!(
+    charge_landmark_points(500, 0, MAX_FACE_LANDMARK_ATTEMPTS_PER_FRAME, &mut none_left).is_none(),
+    "no emittable points left drops the region whole"
+  );
+  assert_eq!(none_left, 40, "and charges nothing further");
+
+  let mut no_attempts = 40usize;
+  assert!(
+    charge_landmark_points(500, 500, 0, &mut no_attempts).is_none(),
+    "no attempt budget left drops the region whole"
+  );
+  assert_eq!(no_attempts, 40, "and charges nothing further");
+}
+
+/// A configured `max_instances_per_observation` of zero is reachable — the
+/// knob is an unbounded `usize` with no lower clamp — which is why the
+/// instance walk short-circuits before `allInstances` / `firstIndex` rather
+/// than reading an index it would only reject.
+#[test]
+fn a_zero_instance_cap_is_a_configurable_state() {
+  let opts = AppleVisionPersonInstanceMaskOptions::new().with_max_instances_per_observation(0);
+  assert_eq!(opts.max_instances_per_observation(), 0);
+  assert_eq!(
+    opts
+      .max_instances_per_observation()
+      .min(MAX_NESTED_INSTANCES_PER_OBSERVATION),
+    0,
+    "the effective inner cap is zero, so the walk must fetch no index at all"
+  );
+}
+
+/// The visit charge is small enough that it cannot displace a conforming
+/// frame's points: 13 regions per face is a rounding error against a
+/// ceiling sized at four times the point budget, so the binding constraint
+/// on a real frame stays the emission budget it has always been.
+#[test]
+fn the_visit_charge_cannot_starve_a_conforming_frame() {
+  // A generous conforming frame: every point of the emission budget spent,
+  // one region visit charged per region that produced them.
+  let regions_visited = 13 * MAX_FACE_LANDMARK_POINTS_PER_FRAME / MAX_LANDMARK_POINTS;
+  let worst_case = MAX_FACE_LANDMARK_POINTS_PER_FRAME + regions_visited;
+  assert!(
+    worst_case < MAX_FACE_LANDMARK_ATTEMPTS_PER_FRAME,
+    "a frame that spends every emittable point still has attempt budget left: {worst_case} vs \
+     {MAX_FACE_LANDMARK_ATTEMPTS_PER_FRAME}"
   );
 }
