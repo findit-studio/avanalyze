@@ -408,29 +408,21 @@ fn service_options_num_workers_large() {
   assert_eq!(o.num_workers(), 64);
 }
 
+/// The eight sections `AnalyzeOptions` still carries are exactly the
+/// eight `Analysis` slots — and nothing else, now that every other
+/// capability configures its own entry point.
 #[test]
 fn service_options_all_sub_option_accessors() {
   let o = AnalyzeOptions::new();
   // Verify every sub-option accessor returns without panicking
   let _ = o.classifications();
-  let _ = o.face_capture();
-  let _ = o.face_rectangles();
-  let _ = o.face_landmarks();
   let _ = o.human_subjects();
   let _ = o.animals();
-  let _ = o.text();
-  let _ = o.body_pose();
-  let _ = o.hand_pose();
-  let _ = o.animal_pose();
-  let _ = o.body_pose_3d();
-  let _ = o.barcodes();
   let _ = o.attention_saliency();
   let _ = o.objectness_saliency();
   let _ = o.horizon();
   let _ = o.document_segments();
   let _ = o.aesthetics();
-  let _ = o.person_instance_masks();
-  let _ = o.person_segmentation_masks();
 }
 
 #[test]
@@ -438,19 +430,119 @@ fn service_options_mut_accessors_modify() {
   let mut o = AnalyzeOptions::new();
   o.classifications_mut().set_min_confidence(0.9);
   assert_eq!(o.classifications().min_confidence(), 0.9);
-  o.face_capture_mut().set_min_capture_quality(0.5);
-  assert_eq!(o.face_capture().min_capture_quality(), 0.5);
-  o.hand_pose_mut().set_maximum_hand_count(6);
-  assert_eq!(o.hand_pose().maximum_hand_count(), 6);
-  o.barcodes_mut().set_min_payload_len(5);
-  assert_eq!(o.barcodes().min_payload_len(), 5);
+  o.human_subjects_mut().set_min_confidence(0.4);
+  assert_eq!(o.human_subjects().min_confidence(), 0.4);
+  o.animals_mut().set_min_confidence(0.6);
+  assert_eq!(o.animals().min_confidence(), 0.6);
   o.attention_saliency_mut().set_max_regions(32);
   assert_eq!(o.attention_saliency().max_regions(), 32);
+  o.objectness_saliency_mut().set_max_regions(8);
+  assert_eq!(o.objectness_saliency().max_regions(), 8);
+  o.horizon_mut().set_min_confidence(0.3);
+  assert_eq!(o.horizon().min_confidence(), 0.3);
   o.document_segments_mut().set_max_segments(8);
   assert_eq!(o.document_segments().max_segments(), 8);
-  o.person_instance_masks_mut()
-    .set_max_instances_per_observation(4);
-  assert_eq!(o.person_instance_masks().max_instances_per_observation(), 4);
+  o.aesthetics_mut().set_min_overall_score(0.25);
+  assert_eq!(o.aesthetics().min_overall_score(), 0.25);
+}
+
+// ===== The composed per-entry options =====
+
+#[test]
+fn face_keypoints_defaults_and_builder() {
+  let o = AppleVisionFaceKeypointsOptions::new();
+  assert_eq!(o.min_confidence(), 0.1);
+  assert_eq!(
+    o.min_confidence(),
+    AppleVisionFaceKeypointsOptions::DEFAULT_MIN_CONFIDENCE
+  );
+  let o = o.with_min_confidence(0.6);
+  assert_eq!(o.min_confidence(), 0.6);
+  let mut o = AppleVisionFaceKeypointsOptions::default();
+  o.set_min_confidence(0.9);
+  assert_eq!(o.min_confidence(), 0.9);
+}
+
+/// `FaceDetector` reads one section per Vision pass it fuses; the
+/// three defaults come from the same source as the standalone types.
+#[test]
+fn face_options_compose_all_three_passes() {
+  let o = AppleVisionFaceOptions::new();
+  assert_eq!(
+    o.rectangles().min_confidence(),
+    AppleVisionFaceRectangleOptions::DEFAULT_MIN_CONFIDENCE
+  );
+  assert_eq!(
+    o.capture().min_capture_quality(),
+    AppleVisionFaceCaptureOptions::DEFAULT_MIN_CAPTURE_QUALITY
+  );
+  assert_eq!(
+    o.keypoints().min_confidence(),
+    AppleVisionFaceKeypointsOptions::DEFAULT_MIN_CONFIDENCE
+  );
+
+  let mut o = AppleVisionFaceOptions::default();
+  o.rectangles_mut().set_min_confidence(0.7);
+  o.capture_mut().set_min_capture_quality(0.8);
+  o.keypoints_mut().set_min_confidence(0.9);
+  assert_eq!(o.rectangles().min_confidence(), 0.7);
+  assert_eq!(o.capture().min_capture_quality(), 0.8);
+  assert_eq!(o.keypoints().min_confidence(), 0.9);
+  assert!(format!("{o:?}").contains("AppleVisionFaceOptions"));
+}
+
+/// `BodyPoser` reads one section per dimensionality, and moving one
+/// must not move the other.
+#[test]
+fn body_poser_options_compose_both_dimensions() {
+  let o = AppleVisionBodyPoserOptions::new();
+  assert_eq!(
+    o.pose_2d().min_joint_confidence(),
+    AppleVisionBodyPoseOptions::DEFAULT_MIN_JOINT_CONFIDENCE
+  );
+  assert_eq!(
+    o.pose_3d().min_joint_confidence(),
+    AppleVisionBodyPose3DOptions::DEFAULT_MIN_JOINT_CONFIDENCE
+  );
+
+  let mut o = AppleVisionBodyPoserOptions::default();
+  o.pose_2d_mut().set_min_joint_confidence(0.55);
+  assert_eq!(o.pose_2d().min_joint_confidence(), 0.55);
+  assert_eq!(
+    o.pose_3d().min_joint_confidence(),
+    AppleVisionBodyPose3DOptions::DEFAULT_MIN_JOINT_CONFIDENCE,
+    "the 3-D floor must not follow the 2-D one"
+  );
+  o.pose_3d_mut().set_min_joint_confidence(0.35);
+  assert_eq!(o.pose_3d().min_joint_confidence(), 0.35);
+  assert_eq!(o.pose_2d().min_joint_confidence(), 0.55);
+}
+
+/// `PersonMasker` reads one section per mask kind, and moving one
+/// must not move the other.
+#[test]
+fn person_masker_options_compose_both_kinds() {
+  let o = AppleVisionPersonMaskerOptions::new();
+  assert_eq!(
+    o.instances().max_instances_per_observation(),
+    AppleVisionPersonInstanceMaskOptions::DEFAULT_MAX_INSTANCES_PER_OBSERVATION
+  );
+  assert_eq!(
+    o.segmentation().min_confidence(),
+    AppleVisionPersonSegmentationOptions::DEFAULT_MIN_CONFIDENCE
+  );
+
+  let mut o = AppleVisionPersonMaskerOptions::default();
+  o.instances_mut().set_max_instances_per_observation(4);
+  assert_eq!(o.instances().max_instances_per_observation(), 4);
+  assert_eq!(
+    o.segmentation().min_confidence(),
+    AppleVisionPersonSegmentationOptions::DEFAULT_MIN_CONFIDENCE,
+    "the segmentation floor must not follow the instance knob"
+  );
+  o.segmentation_mut().set_min_confidence(0.65);
+  assert_eq!(o.segmentation().min_confidence(), 0.65);
+  assert_eq!(o.instances().max_instances_per_observation(), 4);
 }
 
 #[test]

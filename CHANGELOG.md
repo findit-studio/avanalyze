@@ -2,6 +2,199 @@
 
 ## Unreleased
 
+The one 18-seat bundle becomes nine entry points, each owning exactly its own
+Vision requests.
+
+### Breaking
+
+- **`VisionAnalyzer` keeps eight detections and loses ten.** It now owns eight
+  Vision requests — classification, human rectangles, animal recognition, both
+  saliency passes, horizon, document segmentation, aesthetics — and
+  `analyze_keyframe` performs only those. Text, barcodes, faces, landmarks,
+  poses and masks each moved to their own entry point. The old shape charged
+  every consumer for every capability: asking for one text run constructed
+  nineteen requests and ran nineteen models. A consumer of one capability now
+  constructs one entry point, loads one model, and names one output type.
+- **`Analysis` shrinks from eighteen slots to eight** —
+  `classifications`, `human_subjects`, `animal_subjects`,
+  `attention_saliency`, `objectness_saliency`, `document_segments`, `horizon`,
+  `aesthetics`. The `faces`, `face_landmarks`, `body_poses`, `hand_poses`,
+  `body_poses_3d`, `person_instance_masks`, `person_segmentation_masks`,
+  `animal_body_poses`, `text_detections` and `barcodes` slots are gone; their
+  entry points return a plain `Vec` instead.
+- **The `Detections` bundle names seven associated types, not twenty-one** —
+  `BoundingBox`, `Detection`, `SubjectDetection`, `SaliencyRegion`,
+  `HorizonInfo`, `DocumentSegment`, `Aesthetics`. Every other trait is now
+  reached directly, as a single generic parameter on the entry point that
+  builds it, and lives in that entry point's module.
+- **New entry points**, each with `new(&Options)` plus its own detection
+  method, each returning `Result<Vec<_>, AnalyzeError>`:
+  `TextRecognizer::recognize`, `BarcodeDetector::detect`,
+  `FaceDetector::detect`, `FaceLandmarker::detect`, `BodyPoser::detect_2d` /
+  `detect_3d`, `HandPoser::detect`, `AnimalPoser::detect`,
+  `PersonMasker::instance_masks` / `segmentation_masks`.
+- **`TextDetection::try_new` gains `observation: usize, rank: usize`.** One
+  Vision observation is one text region and can yield several candidate
+  readings of it, every one re-using the observation's box — so the box alone
+  could not tell two readings of one region from two overlapping regions. Both
+  indices were already in the engine's candidate loop and were being discarded
+  at the seam; they are now threaded out. `observation` indexes the observation
+  within the call's results, `rank` the candidate within that observation
+  (`0` = Vision's best). A consumer that keeps only `rank == 0` gets one row per
+  region; one that keeps them all can rank, diff or vote across readings without
+  inventing an identity of its own. Both are per call and mean nothing across
+  calls.
+- **`FaceDetector` fuses three passes into one record per face**, and
+  `FaceDetection::try_new` gains `keypoints: Option<FaceKeypoints>`. The
+  face-rectangles pass is the detection spine; its observations are handed to
+  the capture-quality and landmarks requests, which return them enriched with a
+  quality reading and with the 76→5-point reduction. `keypoints` is `None` where
+  Vision returned no landmark set for that face or the engine could not complete
+  the reduction — never an origin-valued placeholder. How a reading reaches a
+  face changed entirely — see **Behaviour** below.
+- **New `FaceKeypoints`**, an engine-owned five-point set in image-normalized,
+  top-left coordinates. `left_eye` / `right_eye` are the `leftPupil` /
+  `rightPupil` centroid when Vision reports one, else the eye contour's;
+  `nose_tip` is the `noseCrest` point (or `nose`, as fallback) farthest from the
+  eye midpoint, which is the tip by construction and does not depend on
+  Vision's undocumented point ordering; `mouth_left` / `mouth_right` are the
+  `outerLips` contour's minimum-x and maximum-x points, ties broken on `y`.
+  All five must be derivable or the whole set is `None`. `points()` returns them
+  in canonical alignment order. Cropping, alignment and embedding stay the
+  caller's business — the engine produces geometry and never an identity.
+- **`AnalyzeOptions` keeps eight sections and loses eleven.** `face_capture`,
+  `face_rectangles`, `face_landmarks`, `text`, `body_pose`, `hand_pose`,
+  `animal_pose`, `body_pose_3d`, `barcodes`, `person_instance_masks` and
+  `person_segmentation_masks` moved to the options type of the entry point that
+  reads them. The per-request options structs themselves are unchanged.
+  **Migrating a serialized config:** one that still names the eleven parses as
+  before and those keys are ignored, exactly as any other unknown key is on
+  every options type in this crate — so their values must be moved to the new
+  options types by hand, or the entry points that read them run on defaults.
+  The compile-time signal is the API break: all eleven accessors (`text()`,
+  `face_capture()`, …) are gone, so code that read one fails to build and names
+  the section it lost.
+- **New composed options**, following the existing section-per-subsystem idiom:
+  `AppleVisionFaceOptions` (`rectangles` / `capture` / `keypoints`),
+  `AppleVisionBodyPoserOptions` (`pose_2d` / `pose_3d`),
+  `AppleVisionPersonMaskerOptions` (`instances` / `segmentation`), plus
+  `AppleVisionFaceKeypointsOptions` for the reduction's own confidence floor.
+- **`conformance` is recast per entry point.** `assert_contract` and
+  `assert_refuses_invalid` now cover the core bundle only; every other
+  capability has its own assertion over its own single type
+  (`assert_text_accepts`, `assert_face_accepts`, `assert_body_pose_accepts`,
+  `assert_person_instance_mask_refusals`, …). Coverage does not shrink — the
+  old bundle-wide assertions are redistributed, and the text provenance pair,
+  the keypoint reduction, and the per-entry non-macOS stubs are new.
+
+### Behaviour
+
+- **The four pose extractors carry cumulative per-call joint, attempt and
+  name-byte budgets.** 2-D body, 3-D body, hand and animal pose each cap the
+  joints one call may walk, the joints it may emit, and the joint-name bytes it
+  may retain, summed across every observation in the frame — where before only
+  the per-observation joint dictionary was capped, and the two caps composed
+  into 4096 observations × 256 joints of names. A pose that cannot fit the
+  remainder is dropped WHOLE and extraction stops there; no pose is truncated to
+  fit. Hardening of pre-existing behaviour: a real frame is a couple of subjects
+  at ~20 joints each, orders of magnitude below every one of the three
+  ceilings.
+- **The per-frame mask budgets are now per call.** `instance_masks` and
+  `segmentation_masks` are separate Vision passes and each charges its own
+  count / cumulative-bytes / generation-attempt ceiling, where the single-pass
+  engine shared one budget across both mask surfaces. That is strictly more
+  permissive; a caller needing the old cumulative ceiling imposes it above this
+  crate.
+- **Every entry point enforces the 64 MiB input ceiling** and the Objective-C
+  exception barrier, not just the analyzer, and each gained a
+  `log_request_revisions` diagnostic (feature `tracing`) for the requests it
+  owns.
+- **A face's readings reach it by observation identity, and the overlap join is
+  gone.** The face-rectangles pass now runs FIRST and alone; its observations are
+  then set as the `inputFaceObservations` of the capture-quality and landmarks
+  requests, through Vision's own `VNFaceObservationAccepting` protocol. Those
+  requests process exactly the faces they were handed and return them enriched,
+  each carrying the `VNObservation.uuid` it was given — and a reading is seated
+  by that uuid, so it arrives at the face Vision computed it for because the
+  observation carrying it names that face. Attribution is a property of the
+  mechanism rather than a conclusion drawn from geometry. Deleted with the join:
+  the IoU ≥ 0.5 match floor, the global one-to-one assignment and its 65536-pair
+  ceiling, and the engine-internal join rectangle the assignment ran on. Argmax
+  overlap was never an ownership invariant — an annotating observation restricted
+  to its maximum-IoU spine face need not belong to that face, and no floor could
+  make it — so a face could wear a neighbour's `capture_quality` or `keypoints`
+  with nothing downstream able to tell. **This can change which readings a face
+  receives relative to 0.4.0**, in the direction of correctness: a face now wears
+  the reading Vision computed for it, or none.
+- **The handoff preserves observation identities, not their order — so the
+  correspondence is keyed and verified, never assumed.** `VNFaceObservationAccepting`
+  returns the same SET of observations, in an order of Vision's own choosing that
+  varies from run to run on one unchanged image. Measured on this host across two
+  independent 30-run samples of a 3-face frame: the returned uuid set matched the
+  spine 30/30 both times, while the returned ORDER matched it in only 14/30 and
+  15/30 of the capture-quality runs and 12/30 and 15/30 of the landmarks runs, with
+  all six permutations of three elements observed. Reading either pass by array position
+  would have mis-seated roughly half of all multi-face frames — every face carrying
+  a real reading computed for one of its neighbours. The engine resolves each pass's
+  uuids onto spine positions instead, refuses the pass unless that resolution is a
+  bijection, and reduces in SPINE order so that which face loses its reduction under
+  the per-frame landmark budgets depends on the image alone, not on the order Vision
+  happened to return.
+- **A face detection is two `performRequests` on one image, not one.** The spine
+  must exist before the other two requests can be fed, so the three face passes
+  no longer run in a single batch. The two annotating requests still run
+  together, in one perform.
+- **An annotating face pass annotates only when its results correspond to the
+  spine.** Each pass is refused independently on four conditions: no results
+  array, a length that differs from the spine's, a returned observation whose
+  uuid string could not be read, or a uuid set that does not resolve one-to-one
+  onto the spine's. Any of the four makes that ONE pass absent for every face;
+  the other still annotates. With the default positive `min_capture_quality` a
+  frame whose quality pass did not correspond therefore yields no faces at all;
+  a caller who wants the faces anyway sets `min_capture_quality` to 0.0 and gets
+  them with both annotations absent. The returned observation's `boundingBox` is
+  **not** compared: the uuid is the identity token, so a box check on top of it
+  is redundant where Vision returns the box unchanged (measured bit-identical,
+  60/60 pass-reads) and wrongly fail-closed if a future Vision refined a box it
+  re-examined.
+- **A caught Objective-C exception can no longer replay an earlier frame.** The
+  exception barrier turned a raising perform into a bare `Ok`, so a caller could
+  not tell a completed perform from an aborted one and read `results` off the
+  request either way. A `VNRequest` is retained across calls and Vision gives no
+  clearing postcondition for a request it did not process, so those `results`
+  may still describe the last SUCCESSFUL call — and in the face fusion that
+  would have made the previous frame's faces this frame's spine, handed verbatim
+  to the annotating passes, which preserve their uuids: the identity check would
+  have seen a valid bijection because the entire identity universe was stale
+  together. A perform now reports whether it ran, and request state is read on
+  exactly one condition — this call's own perform completed. A raise costs THIS
+  frame's detections (an empty `Vec`) or THIS frame's face annotations (absent at
+  every seat), which is what the barrier always claimed it cost. Two further
+  cases in the same class: `FaceDetector::detect` performs the annotating passes
+  only when BOTH took this call's input observations, because a face request
+  performed with a nil `inputFaceObservations` runs its own face detection and
+  returns faces the spine never saw; and the two input clears are now
+  independently guarded, so one raising cannot leave the other request holding
+  this frame's observations into the next call.
+- **The four pose joint-dictionary readers no longer go through
+  `NSDictionary::to_vecs()`.** The 2-D body, 3-D body, hand and animal paths now
+  enumerate the joint dictionary bounded — `keys()` taken at one past
+  `MAX_POSE_JOINTS` — and pair each joint name with the value found under it by
+  keyed lookup, refusing the pose when the dictionary's self-reported count
+  disagrees with what it actually enumerates. `to_vecs()` presents a safe
+  surface over an unsafe bulk copy: it allocates two vectors sized to the
+  FFI-reported `count`, fills them with the deprecated unbounded
+  `getObjects:andKeys:` — which Apple's own header calls out as unsafe because
+  it can overrun — and then `set_len`s both to that same count, so a malformed
+  Vision dictionary could write past the allocations or expose uninitialised
+  pointers before any Rust-side check could reject it. A joint-count guard in
+  front of the call could not help, because it read the very number that was not
+  to be believed. Keyed lookup also retires the parallel-array assumption the
+  old `zip` carried. This is a hardening of pre-existing behaviour, not a
+  contract change: a sound dictionary reads exactly as before, and over the cap
+  the pose is still DROPPED rather than truncated.
+
+
 Attempt accounting now precedes every rejection branch it guards.
 
 ### Fixed
@@ -31,18 +224,42 @@ Attempt accounting now precedes every rejection branch it guards.
   `allInstances` / `firstIndex`, and its single advancement site is now the top
   of each iteration, so no index beyond the per-observation cap is ever
   fetched.
+- **A pose joint entry is charged as it is walked, inside the joint dictionary
+  reader.** The charge used to be one bulk `charge_attempts(pairs.len())` after
+  the read had returned, so it never ran on the read's own rejection paths: a
+  dictionary reporting `MAX_POSE_JOINTS` (256) entries and enumerating one
+  fewer was allocated for, enumerated, and keyed-looked-up entry by entry, and
+  the refusal that followed cost nothing — 256 entry walks × 4096 observations
+  = 1,048,576 walks against an 8192-attempt ceiling that never moved. The
+  reader now takes the budget and charges one unit per entry, before that
+  entry's keyed lookup, and reports budget exhaustion distinctly from
+  malformation: a malformed dictionary drops its own pose and the frame
+  continues, an exhausted budget stops the extraction. The
+  `reported > max_entries` refusal is decided before the enumeration begins, so
+  it still walks nothing and charges nothing.
 
 These are resource-accounting fixes: for conforming Vision output the emitted
 detections, the emission budgets, and every `try_new` call are unchanged — a
-real frame reaches neither ceiling. What changes is that a corrupted or
-adversarial observation set can no longer run a rejection path for free.
+real frame reaches neither ceiling, and a conforming joint dictionary costs
+exactly the entries it enumerates, which is what the bulk charge took. What
+changes is that a corrupted or adversarial observation set can no longer run a
+rejection path for free.
 
 ### Internal
 
-- `charge_mask_walk_step`, `charge_landmark_region_visit` and
-  `charge_landmark_points` are the only places either attempt budget is
-  charged. Each fuses its ceiling test with its charge, so a walk step cannot
-  reach a rejection branch without having paid, and a refusal charges nothing.
+- `MaskBudget::charge_walk_step`, `charge_landmark_region_visit`,
+  `charge_landmark_points` and `PoseBudget::charge_joint_visit` are the only
+  places any attempt budget is charged. Each fuses its ceiling test with its
+  charge, so a walk step cannot reach a rejection branch without having paid,
+  and a refusal charges nothing.
+- The pose joint-dictionary reader is `read_pose_joints` (was
+  `bounded_dictionary_pairs`) and returns `PoseJoints::{Read, Malformed,
+  Exhausted}` rather than an `Option`, because the two refusals mean opposite
+  things to the caller: skip this observation, or stop the frame.
+
+**Semver.** This breaks a published API — 0.4.0 is on crates.io — so it rides
+the next breaking line (0.5.0). The version is not bumped here; the release
+stamp is its own commit, matching the 0.3.0 and 0.4.0 precedent.
 
 ## 0.4.0 — 2026-08-22
 

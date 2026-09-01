@@ -35,7 +35,15 @@ tracing = { version = "0.1", optional = true }
 # exceptions`). See `VisionRequests::perform` / the `extract_*` guards.
 objc2 = { version = "0.6", features = ["exception"] }
 objc2-core-foundation = { version = "0.3", features = ["CFCGTypes"] }
-objc2-foundation = { version = "0.3", features = ["NSArray", "NSString", "NSData", "NSError", "NSObjCRuntime", "NSIndexSet"] }
+# `NSEnumerator` is what makes the bounded pose-dictionary reader
+# possible: it gates `NSDictionary::keys()`, the safe, retaining,
+# iterator-shaped read that `ffi::collect_dictionary_pairs` uses in place
+# of `NSDictionary::to_vecs()` — whose safe surface hides an unbounded
+# `getObjects:andKeys:` followed by `set_len` on an FFI-reported count.
+# `NSDictionary` is named explicitly rather than left to arrive through
+# objc2-vision's feature unification, because this crate now reads a
+# dictionary in its own right.
+objc2-foundation = { version = "0.3", features = ["NSArray", "NSString", "NSData", "NSError", "NSObjCRuntime", "NSIndexSet", "NSUUID", "NSDictionary", "NSEnumerator"] }
 objc2-core-video = { version = "0.3", features = ["CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVReturn"] }
 objc2-vision = { version = "0.3", features = [
   "objc2-core-foundation",
@@ -47,6 +55,7 @@ objc2-vision = { version = "0.3", features = [
   "VNDetectFaceRectanglesRequest",
   "VNDetectFaceLandmarksRequest",
   "VNFaceLandmarks",
+  "VNFaceObservationAccepting",
   "VNDetectFaceCaptureQualityRequest",
   "VNDetectHumanRectanglesRequest",
   "VNRecognizeAnimalsRequest",

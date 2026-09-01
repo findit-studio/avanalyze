@@ -20,9 +20,9 @@ use mediaschema::domain::aggregates::video::{self as ms, detections::DetectionEr
 use crate::{
   Aesthetics, BarcodeDetection, BodyPose3DDetection, BodyPose3DJoint, BodyPoseDetection,
   BodyPoseJoint, BoundingBox, Chirality, Detection, Detections, DocumentSegment, FaceDetection,
-  FaceLandmarkRegion, FaceLandmarksDetection, HandPoseDetection, HeightEstimation, HorizonInfo,
-  PersonInstanceMaskDetection, PersonSegmentationMask, SaliencyRegion, SubjectDetection,
-  TextDetection,
+  FaceKeypoints, FaceLandmarkRegion, FaceLandmarksDetection, HandPoseDetection, HeightEstimation,
+  HorizonInfo, PersonInstanceMaskDetection, PersonSegmentationMask, SaliencyRegion,
+  SubjectDetection, TextDetection,
 };
 
 /// mediaschema's video aggregates, named as one output vocabulary.
@@ -71,13 +71,12 @@ impl SubjectDetection for ms::SubjectDetection {
 
 /// `mediaschema` 0.2.1 has no seat for pose-angle OR capture-quality
 /// absence — its own `FaceDetection::try_new` takes plain `f32` for
-/// both. Collapsing `None` to `0.0` here is this ONE reference
-/// vocabulary's limitation, not a reopening of the loss
-/// `contract::FaceDetection` exists to close: the engine now hands
-/// this impl real `Option<f32>`s, and a vocabulary that CAN represent
-/// the absence (`tests/common::Face`) receives it intact.
-/// `mediaschema` / `mediagraph` adopt the `Option` shape in their own
-/// knife once this crate's 0.4 publishes.
+/// both — and none at all for the five-point reduction. Collapsing
+/// `None` to `0.0` and dropping the keypoints here is this ONE
+/// reference vocabulary's limitation, not a reopening of the loss
+/// `FaceDetection` exists to close: the engine hands this impl real
+/// `Option`s, and a vocabulary that CAN represent the absence
+/// (`tests/common::Face`) receives them intact.
 impl FaceDetection for ms::FaceDetection {
   type Error = DetectionError;
   type BoundingBox = ms::BoundingBox;
@@ -89,7 +88,9 @@ impl FaceDetection for ms::FaceDetection {
     roll: Option<f32>,
     yaw: Option<f32>,
     pitch: Option<f32>,
+    keypoints: Option<FaceKeypoints>,
   ) -> Result<Self, Self::Error> {
+    let _ = keypoints;
     ms::FaceDetection::try_new(
       bbox,
       confidence,
@@ -242,11 +243,23 @@ impl PersonSegmentationMask for ms::PersonSegmentationMask {
   }
 }
 
+/// `mediaschema` 0.2.1 has no seat for the candidate provenance pair
+/// either — same pinned-dependency boundary as the face `Option`s.
+/// Dropping `observation` / `rank` here costs this reference
+/// vocabulary the ability to tell two readings of one text region
+/// apart; `tests/common::Text` keeps both.
 impl TextDetection for ms::TextDetection {
   type Error = DetectionError;
   type BoundingBox = ms::BoundingBox;
 
-  fn try_new(text: &str, confidence: f32, bbox: Self::BoundingBox) -> Result<Self, Self::Error> {
+  fn try_new(
+    text: &str,
+    confidence: f32,
+    bbox: Self::BoundingBox,
+    observation: usize,
+    rank: usize,
+  ) -> Result<Self, Self::Error> {
+    let _ = (observation, rank);
     ms::TextDetection::try_new(text, confidence, bbox)
   }
 }
@@ -302,29 +315,13 @@ impl Aesthetics for ms::Aesthetics {
   }
 }
 
+/// The core bundle names only what the one-pass analyzer builds. The
+/// per-entry impls above stand on their own and are exercised by the
+/// per-entry conformance assertions, not through this trait.
 impl Detections for MediaSchema {
   type BoundingBox = ms::BoundingBox;
   type Detection = ms::Detection;
   type SubjectDetection = ms::SubjectDetection;
-  type FaceDetection = ms::FaceDetection;
-  type FaceLandmarkRegion = ms::FaceLandmarkRegion;
-  type FaceLandmarksDetection = ms::FaceLandmarksDetection;
-  // mediaschema keeps one 2-D joint type for every skeleton, so the
-  // three seats name it three times. That a bundle may still collapse
-  // them is half the point of splitting the seats: the contract permits
-  // the identity, it no longer imposes it.
-  type BodyJoint = ms::BodyPoseJoint;
-  type BodyPoseDetection = ms::BodyPoseDetection;
-  type HandJoint = ms::BodyPoseJoint;
-  type HandPoseDetection = ms::HandPoseDetection;
-  type AnimalJoint = ms::BodyPoseJoint;
-  type AnimalPoseDetection = ms::BodyPoseDetection;
-  type Body3Joint = ms::BodyPose3DJoint;
-  type BodyPose3DDetection = ms::BodyPose3DDetection;
-  type PersonInstanceMaskDetection = ms::PersonInstanceMaskDetection;
-  type PersonSegmentationMask = ms::PersonSegmentationMask;
-  type TextDetection = ms::TextDetection;
-  type BarcodeDetection = ms::BarcodeDetection;
   type SaliencyRegion = ms::SaliencyRegion;
   type HorizonInfo = ms::HorizonInfo;
   type DocumentSegment = ms::DocumentSegment;

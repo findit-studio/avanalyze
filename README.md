@@ -14,21 +14,33 @@ vocabulary you name.
 
 ## What it does
 
-`avanalyze` wraps Apple's Vision.framework in a synchronous Rust API. One
-`VisionAnalyzer` owns one of every supported request kind — face,
-face-landmark, body-pose, body-pose-3D, hand-pose, classification, saliency,
-aesthetics, barcode, text, horizon, animal, animal-body-pose,
-person-segmentation, person-instance-mask, document-segmentation — at fixed,
-pinned revisions. `analyze_keyframe` runs them all against a single JPEG and
-returns an `Analysis`.
+`avanalyze` wraps Apple's Vision.framework in a synchronous Rust API as **nine
+entry points**, each owning exactly the Vision requests its own capability
+needs, at fixed, pinned revisions:
+
+| Entry point | Requests | Produces |
+|---|---|---|
+| `VisionAnalyzer` | 8 | `Analysis` — classifications, human and animal subjects, both saliency passes, document segments, horizon, aesthetics |
+| `TextRecognizer` | 1 | recognised text runs |
+| `BarcodeDetector` | 1 | decoded barcodes |
+| `FaceDetector` | 3 | one record per face: box, confidence, capture quality, roll/yaw/pitch, five keypoints |
+| `FaceLandmarker` | 1 | all thirteen named landmark regions |
+| `BodyPoser` | 2 | human 2-D and 3-D poses |
+| `HandPoser` | 1 | hand poses |
+| `AnimalPoser` | 1 | animal 2-D poses |
+| `PersonMasker` | 2 | per-instance and whole-frame person masks |
+
+Construct only what you use. A consumer that wants text builds a
+`TextRecognizer`, names one output type, and loads exactly one Vision model —
+no face, pose, or mask model is constructed, let alone run.
 
 ## What it does not do
 
 It does not know what a keyframe *is*. The engine mints no identifiers, carries
 no timestamp, reads no frame dimensions, and assembles no aggregate: an
-`Analysis` is eighteen flat slots of detections and nothing else. Composing
-those into whatever record you store is your job, because you are the only one
-who knows the frame's identity.
+`Analysis` is eight flat slots of detections and nothing else, and every other
+entry point hands back a plain `Vec`. Composing those into whatever record you
+store is your job, because you are the only one who knows the frame's identity.
 
 It also has no opinion about what a detection is made of. Every output type is
 yours:
@@ -36,8 +48,9 @@ yours:
 ```rust,ignore
 use avanalyze::{AnalyzeOptions, Detections, VisionAnalyzer};
 
-// A bundle marker naming your types; each one implements the matching
-// per-part trait (`BoundingBox`, `FaceDetection`, `DocumentSegment`, …).
+// A bundle marker naming the seven types the one-pass analyzer builds;
+// each implements the matching trait (`BoundingBox`, `SubjectDetection`,
+// `DocumentSegment`, …).
 struct MyVocabulary;
 impl Detections for MyVocabulary { /* … */ }
 
@@ -45,35 +58,56 @@ let options = AnalyzeOptions::new();
 let analyzer = VisionAnalyzer::new(&options);
 let analysis = analyzer.analyze_keyframe::<MyVocabulary>(&jpeg, &options)?;
 
-for face in analysis.faces() { /* your type */ }
+for subject in analysis.human_subjects() { /* your type */ }
+```
+
+Every other entry point takes **one** type parameter — the type it builds — so
+a single-capability consumer never names a bundle:
+
+```rust,ignore
+use avanalyze::{AppleVisionTextOptions, TextDetection, TextRecognizer};
+
+struct MyTextRun { /* … */ }
+impl TextDetection for MyTextRun { /* … */ }
+
+let options = AppleVisionTextOptions::new();
+let runs = TextRecognizer::new(&options).recognize::<MyTextRun>(&jpeg, &options)?;
 ```
 
 Every seat on every constructor is a primitive — `f32`, `u32`, `usize`, `&str`,
-`&[u8]`, tuples of those — or one of two engine-owned enums. No schema crate,
-no wire format, no foreign type crosses the boundary, and `avanalyze` depends on
-none of them.
+`&[u8]`, tuples of those — or an engine-owned type (`Chirality`,
+`HeightEstimation`, `FaceKeypoints`). No schema crate, no wire format, no
+foreign type crosses the boundary, and `avanalyze` depends on none of them.
+
+Faces come with the 76→5-point reduction — both eye centres, the nose tip, and
+both mouth corners, in image-normalized coordinates and canonical alignment
+order. What you crop, align, or embed with them is your business: the engine
+produces geometry and never an identity.
 
 ### Proving your vocabulary fits
 
 The traits carry signatures; the conventions they cannot express — the unit
 square, the "nothing detected" sentinels, the winding order of document corners,
 the argument order of the horizon — live in `avanalyze::conformance` as
-assertions you run:
+assertions you run. They are per entry point, so you assert only what you use:
 
 ```rust,ignore
 #[test]
 fn my_vocabulary_fits_the_engine() {
   avanalyze::conformance::assert_contract::<MyVocabulary>();
+  avanalyze::conformance::assert_text_accepts::<MyTextRun>();
   // …and, if your types validate their input:
   avanalyze::conformance::assert_refuses_invalid::<MyVocabulary>();
+  avanalyze::conformance::assert_text_refusals::<MyTextRun>();
 }
 ```
 
 ## Degradation
 
 Failure is per detector, not per frame. A Vision request that raises an
-Objective-C exception contributes an empty slot while every other detector's
-results still land. Individual detections are filtered before construction —
+Objective-C exception contributes an empty result while every other detector's
+results still land — an empty slot inside `Analysis`, an empty `Vec` from an
+entry point of its own. Individual detections are filtered before construction —
 non-finite geometry, out-of-range confidences, degenerate boxes — and a refused
 detection is silently absent; there is no "dropped" counter. An `Err` means no
 analysis happened at all, which is a surface of exactly two kinds.
@@ -91,14 +125,23 @@ unconditionally.
 
 ## Layout
 
-- `src/contract.rs` — the `Detections` bundle and the nineteen per-part traits.
-- `src/analysis.rs` — `Analysis<D>`, the eighteen-slot output carton.
-- `src/conformance.rs` — runnable assertions for an implementor's vocabulary.
-- `src/lib.rs` — `VisionAnalyzer`, the pinned request set, and the per-request
-  extractors that translate `VNObservation`s into your types.
-- `src/options.rs` — per-request configuration knobs
-  (`AppleVisionClassificationOptions`, `…BodyPoseOptions`, …) and the top-level
-  `AnalyzeOptions`.
+One module per entry point, each holding its own requests, its own extractors,
+and the traits it builds:
+
+- `src/analyzer.rs` — `VisionAnalyzer`, the eight batched detections.
+- `src/analysis.rs` — `Analysis<D>`, the eight-slot output carton.
+- `src/contract.rs` — the core `Detections` bundle and the seven traits it names.
+- `src/text.rs`, `src/barcode.rs` — the two readers and their traits.
+- `src/face.rs` — `FaceDetector`, `FaceDetection`, `FaceKeypoints`.
+- `src/face_landmarks.rs` — `FaceLandmarker` and the region traits.
+- `src/body_pose.rs`, `src/hand_pose.rs`, `src/animal_pose.rs` — the pose entry
+  points, their traits, `Chirality`, `HeightEstimation`.
+- `src/person_mask.rs` — `PersonMasker`, both mask traits, the pixel-buffer copy.
+- `src/ffi.rs` — the shared Vision boundary: coordinate conversion, resource
+  ceilings, the Objective-C exception barrier.
+- `src/conformance.rs` — runnable assertions, per entry point.
+- `src/options.rs` — per-entry configuration knobs
+  (`AppleVisionTextOptions`, `AppleVisionFaceOptions`, …) and `AnalyzeOptions`.
 - `src/error.rs` — `AnalyzeError` and its two kinds.
 
 ## License

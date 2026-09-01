@@ -1,7 +1,15 @@
 mod reference;
 
 #[cfg(target_vendor = "apple")]
-mod macos;
+mod body_pose;
+#[cfg(target_vendor = "apple")]
+mod face;
+#[cfg(target_vendor = "apple")]
+mod ffi;
+#[cfg(target_vendor = "apple")]
+mod mask;
+
+use mediaschema::domain::aggregates::video as ms;
 
 use crate::{Analysis, conformance, tests::reference::MediaSchema};
 
@@ -9,11 +17,25 @@ use crate::{Analysis, conformance, tests::reference::MediaSchema};
 /// vocabulary — `mediaschema`'s domain aggregates — must satisfy the
 /// contract as written, with no adapter type in between.
 ///
+/// The core bundle and every entry point are asserted separately,
+/// exactly as a consumer would assert only the ones it uses.
+///
 /// If a seat's argument order or domain ever drifts from what a real
 /// implementation expects, this fails before the engine ships it.
 #[test]
 fn reference_vocabulary_satisfies_the_contract() {
   conformance::assert_contract::<MediaSchema>();
+
+  conformance::assert_text_accepts::<ms::TextDetection>();
+  conformance::assert_barcode_accepts::<ms::BarcodeDetection>();
+  conformance::assert_face_accepts::<ms::FaceDetection>();
+  conformance::assert_face_landmarks_accept::<ms::FaceLandmarksDetection>();
+  conformance::assert_body_pose_accepts::<ms::BodyPoseDetection>("BodyPoser");
+  conformance::assert_body_pose_accepts::<ms::BodyPoseDetection>("AnimalPoser");
+  conformance::assert_hand_pose_accepts::<ms::HandPoseDetection>();
+  conformance::assert_body_pose_3d_accepts::<ms::BodyPose3DDetection>();
+  conformance::assert_person_instance_mask_accepts::<ms::PersonInstanceMaskDetection>();
+  conformance::assert_person_segmentation_accepts::<ms::PersonSegmentationMask>();
 }
 
 /// `mediaschema` validates, so it must also pass the optional refusal
@@ -22,6 +44,18 @@ fn reference_vocabulary_satisfies_the_contract() {
 #[test]
 fn reference_vocabulary_refuses_invalid_input() {
   conformance::assert_refuses_invalid::<MediaSchema>();
+
+  conformance::assert_text_refusals::<ms::TextDetection>();
+  // mediaschema keeps one 2-D joint type for every skeleton, so the
+  // three seats name it three times. That a vocabulary may still
+  // collapse them is half the point of splitting the entry points:
+  // the contract permits the identity, it no longer imposes it.
+  conformance::assert_joint_2d_refusals::<ms::BodyPoseJoint>("BodyPoser");
+  conformance::assert_joint_2d_refusals::<ms::BodyPoseJoint>("HandPoser");
+  conformance::assert_joint_2d_refusals::<ms::BodyPoseJoint>("AnimalPoser");
+  conformance::assert_face_landmark_region_refusals::<ms::FaceLandmarkRegion>();
+  conformance::assert_person_instance_mask_refusals::<ms::PersonInstanceMaskDetection>();
+  conformance::assert_person_segmentation_refusals::<ms::PersonSegmentationMask>();
 }
 
 /// A fresh [`Analysis`] is genuinely empty: no fabricated sentinels,
@@ -30,8 +64,11 @@ fn reference_vocabulary_refuses_invalid_input() {
 fn analysis_starts_empty() {
   let analysis: Analysis<MediaSchema> = Analysis::new();
   assert!(analysis.classifications().is_empty());
-  assert!(analysis.faces().is_empty());
-  assert!(analysis.person_segmentation_masks().is_empty());
+  assert!(analysis.human_subjects().is_empty());
+  assert!(analysis.animal_subjects().is_empty());
+  assert!(analysis.attention_saliency().is_empty());
+  assert!(analysis.objectness_saliency().is_empty());
+  assert!(analysis.document_segments().is_empty());
   assert!(analysis.horizon().is_none());
   assert!(analysis.aesthetics().is_none());
 }
@@ -40,8 +77,6 @@ fn analysis_starts_empty() {
 /// exclusive accessor moves the values out without cloning.
 #[test]
 fn analysis_slots_round_trip_through_every_setter() {
-  use mediaschema::domain::aggregates::video as ms;
-
   let detection = ms::Detection::try_new("cat", 0.75).expect("in-range detection");
   let bbox = ms::BoundingBox::try_new(0.1, 0.2, 0.3, 0.4).expect("in-range box");
   let region = ms::SaliencyRegion::try_new(bbox, 0.5).expect("in-range region");
@@ -67,8 +102,10 @@ fn analysis_slots_round_trip_through_every_setter() {
   );
 }
 
-/// Off Apple there is no Vision framework, so every call reports the
+/// Off Apple there is no Vision framework, so the analyzer reports the
 /// platform error rather than pretending to have analysed anything.
+/// The other eight entry points' stubs are pinned the same way in
+/// `tests/audit_avanalyze_api.rs`, where the outside vocabulary lives.
 #[cfg(not(target_vendor = "apple"))]
 #[test]
 fn non_macos_stub_reports_unavailable() {

@@ -26,6 +26,8 @@ default_options!(
   AppleVisionBodyPose3DOptions,
   AppleVisionFaceCaptureOptions,
   AppleVisionFaceRectangleOptions,
+  AppleVisionFaceKeypointsOptions,
+  AppleVisionFaceOptions,
   AppleVisionFaceLandmarkOptions,
   AppleVisionHumanSubjectOptions,
   AppleVisionBarcodeOptions,
@@ -35,6 +37,8 @@ default_options!(
   AppleVisionAestheticsOptions,
   AppleVisionPersonInstanceMaskOptions,
   AppleVisionPersonSegmentationOptions,
+  AppleVisionBodyPoserOptions,
+  AppleVisionPersonMaskerOptions,
   AnalyzeOptions,
 );
 
@@ -436,6 +440,50 @@ impl AppleVisionBodyPose3DOptions {
   }
 }
 
+/// Everything [`BodyPoser`](crate::BodyPoser) reads — one section per
+/// pose dimensionality, because
+/// [`detect_2d`](crate::BodyPoser::detect_2d) and
+/// [`detect_3d`](crate::BodyPoser::detect_3d) run different models
+/// whose joint-confidence floors are not required to move together.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct AppleVisionBodyPoserOptions {
+  #[cfg_attr(feature = "serde", serde(default))]
+  pose_2d: AppleVisionBodyPoseOptions,
+  #[cfg_attr(feature = "serde", serde(default))]
+  pose_3d: AppleVisionBodyPose3DOptions,
+}
+
+impl AppleVisionBodyPoserOptions {
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new() -> Self {
+    Self {
+      pose_2d: AppleVisionBodyPoseOptions::new(),
+      pose_3d: AppleVisionBodyPose3DOptions::new(),
+    }
+  }
+
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn pose_2d(&self) -> AppleVisionBodyPoseOptions {
+    self.pose_2d
+  }
+
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn pose_2d_mut(&mut self) -> &mut AppleVisionBodyPoseOptions {
+    &mut self.pose_2d
+  }
+
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn pose_3d(&self) -> AppleVisionBodyPose3DOptions {
+    self.pose_3d
+  }
+
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn pose_3d_mut(&mut self) -> &mut AppleVisionBodyPose3DOptions {
+    &mut self.pose_3d
+  }
+}
+
 #[cfg_attr(not(tarpaulin), inline(always))]
 const fn default_face_capture_min_confidence() -> f32 {
   0.1
@@ -551,6 +599,111 @@ impl AppleVisionFaceRectangleOptions {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn min_confidence(&self) -> f32 {
     self.min_confidence
+  }
+}
+
+#[cfg_attr(not(tarpaulin), inline(always))]
+const fn default_face_keypoints_min_confidence() -> f32 {
+  0.1
+}
+
+/// Gates for the landmark pass [`FaceDetector`](crate::FaceDetector)
+/// reduces to [`FaceKeypoints`](crate::FaceKeypoints).
+///
+/// Separate from [`AppleVisionFaceLandmarkOptions`], which configures
+/// the full thirteen-region [`FaceLandmarker`](crate::FaceLandmarker):
+/// the two run different passes for different consumers and their
+/// thresholds are not required to move together.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct AppleVisionFaceKeypointsOptions {
+  #[cfg_attr(
+    feature = "serde",
+    serde(default = "default_face_keypoints_min_confidence")
+  )]
+  min_confidence: f32,
+}
+
+impl AppleVisionFaceKeypointsOptions {
+  /// Default [`min_confidence`](Self::min_confidence).
+  pub const DEFAULT_MIN_CONFIDENCE: f32 = default_face_keypoints_min_confidence();
+
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new() -> Self {
+    Self {
+      min_confidence: Self::DEFAULT_MIN_CONFIDENCE,
+    }
+  }
+
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn with_min_confidence(mut self, min_confidence: f32) -> Self {
+    self.set_min_confidence(min_confidence);
+    self
+  }
+
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn set_min_confidence(&mut self, min_confidence: f32) -> &mut Self {
+    self.min_confidence = min_confidence;
+    self
+  }
+
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn min_confidence(&self) -> f32 {
+    self.min_confidence
+  }
+}
+
+/// Everything [`FaceDetector`](crate::FaceDetector) reads — one
+/// section per Vision pass it fuses.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct AppleVisionFaceOptions {
+  #[cfg_attr(feature = "serde", serde(default))]
+  rectangles: AppleVisionFaceRectangleOptions,
+  #[cfg_attr(feature = "serde", serde(default))]
+  capture: AppleVisionFaceCaptureOptions,
+  #[cfg_attr(feature = "serde", serde(default))]
+  keypoints: AppleVisionFaceKeypointsOptions,
+}
+
+impl AppleVisionFaceOptions {
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new() -> Self {
+    Self {
+      rectangles: AppleVisionFaceRectangleOptions::new(),
+      capture: AppleVisionFaceCaptureOptions::new(),
+      keypoints: AppleVisionFaceKeypointsOptions::new(),
+    }
+  }
+
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn rectangles(&self) -> AppleVisionFaceRectangleOptions {
+    self.rectangles
+  }
+
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn rectangles_mut(&mut self) -> &mut AppleVisionFaceRectangleOptions {
+    &mut self.rectangles
+  }
+
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn capture(&self) -> AppleVisionFaceCaptureOptions {
+    self.capture
+  }
+
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn capture_mut(&mut self) -> &mut AppleVisionFaceCaptureOptions {
+    &mut self.capture
+  }
+
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn keypoints(&self) -> AppleVisionFaceKeypointsOptions {
+    self.keypoints
+  }
+
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn keypoints_mut(&mut self) -> &mut AppleVisionFaceKeypointsOptions {
+    &mut self.keypoints
   }
 }
 
@@ -1092,6 +1245,51 @@ impl AppleVisionPersonSegmentationOptions {
   }
 }
 
+/// Everything [`PersonMasker`](crate::PersonMasker) reads — one
+/// section per mask kind, because
+/// [`instance_masks`](crate::PersonMasker::instance_masks) and
+/// [`segmentation_masks`](crate::PersonMasker::segmentation_masks)
+/// run different models whose gates are not required to move
+/// together.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct AppleVisionPersonMaskerOptions {
+  #[cfg_attr(feature = "serde", serde(default))]
+  instances: AppleVisionPersonInstanceMaskOptions,
+  #[cfg_attr(feature = "serde", serde(default))]
+  segmentation: AppleVisionPersonSegmentationOptions,
+}
+
+impl AppleVisionPersonMaskerOptions {
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new() -> Self {
+    Self {
+      instances: AppleVisionPersonInstanceMaskOptions::new(),
+      segmentation: AppleVisionPersonSegmentationOptions::new(),
+    }
+  }
+
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn instances(&self) -> AppleVisionPersonInstanceMaskOptions {
+    self.instances
+  }
+
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn instances_mut(&mut self) -> &mut AppleVisionPersonInstanceMaskOptions {
+    &mut self.instances
+  }
+
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn segmentation(&self) -> AppleVisionPersonSegmentationOptions {
+    self.segmentation
+  }
+
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn segmentation_mut(&mut self) -> &mut AppleVisionPersonSegmentationOptions {
+    &mut self.segmentation
+  }
+}
+
 #[cfg(feature = "serde")]
 #[cfg_attr(not(tarpaulin), inline(always))]
 const fn default_num_workers() -> usize {
@@ -1110,6 +1308,14 @@ where
   Ok(if n == 0 { 1 } else { n })
 }
 
+/// Everything [`VisionAnalyzer`](crate::VisionAnalyzer) reads — one
+/// section per core detection, and nothing else.
+///
+/// The eight sections here are exactly the eight
+/// [`Analysis`](crate::Analysis) slots. Text, barcodes, faces,
+/// landmarks, poses and masks configure their own entry points
+/// through their own options types, so a config that only enables
+/// text no longer carries eleven sections that nothing reads.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct AnalyzeOptions {
@@ -1124,27 +1330,9 @@ pub struct AnalyzeOptions {
   #[cfg_attr(feature = "serde", serde(default))]
   classifications: AppleVisionClassificationOptions,
   #[cfg_attr(feature = "serde", serde(default))]
-  face_capture: AppleVisionFaceCaptureOptions,
-  #[cfg_attr(feature = "serde", serde(default))]
-  face_rectangles: AppleVisionFaceRectangleOptions,
-  #[cfg_attr(feature = "serde", serde(default))]
-  face_landmarks: AppleVisionFaceLandmarkOptions,
-  #[cfg_attr(feature = "serde", serde(default))]
   human_subjects: AppleVisionHumanSubjectOptions,
   #[cfg_attr(feature = "serde", serde(default))]
   animals: AppleVisionAnimalOptions,
-  #[cfg_attr(feature = "serde", serde(default))]
-  text: AppleVisionTextOptions,
-  #[cfg_attr(feature = "serde", serde(default))]
-  body_pose: AppleVisionBodyPoseOptions,
-  #[cfg_attr(feature = "serde", serde(default))]
-  hand_pose: AppleVisionHandPoseOptions,
-  #[cfg_attr(feature = "serde", serde(default))]
-  animal_pose: AppleVisionAnimalPoseOptions,
-  #[cfg_attr(feature = "serde", serde(default))]
-  body_pose_3d: AppleVisionBodyPose3DOptions,
-  #[cfg_attr(feature = "serde", serde(default))]
-  barcodes: AppleVisionBarcodeOptions,
   #[cfg_attr(feature = "serde", serde(default))]
   attention_saliency: AppleVisionSaliencyOptions,
   #[cfg_attr(feature = "serde", serde(default))]
@@ -1155,10 +1343,6 @@ pub struct AnalyzeOptions {
   document_segments: AppleVisionDocumentSegmentationOptions,
   #[cfg_attr(feature = "serde", serde(default))]
   aesthetics: AppleVisionAestheticsOptions,
-  #[cfg_attr(feature = "serde", serde(default))]
-  person_instance_masks: AppleVisionPersonInstanceMaskOptions,
-  #[cfg_attr(feature = "serde", serde(default))]
-  person_segmentation_masks: AppleVisionPersonSegmentationOptions,
 }
 
 impl AnalyzeOptions {
@@ -1170,24 +1354,13 @@ impl AnalyzeOptions {
     Self {
       num_workers: Self::DEFAULT_NUM_WORKERS,
       classifications: AppleVisionClassificationOptions::new(),
-      face_capture: AppleVisionFaceCaptureOptions::new(),
-      face_rectangles: AppleVisionFaceRectangleOptions::new(),
-      face_landmarks: AppleVisionFaceLandmarkOptions::new(),
       human_subjects: AppleVisionHumanSubjectOptions::new(),
       animals: AppleVisionAnimalOptions::new(),
-      text: AppleVisionTextOptions::new(),
-      body_pose: AppleVisionBodyPoseOptions::new(),
-      hand_pose: AppleVisionHandPoseOptions::new(),
-      animal_pose: AppleVisionAnimalPoseOptions::new(),
-      body_pose_3d: AppleVisionBodyPose3DOptions::new(),
-      barcodes: AppleVisionBarcodeOptions::new(),
       attention_saliency: AppleVisionSaliencyOptions::new(),
       objectness_saliency: AppleVisionSaliencyOptions::new(),
       horizon: AppleVisionHorizonOptions::new(),
       document_segments: AppleVisionDocumentSegmentationOptions::new(),
       aesthetics: AppleVisionAestheticsOptions::new(),
-      person_instance_masks: AppleVisionPersonInstanceMaskOptions::new(),
-      person_segmentation_masks: AppleVisionPersonSegmentationOptions::new(),
     }
   }
 
@@ -1219,36 +1392,6 @@ impl AnalyzeOptions {
   }
 
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn face_capture(&self) -> AppleVisionFaceCaptureOptions {
-    self.face_capture
-  }
-
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn face_capture_mut(&mut self) -> &mut AppleVisionFaceCaptureOptions {
-    &mut self.face_capture
-  }
-
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn face_rectangles(&self) -> AppleVisionFaceRectangleOptions {
-    self.face_rectangles
-  }
-
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn face_rectangles_mut(&mut self) -> &mut AppleVisionFaceRectangleOptions {
-    &mut self.face_rectangles
-  }
-
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn face_landmarks(&self) -> AppleVisionFaceLandmarkOptions {
-    self.face_landmarks
-  }
-
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn face_landmarks_mut(&mut self) -> &mut AppleVisionFaceLandmarkOptions {
-    &mut self.face_landmarks
-  }
-
-  #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn human_subjects(&self) -> AppleVisionHumanSubjectOptions {
     self.human_subjects
   }
@@ -1266,66 +1409,6 @@ impl AnalyzeOptions {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn animals_mut(&mut self) -> &mut AppleVisionAnimalOptions {
     &mut self.animals
-  }
-
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn text(&self) -> AppleVisionTextOptions {
-    self.text
-  }
-
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn text_mut(&mut self) -> &mut AppleVisionTextOptions {
-    &mut self.text
-  }
-
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn body_pose(&self) -> AppleVisionBodyPoseOptions {
-    self.body_pose
-  }
-
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn body_pose_mut(&mut self) -> &mut AppleVisionBodyPoseOptions {
-    &mut self.body_pose
-  }
-
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn hand_pose(&self) -> AppleVisionHandPoseOptions {
-    self.hand_pose
-  }
-
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn hand_pose_mut(&mut self) -> &mut AppleVisionHandPoseOptions {
-    &mut self.hand_pose
-  }
-
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn animal_pose(&self) -> AppleVisionAnimalPoseOptions {
-    self.animal_pose
-  }
-
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn animal_pose_mut(&mut self) -> &mut AppleVisionAnimalPoseOptions {
-    &mut self.animal_pose
-  }
-
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn body_pose_3d(&self) -> AppleVisionBodyPose3DOptions {
-    self.body_pose_3d
-  }
-
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn body_pose_3d_mut(&mut self) -> &mut AppleVisionBodyPose3DOptions {
-    &mut self.body_pose_3d
-  }
-
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn barcodes(&self) -> AppleVisionBarcodeOptions {
-    self.barcodes
-  }
-
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn barcodes_mut(&mut self) -> &mut AppleVisionBarcodeOptions {
-    &mut self.barcodes
   }
 
   #[cfg_attr(not(tarpaulin), inline(always))]
@@ -1376,27 +1459,5 @@ impl AnalyzeOptions {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn aesthetics_mut(&mut self) -> &mut AppleVisionAestheticsOptions {
     &mut self.aesthetics
-  }
-
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn person_instance_masks(&self) -> AppleVisionPersonInstanceMaskOptions {
-    self.person_instance_masks
-  }
-
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn person_instance_masks_mut(&mut self) -> &mut AppleVisionPersonInstanceMaskOptions {
-    &mut self.person_instance_masks
-  }
-
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn person_segmentation_masks(&self) -> AppleVisionPersonSegmentationOptions {
-    self.person_segmentation_masks
-  }
-
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn person_segmentation_masks_mut(
-    &mut self,
-  ) -> &mut AppleVisionPersonSegmentationOptions {
-    &mut self.person_segmentation_masks
   }
 }

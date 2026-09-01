@@ -68,6 +68,26 @@ mod serde_tests {
   }
 
   #[test]
+  fn serde_face_keypoints_options() {
+    roundtrip(&AppleVisionFaceKeypointsOptions::new());
+  }
+
+  #[test]
+  fn serde_face_options() {
+    roundtrip(&AppleVisionFaceOptions::new());
+  }
+
+  #[test]
+  fn serde_body_poser_options() {
+    roundtrip(&AppleVisionBodyPoserOptions::new());
+  }
+
+  #[test]
+  fn serde_person_masker_options() {
+    roundtrip(&AppleVisionPersonMaskerOptions::new());
+  }
+
+  #[test]
   fn serde_human_subject_options() {
     roundtrip(&AppleVisionHumanSubjectOptions::new());
   }
@@ -127,7 +147,7 @@ mod serde_tests {
     assert_eq!(o.num_workers(), 1);
     assert_eq!(o.classifications().min_confidence(), 0.3);
     assert_eq!(o.classifications().max_results(), 12);
-    assert_eq!(o.hand_pose().maximum_hand_count(), 2);
+    assert_eq!(o.animals().min_confidence(), 0.3);
   }
 
   #[test]
@@ -139,8 +159,42 @@ mod serde_tests {
     // max_results should be default
     assert_eq!(o.classifications().max_results(), 12);
     // Other sub-options should be default
-    assert_eq!(o.hand_pose().maximum_hand_count(), 2);
-    assert_eq!(o.barcodes().min_payload_len(), 1);
+    assert_eq!(o.animals().min_confidence(), 0.3);
+    assert_eq!(o.document_segments().max_segments(), 16);
+  }
+
+  /// The composed per-entry options default section by section, the
+  /// same way `AnalyzeOptions` does — so a config may name one knob
+  /// and let the rest fill in.
+  #[test]
+  fn serde_composed_options_from_partial_json() {
+    let face: AppleVisionFaceOptions =
+      serde_json::from_str(r#"{"capture": {"min_capture_quality": 0.5}}"#).expect("partial json");
+    assert_eq!(face.capture().min_capture_quality(), 0.5);
+    assert_eq!(
+      face.rectangles().min_confidence(),
+      AppleVisionFaceRectangleOptions::DEFAULT_MIN_CONFIDENCE
+    );
+    assert_eq!(
+      face.keypoints().min_confidence(),
+      AppleVisionFaceKeypointsOptions::DEFAULT_MIN_CONFIDENCE
+    );
+
+    let poser: AppleVisionBodyPoserOptions =
+      serde_json::from_str(r#"{"pose_3d": {"min_joint_confidence": 0.4}}"#).expect("partial json");
+    assert_eq!(poser.pose_3d().min_joint_confidence(), 0.4);
+    assert_eq!(
+      poser.pose_2d().min_joint_confidence(),
+      AppleVisionBodyPoseOptions::DEFAULT_MIN_JOINT_CONFIDENCE
+    );
+
+    let masker: AppleVisionPersonMaskerOptions =
+      serde_json::from_str(r#"{"instances": {"min_confidence": 0.7}}"#).expect("partial json");
+    assert_eq!(masker.instances().min_confidence(), 0.7);
+    assert_eq!(
+      masker.segmentation().min_confidence(),
+      AppleVisionPersonSegmentationOptions::DEFAULT_MIN_CONFIDENCE
+    );
   }
 
   #[test]

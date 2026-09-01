@@ -17,10 +17,9 @@
 //! And it names **four distinct joint types** — [`BodyJoint`],
 //! [`HandJoint`], [`AnimalJoint`], [`Body3Joint`]. Nothing forces that;
 //! it is here so that the decoupling is compiled, not merely asserted.
-//! A bundle whose skeletons carry genuinely different joint vocabularies
-//! must type-check, and the reference implementation in
-//! `src/tests/reference.rs` proves the other half — one joint type in
-//! every seat is still legal.
+//! Each pose entry point picks its own joint type independently, and
+//! the reference implementation in `src/tests/reference.rs` proves the
+//! other half — one joint type everywhere is still legal.
 
 // Each test binary that includes this module uses a different subset
 // of the vocabulary; the unused remainder is not dead code, it is the
@@ -32,9 +31,9 @@ use core::convert::Infallible;
 use avanalyze::{
   Aesthetics, BarcodeDetection, BodyPose3DDetection, BodyPose3DJoint, BodyPoseDetection,
   BodyPoseJoint, BoundingBox, Chirality, Detection, Detections, DocumentSegment, FaceDetection,
-  FaceLandmarkRegion, FaceLandmarksDetection, HandPoseDetection, HeightEstimation, HorizonInfo,
-  PersonInstanceMaskDetection, PersonSegmentationMask, SaliencyRegion, SubjectDetection,
-  TextDetection,
+  FaceKeypoints, FaceLandmarkRegion, FaceLandmarksDetection, HandPoseDetection, HeightEstimation,
+  HorizonInfo, PersonInstanceMaskDetection, PersonSegmentationMask, SaliencyRegion,
+  SubjectDetection, TextDetection,
 };
 
 /// The bundle marker naming every type below.
@@ -69,6 +68,7 @@ pub struct Face {
   pub roll: Option<f32>,
   pub yaw: Option<f32>,
   pub pitch: Option<f32>,
+  pub keypoints: Option<FaceKeypoints>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -172,11 +172,16 @@ pub struct SegmentationMask {
   pub data: Vec<u8>,
 }
 
+/// A recognised text run, keeping the provenance pair the engine
+/// threads out of its candidate loop: `observation` names the Vision
+/// region, `rank` the candidate's place in that region's list.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Text {
   pub text: String,
   pub confidence: f32,
   pub bbox: Bbox,
+  pub observation: usize,
+  pub rank: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -273,6 +278,7 @@ impl FaceDetection for Face {
     roll: Option<f32>,
     yaw: Option<f32>,
     pitch: Option<f32>,
+    keypoints: Option<FaceKeypoints>,
   ) -> Result<Self, Self::Error> {
     Ok(Self {
       bbox,
@@ -281,6 +287,7 @@ impl FaceDetection for Face {
       roll,
       yaw,
       pitch,
+      keypoints,
     })
   }
 }
@@ -506,11 +513,19 @@ impl TextDetection for Text {
   type Error = Infallible;
   type BoundingBox = Bbox;
 
-  fn try_new(text: &str, confidence: f32, bbox: Self::BoundingBox) -> Result<Self, Self::Error> {
+  fn try_new(
+    text: &str,
+    confidence: f32,
+    bbox: Self::BoundingBox,
+    observation: usize,
+    rank: usize,
+  ) -> Result<Self, Self::Error> {
     Ok(Self {
       text: text.to_owned(),
       confidence,
       bbox,
+      observation,
+      rank,
     })
   }
 }
@@ -577,28 +592,14 @@ impl Aesthetics for Score {
   }
 }
 
+/// The core bundle names only the seven types the one-pass analyzer
+/// builds. Every other type above implements its entry point's trait
+/// directly, from outside the crate, with no bundle in between — which
+/// is the openness this file exists to compile.
 impl Detections for Plain {
   type BoundingBox = Bbox;
   type Detection = Label;
   type SubjectDetection = Subject;
-  type FaceDetection = Face;
-  type FaceLandmarkRegion = LandmarkRegion;
-  type FaceLandmarksDetection = FaceLandmarks;
-  // Four skeletons, four joint types, four pose types. The bundle used
-  // to require one joint type for the 2-D three; that it no longer does
-  // is what this impl compiles.
-  type BodyJoint = BodyJoint;
-  type BodyPoseDetection = Pose;
-  type HandJoint = HandJoint;
-  type HandPoseDetection = HandPose;
-  type AnimalJoint = AnimalJoint;
-  type AnimalPoseDetection = AnimalPose;
-  type Body3Joint = Body3Joint;
-  type BodyPose3DDetection = Pose3;
-  type PersonInstanceMaskDetection = InstanceMask;
-  type PersonSegmentationMask = SegmentationMask;
-  type TextDetection = Text;
-  type BarcodeDetection = Barcode;
   type SaliencyRegion = Salient;
   type HorizonInfo = Horizon;
   type DocumentSegment = Quad;
