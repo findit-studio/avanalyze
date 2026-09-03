@@ -24,7 +24,7 @@ use crate::{
     PoseJoints, check_decoded_dimensions, collect_dictionary_pairs, finite_f32, guard_vision_ffi,
     pose_bbox_from_joint_bounds, project_landmark_to_image, read_pose_joints, run_requests,
     validate_raw_slice_bytes, validate_raw_slice_elems, vision_point_to_normalized,
-    vision_rect_to_bbox, with_image,
+    vision_rect_to_bbox, vn_point3d_position, with_image,
   },
   person_mask::MAX_MASK_BYTES,
   plane::MAX_DECODED_IMAGE_BYTES,
@@ -1250,6 +1250,131 @@ fn guard_vision_ffi_catches_objc_exception_and_returns_fallback() {
   assert_eq!(
     got, 7u32,
     "guard must return the fallback after catching the NSException"
+  );
+}
+
+// This `#[link]` is the ONLY thing that names the test archive, and it
+// exists only in a `cfg(test)` build — `build.rs` compiles that archive
+// with `cargo_metadata(false)`, so no `rustc-link-lib` reaches a
+// consumer. That separation is load-bearing rather than tidiness: a
+// test-only Objective-C class sharing the production archive would be
+// pulled into any consumer linking with `-ObjC`, `-all_load` or
+// `-force_load`, which load every member defining a class whether or
+// not anything references it (Apple QA1490). An archive nothing links
+// cannot be force-loaded.
+//
+// `C`, not `C-unwind`: this one allocates and initialises, and neither
+// can raise. The send that can is the shim's, next door.
+#[link(name = "avanalyze_0_5_objc_simd_shim_test", kind = "static")]
+unsafe extern "C" {
+  /// `src/objc_simd_shim_test.m` — a class that answers `position` with
+  /// a matrix fixed in its own source, at +1 for the caller to own.
+  ///
+  /// The `0_5` matches the shim's own version scope; see the extern
+  /// block in `src/ffi.rs` for why the names carry one at all.
+  fn avanalyze_0_5_test_point3d_new() -> *mut AnyObject;
+}
+
+/// The shim's ABI, proved against a matrix this crate wrote down.
+///
+/// This is the deterministic half of the 3-D read's coverage, and the
+/// half that belongs in a unit test. The end-to-end assertion in
+/// `src/tests/body_pose.rs` runs a photograph through a neural network:
+/// it proves the whole road, but its numbers are inference, pinned to
+/// this host, this macOS and this backend, so it cannot be asked for
+/// exact floats. This test asks for exact floats, because the object on
+/// the other side of the boundary is sixteen literals in
+/// `src/objc_simd_shim_test.m` and nothing about it can drift.
+///
+/// The matrix is `columns[col][row] = col * 4 + row + 0.5`, which in
+/// Apple's column-major memory order is `0.5, 1.5, ... 15.5`. Every
+/// entry differs from every other and from its transpose partner, so
+/// each way this read has failed or could fail is caught by value:
+///
+/// - the shipped ABI defect returned a stack buffer the callee never
+///   wrote, so the floats were unrelated garbage near `1e26`;
+/// - a float HFA would reach only the low half of each register, taking
+///   the first two elements of each column and dropping the rest;
+/// - a transposed read would return `0.5, 4.5, 8.5, 12.5, ...`;
+/// - a short read would leave the tail at its initial zero.
+///
+/// The matrix is deliberately not affine — its bottom row is
+/// `(3.5, 7.5, 11.5, 15.5)`. This test is about sixteen floats crossing
+/// a calling convention intact; deciding which of them is a translation
+/// is `translation_if_affine`, which is pure Rust and is tested on its
+/// own synthetic matrices.
+#[test]
+fn the_simd_shim_reads_a_known_matrix_exactly() {
+  let point = unsafe { Retained::from_raw(avanalyze_0_5_test_point3d_new()) }
+    .expect("the test object's initializer must not return nil");
+
+  let got = unsafe { vn_point3d_position(&*point) };
+
+  let want: [f32; 16] = core::array::from_fn(|i| i as f32 + 0.5);
+  assert_eq!(
+    got, want,
+    "the sixteen floats of a simd_float4x4 must cross the shim unchanged and in memory order"
+  );
+}
+
+/// The same contract, through the C shim — the one frame in this crate
+/// an exception crosses that Rust did not compile.
+///
+/// `vn_point3d_position` dispatches through `src/objc_simd_shim.m`, so
+/// a raise unwinds a frame Clang compiled before it reaches the
+/// `objc2::exception::catch` that catches it. That works only if both
+/// halves of the boundary admit unwinding: the Rust declaration is
+/// `extern "C-unwind"`, and `build.rs` compiles the shim with exception
+/// support. Get either wrong and the exception meets a frame declared
+/// not to unwind, which is undefined behaviour rather than a catch.
+///
+/// An `NSString` does not respond to `position`, so this raises
+/// `doesNotRecognizeSelector:` — the very exception the 3-D pose path
+/// used to raise for real, from its own missing selector. A regression
+/// here aborts the test binary instead of failing it, which is the
+/// honest signal for this class of defect.
+#[test]
+fn a_raise_unwinds_out_of_the_simd_shim_and_is_caught() {
+  let not_a_point = NSString::from_str("not a VNPoint3D");
+  let got = guard_vision_ffi("test_detector", [f32::NAN; 16], || unsafe {
+    vn_point3d_position(&*not_a_point)
+  });
+  assert!(
+    got[0].is_nan(),
+    "the guard must return the fallback after catching the raise out of the shim"
+  );
+}
+
+/// The same raise, under the barrier order `extract_3d` actually uses.
+///
+/// The test above guards the shim with `guard_vision_ffi` alone, which
+/// is not the shape the 3-D path runs: there, `catch_unwind` wraps the
+/// Objective-C barrier, and that ordering is the whole point. An
+/// Objective-C exception reaching the outer `catch_unwind` would abort
+/// the process — `fatal runtime error: Rust cannot catch foreign
+/// exceptions` — rather than fail a test, so the flat version above
+/// cannot prove the production shape.
+///
+/// This pins it: the raise must be consumed by the INNER barrier, and
+/// the outer `catch_unwind` must come back `Ok`. `Err` would mean the
+/// exception had been turned into a Rust panic somewhere it should not
+/// have been; an abort would mean it crossed the Objective-C barrier
+/// untouched.
+#[test]
+fn a_raise_on_the_joint_read_path_never_reaches_the_outer_catch_unwind() {
+  use std::panic::{AssertUnwindSafe, catch_unwind};
+
+  let not_a_point = NSString::from_str("not a VNPoint3D");
+  let outcome = catch_unwind(AssertUnwindSafe(|| {
+    guard_vision_ffi("body_pose_3d", [f32::NAN; 16], || unsafe {
+      vn_point3d_position(&*not_a_point)
+    })
+  }));
+
+  let got = outcome.expect("the Objective-C barrier must consume the raise, not the Rust one");
+  assert!(
+    got[0].is_nan(),
+    "the inner guard must return the fallback after catching the raise"
   );
 }
 

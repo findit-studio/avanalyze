@@ -8,6 +8,14 @@ documentation = "https://docs.rs/avanalyze"
 description = "Apple Vision.framework keyframe analysis that builds detections into an output vocabulary you name."
 license = "MIT OR Apache-2.0"
 rust-version = "1.95"
+# The native archive `build.rs` compiles on Apple targets, declared so
+# Cargo enforces a single owner of it per dependency graph. The value
+# carries the crate's major.minor, matching the symbol names inside the
+# archive, so two semver-incompatible avanalyze versions can still
+# coexist — exactly as `objc2-exception-helper`, already in this graph,
+# scopes `objc2_exception_helper_0_1`. `build.rs` refuses to build if its
+# `SHIM_ABI_TAG` and the `version` above ever disagree.
+links = "avanalyze_0_5_objc_simd_shim"
 
 [[bench]]
 path = "benches/foo.rs"
@@ -87,6 +95,14 @@ objc2-vision = { version = "0.3", features = [
 
 [lints]
 workspace = true
+
+# Compiles `src/objc_simd_shim.m` — and, beside it, the deterministic
+# test object in `src/objc_simd_shim_test.m` — on Apple targets only;
+# see `build.rs`. Rust cannot receive Apple's `simd_float4x4` return
+# type, so the one message send that needs it is emitted by Clang
+# instead. Every other target builds the stubs and needs no C toolchain.
+[build-dependencies]
+cc = "1"
 
 [dev-dependencies]
 bytes = "1"

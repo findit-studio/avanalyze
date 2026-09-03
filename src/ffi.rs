@@ -703,6 +703,101 @@ pub(crate) fn guard_vision_ffi<R>(detector: &'static str, fallback: R, f: impl F
   }
 }
 
+// `C-unwind`, not `C`: the send inside can raise an Objective-C
+// exception, which unwinds out through this boundary on its way to the
+// `objc2::exception::catch` the caller sits inside. Declaring it `C`
+// would mark it `nounwind`, and an unwind out of a `nounwind` frame is
+// undefined behaviour rather than a caught exception. objc2 declares
+// `objc_msgSend` and `objc2-exception-helper`'s own entry point the
+// same way, for the same reason. The Objective-C side is compiled with
+// exception support so its frame is unwind-transparent too — see
+// `build.rs`.
+unsafe extern "C-unwind" {
+  /// `src/objc_simd_shim.m` — one message send, emitted by Clang.
+  ///
+  /// The `0_5` is the crate's major.minor, not decoration: C has no
+  /// namespaces, so an unversioned name would collide with a second
+  /// avanalyze in the same graph. `build.rs` scopes the archive and
+  /// fails the build if the tag stops matching the package version.
+  fn avanalyze_0_5_vn_point3d_position(receiver: *mut objc2::runtime::AnyObject, out: *mut f32);
+}
+
+/// Reads `-[VNPoint3D position]` off `receiver`, as 16 floats in
+/// Apple's column-major memory order.
+///
+/// # Why this is not a `msg_send!`
+///
+/// Because Rust cannot receive the return type, on either of the two
+/// levels the failure hides on.
+///
+/// The **encoding** level is the visible one: `simd_float4` is an
+/// `ext_vector_type`, for which Clang deliberately emits no `@encode`
+/// character, so `@encode(simd_float4x4)` is the literal `{?=[4]}` — an
+/// unnamed struct wrapping an array of four elements whose type is
+/// unwritable. objc2's debug-build verification compares that against
+/// whatever `Encode` impl a caller supplies, and a mismatch is a Rust
+/// panic at the send.
+///
+/// The **ABI** level is the one that matters, and no `Encode` impl
+/// reaches it. On arm64 `simd_float4x4` is a homogeneous vector
+/// aggregate of four 128-bit vectors, returned in v0-v3. rustc's
+/// `extern "C"` returns a vector aggregate in registers only when the
+/// *whole aggregate* is 64 or 128 bits; at 512 it falls back to the x8
+/// hidden pointer. Measured, not assumed: for a `#[repr(C)]` struct of
+/// four `float32x4_t`, rustc emits `mov x8, sp` before the call and
+/// reads the buffer afterwards, while Clang emits `stp q0, q1` /
+/// `stp q2, q3` from the returned registers. The callee writes v0-v3;
+/// Rust reads a stack buffer nobody wrote.
+///
+/// That is not a hypothetical: it was live in this crate. Every 3-D
+/// joint carried stale stack bytes reinterpreted as metres — values
+/// near `1e26`, and *finite*, so every finiteness check passed them.
+///
+/// There is no Rust type that fixes it. `#[repr(simd)]` is unstable,
+/// and would not help: the aggregate-size rule rejects the shape, not
+/// the element. A float HFA reaches only s0-s3 or d0-d3 — the low half
+/// of each register — which can recover a translation's `x` and `y` and
+/// can never recover its `z`.
+///
+/// # Why the selector is not a parameter
+///
+/// Because x86_64 returns this matrix by a different convention *and
+/// through a different dispatcher*. It is MEMORY class there, which the
+/// runtime reaches by `objc_msgSend_stret` — a symbol that does not
+/// exist on arm64 at all. Which dispatcher is correct depends on the
+/// target and the method's return type together, so the shim types the
+/// send rather than choosing one: Clang then emits
+/// `objc_msgSend_stret` for x86_64 and `objc_msgSend` for arm64, and
+/// this crate holds no architecture table whose wrong cells would be
+/// memory corruption.
+///
+/// Typing the send means fixing the selector, which also deletes the
+/// sharpest edge this seam could have had — a caller can no longer name
+/// a method whose return type disagrees with the convention being used
+/// to read it.
+///
+/// # Safety
+///
+/// `receiver` must be a live object responding to `position` with a
+/// method whose Objective-C return type is `simd_float4x4`; every
+/// `VNPoint3D` and its subclasses do. A receiver that does not respond
+/// raises, and callers are inside [`guard_vision_ffi`], which catches
+/// it.
+pub(crate) unsafe fn vn_point3d_position<T: Message>(receiver: &T) -> [f32; 16] {
+  let mut matrix = [0f32; 16];
+  // SAFETY: the shim reads `receiver` only by sending it `position`,
+  // and writes exactly the 16 floats of a `simd_float4x4` into `out`,
+  // which is the length of `matrix`. The receiver is borrowed for the
+  // call, so it outlives it; the caller upholds the receiver contract.
+  unsafe {
+    avanalyze_0_5_vn_point3d_position(
+      core::ptr::from_ref(receiver).cast_mut().cast(),
+      matrix.as_mut_ptr(),
+    );
+  }
+  matrix
+}
+
 // ----- the shared request run -----------------------------------------------
 
 /// Refuse an oversized payload BEFORE Foundation copies it into an

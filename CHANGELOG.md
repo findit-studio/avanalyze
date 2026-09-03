@@ -97,6 +97,137 @@ of encoded JPEG bytes. Nothing about the first door changes.
   the edge direct and names three features (`CGImage`, `CGDataProvider`,
   `CGColorSpace`). `Cargo.lock` does not move.
 
+### Breaking
+
+- **`BodyPose3DJoint::try_new` takes `Option<f32>` for `confidence`, and the
+  engine always passes `None`.** Apple's 3-D point hierarchy declares no
+  confidence at any level: `VNPoint3D` has `position`, `VNRecognizedPoint3D`
+  adds `identifier`, `VNHumanBodyRecognizedPoint3D` adds `localPosition` and
+  `parentJoint`, and that is the whole roster. Confidence lives on the *2-D*
+  road, at `VNDetectedPoint`, in a hierarchy the 3-D points do not descend
+  from; the runtime agrees, answering `respondsToSelector:@selector(confidence)`
+  with `NO` for every 3-D point.
+
+  This is the same ruling `capture_quality`, `roll`, `yaw` and `pitch` already
+  got: what Vision does not report is `None`, never a substituted `0.0`. A
+  vocabulary that needs a number makes that collapse itself, in its own
+  adapter, where it is one visible line.
+
+- **`AppleVisionBodyPose3DOptions::min_joint_confidence` is gone**, with its
+  `DEFAULT_MIN_JOINT_CONFIDENCE`, `with_`/`set_` builders and getter. It was a
+  floor on a reading that does not exist, and it never once ran: the send that
+  fetched the value it compared against raised, so every 3-D joint was dropped
+  in every released version. No observable behaviour is removed with it. The
+  section itself stays, empty, for a future 3-D knob; like every options type
+  in this crate it tolerates unknown fields, so a config still naming the key
+  parses and drops it.
+
+### Fixed
+
+- **`BodyPoser::detect_3d` produced nothing, through either door, in every
+  released version — and the road under it was broken twice.**
+
+  *The selector.* `body_pose.rs` sent `confidence` to a
+  `VNHumanBodyRecognizedPoint3D`, which declares no such method. A debug build
+  panicked into the crate's `catch_unwind`; a release build raised
+  `doesNotRecognizeSelector:` into the Objective-C barrier. Either way every
+  joint was dropped, so every pose was empty, so no pose was ever emitted.
+
+  *The ABI, underneath it.* `-[VNPoint3D position]` returns a
+  `simd_float4x4` — a homogeneous vector aggregate Apple returns in v0-v3.
+  rustc's AArch64 `extern "C"` returns a vector aggregate in registers only
+  when the whole aggregate is 64 or 128 bits; at 512 it uses the x8 hidden
+  pointer instead. Measured, not assumed: for a `#[repr(C)]` struct of four
+  `float32x4_t`, rustc emits `mov x8, sp` before the call, while Clang emits
+  `stp q0, q1` / `stp q2, q3` from the returned registers. The callee wrote
+  registers; Rust read a stack buffer nobody had written. Every joint carried
+  stale stack bytes reinterpreted as metres — around `1e26`, and *finite*, so
+  every finiteness check in the crate passed them. No Rust type fixes this:
+  `#[repr(simd)]` is unstable and would not help, since the rule rejects the
+  aggregate's size rather than its element, and a float HFA reaches only the
+  low half of each register — enough for a translation's `x` and `y`, never its
+  `z`. The send is therefore made in Objective-C, in
+  `src/objc_simd_shim.m`, compiled by `build.rs` on Apple targets only.
+
+  Objective-C rather than C, because the convention is not one thing. x86_64
+  returns this matrix as MEMORY class, which the runtime reaches by
+  `objc_msgSend_stret` — a dispatcher that does not exist on arm64, where the
+  matrix is a vector aggregate and the ordinary `objc_msgSend` is correct. The
+  shim types the send rather than choosing a dispatcher, so Clang selects it per
+  target and this crate holds no architecture table whose wrong cells would be
+  memory corruption. Measured on both: the arm64 object's only dispatcher symbol
+  is `_objc_msgSend$position`, the x86_64 object's is `_objc_msgSend_stret`.
+  Typing the send also fixes the selector, which removes the seam's sharpest
+  edge — a caller can no longer name a method whose return type disagrees with
+  the convention being used to read it.
+
+  The read now also checks the matrix's bottom row is `(0, 0, 0, 1)` before
+  believing its last column. That is the invariant of any 4x4 affine transform,
+  and it is what a broken read fails: the defect above produced coordinates
+  that were finite and plausible-looking, which no other guard in the crate
+  objected to.
+
+  `apollo11_crew.jpg` carries a 3-D pose, so the capability joins the roster's
+  positive set through both doors instead of being named as a hole. The
+  coverage splits by what each half can actually prove. `src/tests/ffi.rs`
+  reads a matrix of sixteen literals off an Objective-C object built for the
+  purpose (`src/objc_simd_shim_test.m`) and asserts every float exactly — that
+  is the ABI, and nothing about it can drift. `src/tests/body_pose.rs` then runs
+  the photograph and asserts the invariants of a human skeleton in model space:
+  rooted at the hip, hips symmetric about the root, head above them, ankle
+  below, and nothing further from the root than a person is tall — which the
+  `1e26`-metre garbage fails on magnitude and a transposed read fails on the
+  hips. Vision's coordinates are neural-network output, pinned to a host, an OS
+  release and an execution backend, so they are recorded as provenance rather
+  than asserted; CI runs a floating `macos-latest` runner, and a correct
+  implementation should not go red on a runner change. The affine gate is pure
+  Rust and is tested directly on synthetic matrices, including the `3e-45`
+  corner the real defect produced — Vision never returns a matrix that fails it,
+  so that branch has no other way to be covered.
+
+### Internal
+
+- **`cc` joins the build dependencies, for Apple targets only.** It compiles
+  the one Objective-C function above, without ARC — nothing there is retained,
+  released or stored. Every other target builds the crate's stubs and needs no
+  C toolchain, and docs.rs — which documents this crate for an Apple target but
+  has no Clang for one — skips the compile, as `objc2-exception-helper` already
+  does in this crate's graph.
+
+  Both halves of that boundary admit unwinding, because a Vision raise has to
+  cross it to reach the barrier that catches it: the shim is compiled with
+  exception support so its frame is not `nounwind`, and the Rust declaration is
+  `extern "C-unwind"`. `src/tests/ffi.rs` raises
+  `doesNotRecognizeSelector:` straight through the shim and asserts the
+  fallback comes back, so a regression aborts the test binary rather than
+  passing quietly.
+
+- **The native names carry the crate's major.minor, and the package declares
+  `links`.** C has no namespaces, and Cargo permits two semver-incompatible
+  versions of one crate in a single graph. An unversioned shim would publish
+  two definitions of one symbol into one process, and the linker would bind
+  both Rust wrappers to whichever archive member it reached first — a
+  calling-convention mismatch rather than a link error on the day the two shims
+  differ. So the exported function is `avanalyze_0_5_vn_point3d_position`, the
+  static archive is `avanalyze_0_5_objc_simd_shim`, and `links` names the same
+  string, which is how `objc2-exception-helper` — already in this crate's graph
+  — scopes `objc2_exception_helper_0_1`. Neither C nor Rust can build a linkage
+  name out of a value at compile time, so the remaining sites spell the tag out;
+  `build.rs` holds it in one constant, checks it against the package version,
+  and reads every hand-written copy back out of the files, so a bump that
+  updated some of them and not the rest is a build error rather than a silent
+  re-collision.
+
+- **The deterministic test object is compiled into an archive of its own, which
+  nothing links.** It would have been natural to put it beside the shim as a
+  second translation unit and rely on the linker to leave it alone, and that
+  would have been wrong: `-ObjC`, `-all_load` and `-force_load` load every
+  archive member defining an Objective-C class whether or not anything
+  references it, and `-ObjC` is routine in Apple application builds. So the test
+  object gets its own archive, compiled with cargo metadata suppressed, and the
+  only thing naming it is a `#[link]` attribute that exists solely in a
+  `cfg(test)` build. A consumer's link line never contains it.
+
 ## 0.5.0 — 2026-09-02
 
 The one 18-seat bundle becomes nine entry points, each owning exactly its own

@@ -123,12 +123,14 @@ mod serde_coercion_tests {
       serde_json::from_str(r#"{"min_confidence": 0.5, "min_payload_len": 5}"#).unwrap();
     assert_eq!(barcodes.min_payload_len(), 5);
 
+    // `pose_3d` no longer holds a floor — Apple's 3-D points carry no
+    // confidence — so the key it used to hold is now an ordinary
+    // unknown field, tolerated and dropped.
     let poser: AppleVisionBodyPoserOptions = serde_json::from_str(
       r#"{"pose_2d": {"min_joint_confidence": 0.3}, "pose_3d": {"min_joint_confidence": 0.3}}"#,
     )
     .unwrap();
     assert_eq!(poser.pose_2d().min_joint_confidence(), 0.3);
-    assert_eq!(poser.pose_3d().min_joint_confidence(), 0.3);
 
     let hand: AppleVisionHandPoseOptions =
       serde_json::from_str(r#"{"min_joint_confidence": 0.4, "maximum_hand_count": 4}"#).unwrap();

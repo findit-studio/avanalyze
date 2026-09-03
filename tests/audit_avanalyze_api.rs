@@ -1036,13 +1036,17 @@ mod real_inference {
   /// synthetic image with nothing in it. A count that must be non-zero
   /// would not.
   ///
-  /// Four capabilities have no material here and are asserted for
+  /// Three capabilities have no material here and are asserted for
   /// agreement only, honestly: `apollo11_crew.jpg` carries no barcode
   /// (covered by the QR fixture below instead), no animal, and no text
-  /// Vision reads at 640 px, and `detect_3d` returns nothing on this
-  /// host through EITHER door because `VNRecognizedPoint3D` has no
-  /// `confidence` selector for `body_pose.rs` to send — a defect on
-  /// `main`, not of this door.
+  /// Vision reads at 640 px.
+  ///
+  /// 3-D body poses were a fourth, back when `detect_3d` could not
+  /// produce output through either door. It can now, and the fixture
+  /// carries a pose, so it joins the positive set. What that pose's
+  /// joints actually contain is asserted against Objective-C's own
+  /// reading in `src/tests/body_pose.rs` — a count would not have
+  /// caught coordinates that were finite and wrong.
   #[test]
   fn every_entry_point_runs_its_pixel_door_on_a_real_photograph() {
     let (width, height, packed) = rgb_plane_bytes(CREW);
@@ -1171,15 +1175,22 @@ mod real_inference {
         .len(),
       true,
     );
-    agree(
-      "3-D body poses",
-      bodies.detect_3d::<Pose3>(CREW, &poser).expect("jpeg").len(),
-      bodies
-        .detect_3d_pixels::<Pose3>(&plane, &poser)
-        .expect("pixels")
-        .len(),
-      false,
-    );
+    let jpeg_3d = bodies.detect_3d::<Pose3>(CREW, &poser).expect("jpeg");
+    let pixel_3d = bodies
+      .detect_3d_pixels::<Pose3>(&plane, &poser)
+      .expect("pixels");
+    agree("3-D body poses", jpeg_3d.len(), pixel_3d.len(), true);
+    // A 3-D pose whose joint list is empty is dropped before it reaches
+    // the vocabulary, so a non-zero pose count already proves joints
+    // were read. Assert the absent confidence here too, on the outside
+    // vocabulary: it is the seat the caller sees.
+    for pose in jpeg_3d.iter().chain(pixel_3d.iter()) {
+      assert!(!pose.joints.is_empty());
+      assert!(
+        pose.joints.iter().all(|j| j.confidence.is_none()),
+        "Apple's 3-D points carry no confidence, so every joint's seat is None"
+      );
+    }
 
     let hand = AppleVisionHandPoseOptions::new();
     let hands = HandPoser::new(&hand);

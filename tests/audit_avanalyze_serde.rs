@@ -181,12 +181,8 @@ mod serde_tests {
     );
 
     let poser: AppleVisionBodyPoserOptions =
-      serde_json::from_str(r#"{"pose_3d": {"min_joint_confidence": 0.4}}"#).expect("partial json");
-    assert_eq!(poser.pose_3d().min_joint_confidence(), 0.4);
-    assert_eq!(
-      poser.pose_2d().min_joint_confidence(),
-      AppleVisionBodyPoseOptions::DEFAULT_MIN_JOINT_CONFIDENCE
-    );
+      serde_json::from_str(r#"{"pose_2d": {"min_joint_confidence": 0.4}}"#).expect("partial json");
+    assert_eq!(poser.pose_2d().min_joint_confidence(), 0.4);
 
     let masker: AppleVisionPersonMaskerOptions =
       serde_json::from_str(r#"{"instances": {"min_confidence": 0.7}}"#).expect("partial json");

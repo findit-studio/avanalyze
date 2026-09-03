@@ -150,16 +150,19 @@ fn animal_pose_builder() {
 
 // ===== R26: BodyPose3D =====
 
+/// The 3-D section is empty on purpose, and stays constructible,
+/// defaultable and `Copy` so a future knob is additive rather than a
+/// new type.
+///
+/// Its `min_joint_confidence` is gone: Apple's 3-D point hierarchy
+/// reports no per-joint confidence for a floor to compare against.
 #[test]
-fn body_pose_3d_defaults() {
+fn body_pose_3d_section_is_empty_and_still_composable() {
   let o = AppleVisionBodyPose3DOptions::new();
-  assert_eq!(o.min_joint_confidence(), 0.1);
-}
-
-#[test]
-fn body_pose_3d_builder() {
-  let o = AppleVisionBodyPose3DOptions::new().with_min_joint_confidence(0.3);
-  assert_eq!(o.min_joint_confidence(), 0.3);
+  let d = AppleVisionBodyPose3DOptions::default();
+  assert_eq!(format!("{o:?}"), format!("{d:?}"));
+  let copied = o;
+  assert_eq!(format!("{copied:?}"), format!("{o:?}"));
 }
 
 // ===== R26: FaceCapture =====
@@ -491,8 +494,9 @@ fn face_options_compose_all_three_passes() {
   assert!(format!("{o:?}").contains("AppleVisionFaceOptions"));
 }
 
-/// `BodyPoser` reads one section per dimensionality, and moving one
-/// must not move the other.
+/// `BodyPoser` reads one section per dimensionality. Only the 2-D
+/// section carries a gate — the 3-D model reports nothing per joint —
+/// and both sections must still be reachable and independently held.
 #[test]
 fn body_poser_options_compose_both_dimensions() {
   let o = AppleVisionBodyPoserOptions::new();
@@ -500,21 +504,17 @@ fn body_poser_options_compose_both_dimensions() {
     o.pose_2d().min_joint_confidence(),
     AppleVisionBodyPoseOptions::DEFAULT_MIN_JOINT_CONFIDENCE
   );
-  assert_eq!(
-    o.pose_3d().min_joint_confidence(),
-    AppleVisionBodyPose3DOptions::DEFAULT_MIN_JOINT_CONFIDENCE
-  );
 
   let mut o = AppleVisionBodyPoserOptions::default();
+  let pose_3d_before = format!("{:?}", o.pose_3d());
   o.pose_2d_mut().set_min_joint_confidence(0.55);
   assert_eq!(o.pose_2d().min_joint_confidence(), 0.55);
   assert_eq!(
-    o.pose_3d().min_joint_confidence(),
-    AppleVisionBodyPose3DOptions::DEFAULT_MIN_JOINT_CONFIDENCE,
-    "the 3-D floor must not follow the 2-D one"
+    format!("{:?}", o.pose_3d()),
+    pose_3d_before,
+    "moving the 2-D floor must not disturb the 3-D section"
   );
-  o.pose_3d_mut().set_min_joint_confidence(0.35);
-  assert_eq!(o.pose_3d().min_joint_confidence(), 0.35);
+  let _: &mut AppleVisionBodyPose3DOptions = o.pose_3d_mut();
   assert_eq!(o.pose_2d().min_joint_confidence(), 0.55);
 }
 

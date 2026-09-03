@@ -153,8 +153,19 @@ impl BodyPoseDetection for ms::BodyPoseDetection {
 impl BodyPose3DJoint for ms::BodyPose3DJoint {
   type Error = DetectionError;
 
-  fn try_new(name: &str, x: f32, y: f32, z: f32, confidence: f32) -> Result<Self, Self::Error> {
-    ms::BodyPose3DJoint::try_new(name, x, y, z, confidence)
+  fn try_new(
+    name: &str,
+    x: f32,
+    y: f32,
+    z: f32,
+    confidence: Option<f32>,
+  ) -> Result<Self, Self::Error> {
+    // mediaschema's 3-D joint demands an `f32`, so the collapse happens
+    // here — in the adapter, one visible line — exactly as this file
+    // already collapses `capture_quality`, `roll`, `yaw` and `pitch`.
+    // The engine never invents the number; a vocabulary that insists on
+    // one chooses its own stand-in.
+    ms::BodyPose3DJoint::try_new(name, x, y, z, confidence.unwrap_or(0.0))
   }
 
   fn name(&self) -> &str {
