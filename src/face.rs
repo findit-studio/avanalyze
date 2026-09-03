@@ -15,7 +15,7 @@ use objc2_vision::*;
 #[cfg(target_vendor = "apple")]
 use smol_str::SmolStr;
 
-use crate::{AnalyzeError, AppleVisionFaceOptions, BoundingBox};
+use crate::{AnalyzeError, AppleVisionFaceOptions, BoundingBox, PixelPlane};
 #[cfg(target_vendor = "apple")]
 use crate::{
   face_landmarks::{
@@ -23,8 +23,8 @@ use crate::{
     landmark_region_points_complete,
   },
   ffi::{
-    MAX_VISION_RESULTS_PER_FRAME, Performed, ffi_nsstring_to_smolstr, finite_f32, guard_vision_ffi,
-    perform, sanitize_confidence, vision_rect_to_bbox, with_image,
+    ImageSource, MAX_VISION_RESULTS_PER_FRAME, Performed, ffi_nsstring_to_smolstr, finite_f32,
+    guard_vision_ffi, perform, sanitize_confidence, vision_rect_to_bbox, with_image,
   },
 };
 
@@ -352,7 +352,30 @@ impl FaceDetector {
     jpeg_data: &[u8],
     options: &AppleVisionFaceOptions,
   ) -> Result<Vec<F>, AnalyzeError> {
-    with_image(jpeg_data, |handler, data| {
+    self.detect_on::<F>(ImageSource::Jpeg(jpeg_data), options)
+  }
+
+  /// Detects every face in already-decoded `pixels`, one record per
+  /// face.
+  ///
+  /// [`detect`](Self::detect) reached without the encode. Both performs
+  /// run against the same one image, so the fusion, the spine, the
+  /// identity seating and every refusal documented there are unchanged.
+  pub fn detect_pixels<F: FaceDetection>(
+    &self,
+    pixels: &PixelPlane<'_>,
+    options: &AppleVisionFaceOptions,
+  ) -> Result<Vec<F>, AnalyzeError> {
+    self.detect_on::<F>(ImageSource::Plane(pixels), options)
+  }
+
+  /// The one two-perform fusion both doors reach.
+  fn detect_on<F: FaceDetection>(
+    &self,
+    source: ImageSource<'_>,
+    options: &AppleVisionFaceOptions,
+  ) -> Result<Vec<F>, AnalyzeError> {
+    with_image(source, |handler, data| {
       // Stage one — the detection spine.
       let rectangles = unsafe {
         [Retained::cast_unchecked::<VNRequest>(
@@ -1199,6 +1222,16 @@ impl FaceDetector {
   pub fn detect<F: FaceDetection>(
     &self,
     _jpeg_data: &[u8],
+    _options: &AppleVisionFaceOptions,
+  ) -> Result<Vec<F>, AnalyzeError> {
+    crate::error::unsupported()
+  }
+
+  /// Non-macOS stub: always reports
+  /// [`AnalyzeErrorKind::Unsupported`](crate::AnalyzeErrorKind::Unsupported).
+  pub fn detect_pixels<F: FaceDetection>(
+    &self,
+    _pixels: &PixelPlane<'_>,
     _options: &AppleVisionFaceOptions,
   ) -> Result<Vec<F>, AnalyzeError> {
     crate::error::unsupported()

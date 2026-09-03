@@ -11,12 +11,14 @@ use smol_str::{SmolStr, StrExt};
 
 use crate::AnalyzeError;
 #[cfg(target_vendor = "apple")]
+use crate::PixelPlane;
+#[cfg(target_vendor = "apple")]
 use crate::{
   Aesthetics, Analysis, AnalyzeOptions, AppleVisionSaliencyOptions, Detection, Detections,
   DocumentSegment, HorizonInfo, SaliencyRegion, SubjectDetection,
   ffi::{
-    MAX_VISION_RESULTS_PER_FRAME, effective_results_cap, ffi_nsstring_to_smolstr, finite_f32,
-    guard_vision_ffi, run_requests, sanitize_confidence, vision_point_to_normalized,
+    ImageSource, MAX_VISION_RESULTS_PER_FRAME, effective_results_cap, ffi_nsstring_to_smolstr,
+    finite_f32, guard_vision_ffi, run_requests, sanitize_confidence, vision_point_to_normalized,
     vision_rect_to_bbox,
   },
 };
@@ -200,57 +202,87 @@ impl VisionAnalyzer {
     jpeg_data: &[u8],
     options: &AnalyzeOptions,
   ) -> Result<Analysis<D>, AnalyzeError> {
-    run_requests(
-      jpeg_data,
-      &self.requests.as_slice(),
-      Analysis::new(),
-      || {
-        // Per-detector Objective-C exception barrier. The batched
-        // perform above runs every detector, but result extraction
-        // re-enters Vision FFI per detector (`results()` + per-observation
-        // accessors). Any one of those can raise an `NSException` that
-        // `catch_unwind` cannot catch — so each `extract_*` is wrapped in
-        // `objc2::exception::catch` (via `guard_vision_ffi`). A raising
-        // detector contributes its empty fallback and the OTHER detectors'
-        // results still land: the analysis degrades per detector, never
-        // aborting the process.
-        let mut analysis: Analysis<D> = Analysis::new();
-        analysis
-          .set_classifications(guard_vision_ffi("classify", Vec::new(), || {
-            self.extract_classifications::<D>(options)
-          }))
-          .set_human_subjects(guard_vision_ffi("human_rectangles", Vec::new(), || {
-            self.extract_human_subjects::<D>(options)
-          }))
-          .set_animal_subjects(guard_vision_ffi("animals", Vec::new(), || {
-            self.extract_animal_subjects::<D>(options)
-          }))
-          .set_attention_saliency(guard_vision_ffi("attention_saliency", Vec::new(), || {
-            self.extract_attention_saliency::<D>(options)
-          }))
-          .set_objectness_saliency(guard_vision_ffi("objectness_saliency", Vec::new(), || {
-            self.extract_objectness_saliency::<D>(options)
-          }))
-          .set_document_segments(guard_vision_ffi("document_segments", Vec::new(), || {
-            self.extract_document_segments::<D>(options)
-          }))
-          .set_horizon(guard_vision_ffi(
-            "horizon",
-            // The "no detection" sentinel — matches `extract_horizon`'s
-            // own `empty`. `None` only if the vocabulary refuses even
-            // that, which costs the slot rather than the frame.
-            D::HorizonInfo::try_new(0.0, 0.0).ok(),
-            || self.extract_horizon::<D>(options),
-          ))
-          .set_aesthetics(Some(guard_vision_ffi(
-            "aesthetics",
-            // The "no detection" sentinel — matches `extract_aesthetics`.
-            D::Aesthetics::new(0.0, false),
-            || self.extract_aesthetics::<D>(options),
-          )));
-        analysis
-      },
-    )
+    self.analyze_on::<D>(ImageSource::Jpeg(jpeg_data), options)
+  }
+
+  /// Runs the eight core Vision requests against already-decoded
+  /// `pixels` and gathers the detections into an [`Analysis`].
+  ///
+  /// [`analyze_keyframe`](Self::analyze_keyframe) reached without the
+  /// encode: same eight requests, same options, same per-detector
+  /// degradation, same output.
+  ///
+  /// # Why the pixels are copied
+  ///
+  /// The plane is borrowed, but the bytes handed to Vision are a copy.
+  /// Apple's contract does not say Vision releases the image before
+  /// `performRequests` returns, and a framework that outlived the borrow
+  /// would be reading freed memory — undefined behaviour rather than a
+  /// wrong detection — so the image is backed by a `CFData` that owns
+  /// its own bytes. One pass over the plane is what that costs, against
+  /// a door whose purpose is to delete a JPEG encode and the decode that
+  /// answers it. The caller's slice is untouched and free the moment the
+  /// call returns.
+  pub fn analyze_keyframe_pixels<D: Detections>(
+    &self,
+    pixels: &PixelPlane<'_>,
+    options: &AnalyzeOptions,
+  ) -> Result<Analysis<D>, AnalyzeError> {
+    self.analyze_on::<D>(ImageSource::Plane(pixels), options)
+  }
+
+  /// The one analysis body both doors reach.
+  fn analyze_on<D: Detections>(
+    &self,
+    source: ImageSource<'_>,
+    options: &AnalyzeOptions,
+  ) -> Result<Analysis<D>, AnalyzeError> {
+    run_requests(source, &self.requests.as_slice(), Analysis::new(), || {
+      // Per-detector Objective-C exception barrier. The batched
+      // perform above runs every detector, but result extraction
+      // re-enters Vision FFI per detector (`results()` + per-observation
+      // accessors). Any one of those can raise an `NSException` that
+      // `catch_unwind` cannot catch — so each `extract_*` is wrapped in
+      // `objc2::exception::catch` (via `guard_vision_ffi`). A raising
+      // detector contributes its empty fallback and the OTHER detectors'
+      // results still land: the analysis degrades per detector, never
+      // aborting the process.
+      let mut analysis: Analysis<D> = Analysis::new();
+      analysis
+        .set_classifications(guard_vision_ffi("classify", Vec::new(), || {
+          self.extract_classifications::<D>(options)
+        }))
+        .set_human_subjects(guard_vision_ffi("human_rectangles", Vec::new(), || {
+          self.extract_human_subjects::<D>(options)
+        }))
+        .set_animal_subjects(guard_vision_ffi("animals", Vec::new(), || {
+          self.extract_animal_subjects::<D>(options)
+        }))
+        .set_attention_saliency(guard_vision_ffi("attention_saliency", Vec::new(), || {
+          self.extract_attention_saliency::<D>(options)
+        }))
+        .set_objectness_saliency(guard_vision_ffi("objectness_saliency", Vec::new(), || {
+          self.extract_objectness_saliency::<D>(options)
+        }))
+        .set_document_segments(guard_vision_ffi("document_segments", Vec::new(), || {
+          self.extract_document_segments::<D>(options)
+        }))
+        .set_horizon(guard_vision_ffi(
+          "horizon",
+          // The "no detection" sentinel — matches `extract_horizon`'s
+          // own `empty`. `None` only if the vocabulary refuses even
+          // that, which costs the slot rather than the frame.
+          D::HorizonInfo::try_new(0.0, 0.0).ok(),
+          || self.extract_horizon::<D>(options),
+        ))
+        .set_aesthetics(Some(guard_vision_ffi(
+          "aesthetics",
+          // The "no detection" sentinel — matches `extract_aesthetics`.
+          D::Aesthetics::new(0.0, false),
+          || self.extract_aesthetics::<D>(options),
+        )));
+      analysis
+    })
   }
 
   fn extract_classifications<D: Detections>(&self, options: &AnalyzeOptions) -> Vec<D::Detection> {
@@ -588,6 +620,18 @@ impl VisionAnalyzer {
   pub fn analyze_keyframe<D: crate::Detections>(
     &self,
     _jpeg_data: &[u8],
+    _options: &AnalyzeOptions,
+  ) -> Result<Analysis<D>, AnalyzeError> {
+    crate::error::unsupported()
+  }
+
+  /// Non-macOS stub: Apple's Vision.framework is only available on
+  /// macOS, so this always reports
+  /// [`AnalyzeErrorKind::Unsupported`](crate::AnalyzeErrorKind::Unsupported).
+  /// `_pixels` is ignored.
+  pub fn analyze_keyframe_pixels<D: crate::Detections>(
+    &self,
+    _pixels: &crate::PixelPlane<'_>,
     _options: &AnalyzeOptions,
   ) -> Result<Analysis<D>, AnalyzeError> {
     crate::error::unsupported()

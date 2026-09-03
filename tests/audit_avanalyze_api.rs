@@ -10,7 +10,7 @@ use avanalyze::{
   AppleVisionBodyPoserOptions, AppleVisionClassificationOptions, AppleVisionFaceLandmarkOptions,
   AppleVisionFaceOptions, AppleVisionHandPoseOptions, AppleVisionPersonMaskerOptions,
   AppleVisionTextOptions, BarcodeDetector, BodyPoser, FaceDetector, FaceLandmarker, HandPoser,
-  PersonMasker, TextRecognizer, VisionAnalyzer,
+  PersonMasker, PixelFormat, PixelPlane, TextRecognizer, VisionAnalyzer,
 };
 use common::{
   AnimalPose, Barcode, Face, FaceLandmarks, HandPose, InstanceMask, Plain, Pose, Pose3,
@@ -144,6 +144,95 @@ mod non_macos {
     check(
       PersonMasker::new(&masker)
         .segmentation_masks::<SegmentationMask>(&[], &masker)
+        .expect_err("stub must Err"),
+    );
+  }
+
+  /// The pixel door refuses off Apple exactly as the JPEG door does —
+  /// same kind, same message, all eleven methods. A plane is pure
+  /// arithmetic and builds fine here; what does not exist off Apple is
+  /// Vision, so the refusal has to come from the same place either way.
+  #[test]
+  fn every_pixel_door_stub_refuses() {
+    fn check(err: avanalyze::AnalyzeError) {
+      assert_eq!(err.kind(), AnalyzeErrorKind::Unsupported);
+      assert!(err.message().contains("macOS"));
+    }
+
+    let bytes = [0u8; 4 * 4 * 3];
+    let plane = PixelPlane::packed(&bytes, 4, 4, PixelFormat::Rgb8)
+      .expect("a plane is arithmetic, and is valid on every target");
+
+    let options = AnalyzeOptions::new();
+    check(
+      VisionAnalyzer::new(&options)
+        .analyze_keyframe_pixels::<Plain>(&plane, &options)
+        .expect_err("stub must Err"),
+    );
+
+    let text = AppleVisionTextOptions::new();
+    check(
+      TextRecognizer::new(&text)
+        .recognize_pixels::<Text>(&plane, &text)
+        .expect_err("stub must Err"),
+    );
+
+    let barcode = AppleVisionBarcodeOptions::new();
+    check(
+      BarcodeDetector::new(&barcode)
+        .detect_pixels::<Barcode>(&plane, &barcode)
+        .expect_err("stub must Err"),
+    );
+
+    let face = AppleVisionFaceOptions::new();
+    check(
+      FaceDetector::new(&face)
+        .detect_pixels::<Face>(&plane, &face)
+        .expect_err("stub must Err"),
+    );
+
+    let landmarks = AppleVisionFaceLandmarkOptions::new();
+    check(
+      FaceLandmarker::new(&landmarks)
+        .detect_pixels::<FaceLandmarks>(&plane, &landmarks)
+        .expect_err("stub must Err"),
+    );
+
+    let poser = AppleVisionBodyPoserOptions::new();
+    check(
+      BodyPoser::new(&poser)
+        .detect_2d_pixels::<Pose>(&plane, &poser)
+        .expect_err("stub must Err"),
+    );
+    check(
+      BodyPoser::new(&poser)
+        .detect_3d_pixels::<Pose3>(&plane, &poser)
+        .expect_err("stub must Err"),
+    );
+
+    let hand = AppleVisionHandPoseOptions::new();
+    check(
+      HandPoser::new(&hand)
+        .detect_pixels::<HandPose>(&plane, &hand)
+        .expect_err("stub must Err"),
+    );
+
+    let animal = AppleVisionAnimalPoseOptions::new();
+    check(
+      AnimalPoser::new(&animal)
+        .detect_pixels::<AnimalPose>(&plane, &animal)
+        .expect_err("stub must Err"),
+    );
+
+    let masker = AppleVisionPersonMaskerOptions::new();
+    check(
+      PersonMasker::new(&masker)
+        .instance_masks_pixels::<InstanceMask>(&plane, &masker)
+        .expect_err("stub must Err"),
+    );
+    check(
+      PersonMasker::new(&masker)
+        .segmentation_masks_pixels::<SegmentationMask>(&plane, &masker)
         .expect_err("stub must Err"),
     );
   }
@@ -858,5 +947,337 @@ mod real_inference {
         .segmentation_masks::<SegmentationMask>(huge_dims, &masker)
         .expect_err("over-cap decoded dimensions must be refused"),
     );
+  }
+
+  /// A QR code carrying a known payload, generated for this suite.
+  /// Provenance is recorded in `tests/fixtures/README.md`.
+  const QR: &[u8] = include_bytes!("fixtures/qr_code.jpg");
+
+  /// Decode a fixture through ImageIO — the very decoder Vision reaches
+  /// for behind the JPEG door — and hand back a tight packed-RGB plane
+  /// of it, so both doors are compared on one decode rather than two.
+  fn rgb_plane_bytes(jpeg: &'static [u8]) -> (u32, u32, Vec<u8>) {
+    use core::ffi::c_void;
+
+    use objc2_core_foundation::{CGPoint, CGRect, CGSize};
+    use objc2_core_graphics::{
+      CGBitmapContextCreate, CGColorRenderingIntent, CGColorSpace, CGContext, CGDataProvider,
+      CGImage, CGImageAlphaInfo,
+    };
+
+    // SAFETY: `jpeg` is `'static`, so the provider's borrow cannot
+    // dangle, and no release callback is needed because nothing is
+    // owned. `decode` is null, the documented alternative to a pointer.
+    let (width, height, rgba) = unsafe {
+      let provider = CGDataProvider::with_data(
+        core::ptr::null_mut(),
+        jpeg.as_ptr().cast::<c_void>(),
+        jpeg.len(),
+        None,
+      )
+      .expect("a data provider over a static fixture");
+      let image = CGImage::with_jpeg_data_provider(
+        Some(&provider),
+        core::ptr::null(),
+        true,
+        CGColorRenderingIntent::RenderingIntentDefault,
+      )
+      .expect("the fixture is a decodable JPEG");
+      let width = CGImage::width(Some(&image));
+      let height = CGImage::height(Some(&image));
+      let stride = width * 4;
+      let mut rgba = vec![0u8; stride * height];
+      let colour_space = CGColorSpace::new_device_rgb().expect("device RGB");
+      let context = CGBitmapContextCreate(
+        rgba.as_mut_ptr().cast::<c_void>(),
+        width,
+        height,
+        8,
+        stride,
+        Some(&colour_space),
+        CGImageAlphaInfo::NoneSkipLast.0,
+      )
+      .expect("an RGBA8 bitmap context");
+      CGContext::draw_image(
+        Some(&context),
+        CGRect {
+          origin: CGPoint { x: 0.0, y: 0.0 },
+          size: CGSize {
+            width: width as f64,
+            height: height as f64,
+          },
+        },
+        Some(&image),
+      );
+      drop(context);
+      (width, height, rgba)
+    };
+
+    let mut packed = Vec::with_capacity(width * height * 3);
+    for pixel in rgba.as_chunks::<4>().0 {
+      packed.extend_from_slice(&pixel[..3]);
+    }
+    (
+      u32::try_from(width).expect("fixture width fits u32"),
+      u32::try_from(height).expect("fixture height fits u32"),
+      packed,
+    )
+  }
+
+  /// Door parity as a roster, through the OUTSIDE vocabulary: every one
+  /// of the eleven analysis methods has a pixel twin, every twin runs
+  /// against a plane decoded from a real photograph, and every one that
+  /// the photograph carries material for comes back with something.
+  ///
+  /// Presence is what this asserts and why it exists. `run_requests`
+  /// reports a caught Objective-C exception as `Ok` carrying the
+  /// caller's empty fallback, so a door that silently found nothing —
+  /// forever, for every input — would satisfy "returned `Ok`" on a
+  /// synthetic image with nothing in it. A count that must be non-zero
+  /// would not.
+  ///
+  /// Four capabilities have no material here and are asserted for
+  /// agreement only, honestly: `apollo11_crew.jpg` carries no barcode
+  /// (covered by the QR fixture below instead), no animal, and no text
+  /// Vision reads at 640 px, and `detect_3d` returns nothing on this
+  /// host through EITHER door because `VNRecognizedPoint3D` has no
+  /// `confidence` selector for `body_pose.rs` to send — a defect on
+  /// `main`, not of this door.
+  #[test]
+  fn every_entry_point_runs_its_pixel_door_on_a_real_photograph() {
+    let (width, height, packed) = rgb_plane_bytes(CREW);
+    let plane = PixelPlane::packed(&packed, width, height, PixelFormat::Rgb8)
+      .expect("a tight RGB plane of the crew fixture");
+
+    /// Both doors agreed, and — where the fixture carries the
+    /// capability — the pixel door found something.
+    fn agree(capability: &str, jpeg: usize, pixels: usize, carried: bool) {
+      assert_eq!(jpeg, pixels, "the two doors must agree on {capability}");
+      if carried {
+        assert!(
+          pixels > 0,
+          "the crew fixture carries {capability}, so a pixel door finding none is broken"
+        );
+      }
+    }
+
+    let options = AnalyzeOptions::new();
+    let analyzer = VisionAnalyzer::new(&options);
+    let jpeg = analyzer
+      .analyze_keyframe::<Plain>(CREW, &options)
+      .expect("the analyzer's jpeg door must return Ok");
+    let pixels = analyzer
+      .analyze_keyframe_pixels::<Plain>(&plane, &options)
+      .expect("the analyzer's pixel door must return Ok");
+    agree(
+      "classifications",
+      jpeg.classifications().len(),
+      pixels.classifications().len(),
+      true,
+    );
+    agree(
+      "human subjects",
+      jpeg.human_subjects().len(),
+      pixels.human_subjects().len(),
+      true,
+    );
+    assert!(pixels.horizon().is_some());
+    assert!(pixels.aesthetics().is_some());
+
+    let text = AppleVisionTextOptions::new();
+    let recognizer = TextRecognizer::new(&text);
+    agree(
+      "text",
+      recognizer
+        .recognize::<Text>(CREW, &text)
+        .expect("jpeg")
+        .len(),
+      recognizer
+        .recognize_pixels::<Text>(&plane, &text)
+        .expect("pixels")
+        .len(),
+      false,
+    );
+
+    let barcode = AppleVisionBarcodeOptions::new();
+    let detector = BarcodeDetector::new(&barcode);
+    agree(
+      "barcodes",
+      detector
+        .detect::<Barcode>(CREW, &barcode)
+        .expect("jpeg")
+        .len(),
+      detector
+        .detect_pixels::<Barcode>(&plane, &barcode)
+        .expect("pixels")
+        .len(),
+      false,
+    );
+
+    let face = AppleVisionFaceOptions::new();
+    let faces = FaceDetector::new(&face);
+    let through_pixels = faces
+      .detect_pixels::<Face>(&plane, &face)
+      .expect("the face fusion's pixel door must return Ok");
+    agree(
+      "faces",
+      faces.detect::<Face>(CREW, &face).expect("jpeg").len(),
+      through_pixels.len(),
+      true,
+    );
+    // The fusion's own product, not merely a count: every face carried
+    // through the pixel door must still arrive with its OWN annotations
+    // seated on it.
+    for found in &through_pixels {
+      let keypoints = found
+        .keypoints
+        .expect("each crew face reduces to five keypoints through the pixel door too");
+      for (x, y) in keypoints.points() {
+        assert!(
+          point_in_box(&found.bbox, x, y),
+          "a keypoint seated on the wrong face: ({x}, {y}) outside {:?}",
+          found.bbox
+        );
+      }
+      assert!(
+        found.capture_quality.is_some(),
+        "the capture-quality pass must reach the pixel door's faces too"
+      );
+    }
+
+    let landmarks = AppleVisionFaceLandmarkOptions::new();
+    let landmarker = FaceLandmarker::new(&landmarks);
+    agree(
+      "landmark sets",
+      landmarker
+        .detect::<FaceLandmarks>(CREW, &landmarks)
+        .expect("jpeg")
+        .len(),
+      landmarker
+        .detect_pixels::<FaceLandmarks>(&plane, &landmarks)
+        .expect("pixels")
+        .len(),
+      true,
+    );
+
+    let poser = AppleVisionBodyPoserOptions::new();
+    let bodies = BodyPoser::new(&poser);
+    agree(
+      "2-D body poses",
+      bodies.detect_2d::<Pose>(CREW, &poser).expect("jpeg").len(),
+      bodies
+        .detect_2d_pixels::<Pose>(&plane, &poser)
+        .expect("pixels")
+        .len(),
+      true,
+    );
+    agree(
+      "3-D body poses",
+      bodies.detect_3d::<Pose3>(CREW, &poser).expect("jpeg").len(),
+      bodies
+        .detect_3d_pixels::<Pose3>(&plane, &poser)
+        .expect("pixels")
+        .len(),
+      false,
+    );
+
+    let hand = AppleVisionHandPoseOptions::new();
+    let hands = HandPoser::new(&hand);
+    agree(
+      "hand poses",
+      hands.detect::<HandPose>(CREW, &hand).expect("jpeg").len(),
+      hands
+        .detect_pixels::<HandPose>(&plane, &hand)
+        .expect("pixels")
+        .len(),
+      true,
+    );
+
+    let animal = AppleVisionAnimalPoseOptions::new();
+    let animals = AnimalPoser::new(&animal);
+    agree(
+      "animal poses",
+      animals
+        .detect::<AnimalPose>(CREW, &animal)
+        .expect("jpeg")
+        .len(),
+      animals
+        .detect_pixels::<AnimalPose>(&plane, &animal)
+        .expect("pixels")
+        .len(),
+      false,
+    );
+
+    let masker = AppleVisionPersonMaskerOptions::new();
+    let masks = PersonMasker::new(&masker);
+    let instances = masks
+      .instance_masks_pixels::<InstanceMask>(&plane, &masker)
+      .expect("instance masks' pixel door must return Ok");
+    agree(
+      "instance masks",
+      masks
+        .instance_masks::<InstanceMask>(CREW, &masker)
+        .expect("jpeg")
+        .len(),
+      instances.len(),
+      true,
+    );
+    for mask in &instances {
+      assert!(
+        !mask.data.is_empty() && mask.width > 0 && mask.height > 0,
+        "a mask through the pixel door must carry real pixels"
+      );
+    }
+    agree(
+      "segmentation masks",
+      masks
+        .segmentation_masks::<SegmentationMask>(CREW, &masker)
+        .expect("jpeg")
+        .len(),
+      masks
+        .segmentation_masks_pixels::<SegmentationMask>(&plane, &masker)
+        .expect("pixels")
+        .len(),
+      true,
+    );
+  }
+
+  /// The barcode door reads a payload, not merely `Ok`.
+  ///
+  /// The crew fixture carries no barcode, so without this the barcode
+  /// door could return nothing forever and every other assertion would
+  /// still pass. The QR fixture exists for exactly that gap.
+  #[test]
+  fn the_pixel_door_decodes_a_barcode_payload() {
+    let (width, height, packed) = rgb_plane_bytes(QR);
+    let plane = PixelPlane::packed(&packed, width, height, PixelFormat::Rgb8).expect("plane");
+
+    let options = AppleVisionBarcodeOptions::new();
+    let detector = BarcodeDetector::new(&options);
+    let through_jpeg = detector
+      .detect::<Barcode>(QR, &options)
+      .expect("the jpeg door must return Ok");
+    let through_pixels = detector
+      .detect_pixels::<Barcode>(&plane, &options)
+      .expect("the pixel door must return Ok");
+
+    assert_eq!(through_jpeg.len(), 1, "the fixture carries one QR code");
+    assert_eq!(through_pixels.len(), 1, "and the pixel door must read it");
+    assert_eq!(through_pixels[0].payload, "AVANALYZE-PIXEL-DOOR");
+    assert_eq!(through_pixels[0].payload, through_jpeg[0].payload);
+    assert_eq!(through_pixels[0].symbology, through_jpeg[0].symbology);
+  }
+
+  /// The pixel door has no SOF preflight because it has nothing to
+  /// preflight — the geometry was settled when the caller built the
+  /// plane. So the refusal that the JPEG door raises at the door, the
+  /// pixel door raises at construction, and there is no way to get an
+  /// over-ceiling plane past it and into Vision.
+  #[test]
+  fn an_over_ceiling_plane_cannot_be_built_at_all() {
+    let err = PixelPlane::packed(&[], u16::MAX as u32, u16::MAX as u32, PixelFormat::Rgb8)
+      .expect_err("an over-ceiling plane must be refused");
+    assert_eq!(err.kind(), avanalyze::AnalyzeErrorKind::RequestFailed);
+    assert!(err.message().contains("MAX_DECODED_IMAGE_BYTES"));
   }
 }

@@ -1,8 +1,8 @@
 # Test fixtures
 
-Two committed images. Both are inputs to the real-inference lane in
-`tests/audit_avanalyze_api.rs`, which runs against the real Apple Vision
-framework and therefore only on an Apple host.
+Three committed images. All are inputs to the real-inference lanes in
+`tests/audit_avanalyze_api.rs` and `src/tests/pixel_door.rs`, which run
+against the real Apple Vision framework and therefore only on an Apple host.
 
 ```
 apollo11_crew.jpg
@@ -30,4 +30,19 @@ airport_keyframe.jpg
   288x512 + jpeg-encoder q85) at the first frame whose 3-D body-pose detector raises an
   Objective-C exception. 25930 bytes. Carries no face: it is the zero-face lane for the face
   fusion, and the no-abort regression fixture for every entry point.
+
+qr_code.jpg
+  content:   AVANALYZE-PIXEL-DOOR
+  produced:  generated for this repository with segno (QR version 2, error
+             correction H, scale 12, border 4), then
+             sips -s format jpeg -s formatOptions 90
+  committed: 396x396, 18006 bytes
+  sha256:    bd93cffe8b6bcb1434838906e3514cd85806e8a6ebf8482d5590a57bb46cfacf
+  licence:   none needed -- generated here, not taken from anywhere
+  why:       the barcode capability has no positive material in the other two
+             fixtures, so a barcode entry point that silently returned nothing
+             would pass every other test. Both doors must decode the payload
+             above, not merely detect a shape.
+  verified on this host: 1 barcode, symbology VNBarcodeSymbologyQR, payload
+    AVANALYZE-PIXEL-DOOR, identical through the jpeg door and the pixel door.
 ```

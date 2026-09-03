@@ -19,7 +19,7 @@ use crate::{
   AnalyzeErrorKind,
   face_landmarks::MAX_LANDMARK_POINTS,
   ffi::{
-    MAX_DECODED_IMAGE_BYTES, MAX_POSE_JOINT_ATTEMPTS_PER_CALL, MAX_POSE_JOINT_NAME_BYTES_PER_CALL,
+    ImageSource, MAX_POSE_JOINT_ATTEMPTS_PER_CALL, MAX_POSE_JOINT_NAME_BYTES_PER_CALL,
     MAX_POSE_JOINTS, MAX_POSE_JOINTS_PER_CALL, MAX_VISION_RESULTS_PER_FRAME, Performed, PoseBudget,
     PoseJoints, check_decoded_dimensions, collect_dictionary_pairs, finite_f32, guard_vision_ffi,
     pose_bbox_from_joint_bounds, project_landmark_to_image, read_pose_joints, run_requests,
@@ -27,6 +27,7 @@ use crate::{
     vision_rect_to_bbox, with_image,
   },
   person_mask::MAX_MASK_BYTES,
+  plane::MAX_DECODED_IMAGE_BYTES,
 };
 
 /// `vision_rect_to_bbox` must flip y. A Vision rect of
@@ -1301,7 +1302,7 @@ fn run_requests_extracts_only_after_a_completed_perform() {
     )]
   };
   let extracted = Cell::new(false);
-  let got = run_requests(JPEG, &requests, vec![9u8], || {
+  let got = run_requests(ImageSource::Jpeg(JPEG), &requests, vec![9u8], || {
     extracted.set(true);
     vec![1u8, 2, 3]
   })
@@ -1418,7 +1419,7 @@ fn sof_preflight_rejects_over_cap_dimensions_before_ns_data() {
   let jpeg = crafted_sof0(u16::MAX, u16::MAX);
   let body_ran = Cell::new(false);
 
-  let err = with_image(&jpeg, |_handler, _data| {
+  let err = with_image(ImageSource::Jpeg(&jpeg), |_handler, _image| {
     body_ran.set(true);
     Ok(())
   })

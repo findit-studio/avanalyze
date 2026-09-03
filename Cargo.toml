@@ -35,6 +35,15 @@ tracing = { version = "0.1", optional = true }
 # exceptions`). See `VisionRequests::perform` / the `extract_*` guards.
 objc2 = { version = "0.6", features = ["exception"] }
 objc2-core-foundation = { version = "0.3", features = ["CFCGTypes"] }
+# The pixel door's road into Vision. `performRequests:onCGImage:` is the
+# only entry face that takes packed 24-bit RGB — the shape a decoder
+# already holds — at an arbitrary row stride and without a re-encode;
+# `CVPixelBufferCreateWithBytes` refuses several of those layouts
+# outright (24BGR, 32RGBA) and reorders Vision's results for the rest.
+# `CGImage` builds the image, `CGDataProvider` carries the `CFData` that
+# owns the pixel copy, and `CGColorSpace` names the device RGB / gray
+# space each format is read in. See `ffi::cg_image_from_plane`.
+objc2-core-graphics = { version = "0.3", features = ["CGImage", "CGDataProvider", "CGColorSpace"] }
 # `NSEnumerator` is what makes the bounded pose-dictionary reader
 # possible: it gates `NSDictionary::keys()`, the safe, retaining,
 # iterator-shaped read that `ffi::collect_dictionary_pairs` uses in place
@@ -96,6 +105,15 @@ tempfile = "3"
 # constructors, so the two must link the SAME mediaframe — 0.2 pins 0.1.
 mediaframe = { version = "0.1", default-features = false, features = ["std"] }
 mediaschema = { version = "0.2", default-features = false, features = ["std", "video"] }
+
+# Test-only Core Graphics surface, on top of what the engine itself
+# links. The pixel door's format mappings are asserted by decoding a
+# fixture through ImageIO and rendering each built `CGImage` back out
+# into a bitmap context, channel by channel — which needs the drawing
+# half of the framework the engine never calls. Kept out of
+# `[dependencies]` so a consumer's build does not pull it.
+[target.'cfg(target_vendor = "apple")'.dev-dependencies]
+objc2-core-graphics = { version = "0.3", features = ["CGContext", "CGBitmapContext", "CGGeometry"] }
 
 [profile.bench]
 opt-level = 3

@@ -14,10 +14,11 @@ use objc2_vision::*;
 
 #[cfg(target_vendor = "apple")]
 use crate::ffi::{
-  MAX_VISION_RESULTS_PER_FRAME, guard_vision_ffi, project_landmark_to_image, run_requests,
-  sanitize_confidence, validate_raw_slice_elems, vision_point_to_normalized, vision_rect_to_bbox,
+  ImageSource, MAX_VISION_RESULTS_PER_FRAME, guard_vision_ffi, project_landmark_to_image,
+  run_requests, sanitize_confidence, validate_raw_slice_elems, vision_point_to_normalized,
+  vision_rect_to_bbox,
 };
-use crate::{AnalyzeError, AppleVisionFaceLandmarkOptions, BoundingBox};
+use crate::{AnalyzeError, AppleVisionFaceLandmarkOptions, BoundingBox, PixelPlane};
 
 /// Upper bound on the number of landmark points per face-landmark
 /// region. Vision's `allPoints` is ~76 points; per-feature regions
@@ -264,8 +265,30 @@ impl FaceLandmarker {
     jpeg_data: &[u8],
     options: &AppleVisionFaceLandmarkOptions,
   ) -> Result<Vec<L>, AnalyzeError> {
+    self.detect_on::<L>(ImageSource::Jpeg(jpeg_data), options)
+  }
+
+  /// Detects faces in already-decoded `pixels` and returns each with
+  /// its landmark regions.
+  ///
+  /// [`detect`](Self::detect) reached without the encode: same request,
+  /// same options, same budgets, same output.
+  pub fn detect_pixels<L: FaceLandmarksDetection>(
+    &self,
+    pixels: &PixelPlane<'_>,
+    options: &AppleVisionFaceLandmarkOptions,
+  ) -> Result<Vec<L>, AnalyzeError> {
+    self.detect_on::<L>(ImageSource::Plane(pixels), options)
+  }
+
+  /// The one detection body both doors reach.
+  fn detect_on<L: FaceLandmarksDetection>(
+    &self,
+    source: ImageSource<'_>,
+    options: &AppleVisionFaceLandmarkOptions,
+  ) -> Result<Vec<L>, AnalyzeError> {
     let requests = unsafe { [Retained::cast_unchecked::<VNRequest>(self.request.clone())] };
-    run_requests(jpeg_data, &requests, Vec::new(), || {
+    run_requests(source, &requests, Vec::new(), || {
       guard_vision_ffi("face_landmarks", Vec::new(), || self.extract::<L>(options))
     })
   }
@@ -643,6 +666,16 @@ impl FaceLandmarker {
   pub fn detect<L: FaceLandmarksDetection>(
     &self,
     _jpeg_data: &[u8],
+    _options: &AppleVisionFaceLandmarkOptions,
+  ) -> Result<Vec<L>, AnalyzeError> {
+    crate::error::unsupported()
+  }
+
+  /// Non-macOS stub: always reports
+  /// [`AnalyzeErrorKind::Unsupported`](crate::AnalyzeErrorKind::Unsupported).
+  pub fn detect_pixels<L: FaceLandmarksDetection>(
+    &self,
+    _pixels: &PixelPlane<'_>,
     _options: &AppleVisionFaceLandmarkOptions,
   ) -> Result<Vec<L>, AnalyzeError> {
     crate::error::unsupported()

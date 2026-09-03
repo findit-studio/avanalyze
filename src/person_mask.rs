@@ -17,9 +17,9 @@ use objc2_vision::*;
 
 #[cfg(target_vendor = "apple")]
 use crate::ffi::{
-  MAX_VISION_RESULTS_PER_FRAME, guard_vision_ffi, run_requests, sanitize_confidence,
+  ImageSource, MAX_VISION_RESULTS_PER_FRAME, guard_vision_ffi, run_requests, sanitize_confidence,
 };
-use crate::{AnalyzeError, AppleVisionPersonMaskerOptions, BoundingBox};
+use crate::{AnalyzeError, AppleVisionPersonMaskerOptions, BoundingBox, PixelPlane};
 
 /// Upper bound on a single mask payload (post-packing, 8 bits per
 /// pixel) before we refuse to allocate. 64 MiB covers any sane image
@@ -188,12 +188,35 @@ impl PersonMasker {
     jpeg_data: &[u8],
     options: &AppleVisionPersonMaskerOptions,
   ) -> Result<Vec<M>, AnalyzeError> {
+    self.instance_masks_on::<M>(ImageSource::Jpeg(jpeg_data), options)
+  }
+
+  /// Generates one mask per detected person instance in already-decoded
+  /// `pixels`.
+  ///
+  /// [`instance_masks`](Self::instance_masks) reached without the
+  /// encode: same request, same options, same budgets, same output. The
+  /// whole-frame segmentation model is still not loaded.
+  pub fn instance_masks_pixels<M: PersonInstanceMaskDetection>(
+    &self,
+    pixels: &PixelPlane<'_>,
+    options: &AppleVisionPersonMaskerOptions,
+  ) -> Result<Vec<M>, AnalyzeError> {
+    self.instance_masks_on::<M>(ImageSource::Plane(pixels), options)
+  }
+
+  /// The one instance-mask body both doors reach.
+  fn instance_masks_on<M: PersonInstanceMaskDetection>(
+    &self,
+    source: ImageSource<'_>,
+    options: &AppleVisionPersonMaskerOptions,
+  ) -> Result<Vec<M>, AnalyzeError> {
     let requests = unsafe {
       [Retained::cast_unchecked::<VNRequest>(
         self.instances.clone(),
       )]
     };
-    run_requests(jpeg_data, &requests, Vec::new(), || {
+    run_requests(source, &requests, Vec::new(), || {
       // The mask closure captures `&mut` budget counters, hence the
       // `AssertUnwindSafe` inside `guard_vision_ffi`: a caught
       // exception leaves a counter at its partial (over-counted,
@@ -215,12 +238,35 @@ impl PersonMasker {
     jpeg_data: &[u8],
     options: &AppleVisionPersonMaskerOptions,
   ) -> Result<Vec<M>, AnalyzeError> {
+    self.segmentation_masks_on::<M>(ImageSource::Jpeg(jpeg_data), options)
+  }
+
+  /// Generates the whole-frame person segmentation mask(s) for
+  /// already-decoded `pixels`.
+  ///
+  /// [`segmentation_masks`](Self::segmentation_masks) reached without
+  /// the encode: same request, same options, same budgets, same output.
+  /// The instance model is still not loaded.
+  pub fn segmentation_masks_pixels<M: PersonSegmentationMask>(
+    &self,
+    pixels: &PixelPlane<'_>,
+    options: &AppleVisionPersonMaskerOptions,
+  ) -> Result<Vec<M>, AnalyzeError> {
+    self.segmentation_masks_on::<M>(ImageSource::Plane(pixels), options)
+  }
+
+  /// The one segmentation-mask body both doors reach.
+  fn segmentation_masks_on<M: PersonSegmentationMask>(
+    &self,
+    source: ImageSource<'_>,
+    options: &AppleVisionPersonMaskerOptions,
+  ) -> Result<Vec<M>, AnalyzeError> {
     let requests = unsafe {
       [Retained::cast_unchecked::<VNRequest>(
         self.segmentation.clone(),
       )]
     };
-    run_requests(jpeg_data, &requests, Vec::new(), || {
+    run_requests(source, &requests, Vec::new(), || {
       let mut budget = MaskBudget::new();
       guard_vision_ffi("person_segmentation", Vec::new(), || {
         self.extract_segmentation::<M>(options, &mut budget)
@@ -935,9 +981,29 @@ impl PersonMasker {
 
   /// Non-macOS stub: always reports
   /// [`AnalyzeErrorKind::Unsupported`](crate::AnalyzeErrorKind::Unsupported).
+  pub fn instance_masks_pixels<M: PersonInstanceMaskDetection>(
+    &self,
+    _pixels: &PixelPlane<'_>,
+    _options: &AppleVisionPersonMaskerOptions,
+  ) -> Result<Vec<M>, AnalyzeError> {
+    crate::error::unsupported()
+  }
+
+  /// Non-macOS stub: always reports
+  /// [`AnalyzeErrorKind::Unsupported`](crate::AnalyzeErrorKind::Unsupported).
   pub fn segmentation_masks<M: PersonSegmentationMask>(
     &self,
     _jpeg_data: &[u8],
+    _options: &AppleVisionPersonMaskerOptions,
+  ) -> Result<Vec<M>, AnalyzeError> {
+    crate::error::unsupported()
+  }
+
+  /// Non-macOS stub: always reports
+  /// [`AnalyzeErrorKind::Unsupported`](crate::AnalyzeErrorKind::Unsupported).
+  pub fn segmentation_masks_pixels<M: PersonSegmentationMask>(
+    &self,
+    _pixels: &PixelPlane<'_>,
     _options: &AppleVisionPersonMaskerOptions,
   ) -> Result<Vec<M>, AnalyzeError> {
     crate::error::unsupported()
