@@ -1,3 +1,4 @@
+mod plane;
 mod reference;
 
 #[cfg(target_vendor = "apple")]
@@ -8,6 +9,8 @@ mod face;
 mod ffi;
 #[cfg(target_vendor = "apple")]
 mod mask;
+#[cfg(target_vendor = "apple")]
+mod pixel_door;
 
 use mediaschema::domain::aggregates::video as ms;
 

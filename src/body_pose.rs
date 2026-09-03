@@ -13,11 +13,11 @@ use objc2_vision::*;
 
 #[cfg(target_vendor = "apple")]
 use crate::ffi::{
-  MAX_POSE_JOINTS, MAX_VISION_RESULTS_PER_FRAME, PoseBudget, PoseJoints, ffi_nsstring_to_smolstr,
-  finite_f32, guard_vision_ffi, pose_bbox_from_joint_bounds, read_pose_joints, run_requests,
-  sanitize_confidence, vision_point_to_normalized,
+  ImageSource, MAX_POSE_JOINTS, MAX_VISION_RESULTS_PER_FRAME, PoseBudget, PoseJoints,
+  ffi_nsstring_to_smolstr, finite_f32, guard_vision_ffi, pose_bbox_from_joint_bounds,
+  read_pose_joints, run_requests, sanitize_confidence, vision_point_to_normalized,
 };
-use crate::{AnalyzeError, AppleVisionBodyPoserOptions, BoundingBox};
+use crate::{AnalyzeError, AppleVisionBodyPoserOptions, BoundingBox, PixelPlane};
 
 /// One 2-D pose joint — the shape body, hand, and animal joints share.
 ///
@@ -236,8 +236,30 @@ impl BodyPoser {
     jpeg_data: &[u8],
     options: &AppleVisionBodyPoserOptions,
   ) -> Result<Vec<P>, AnalyzeError> {
+    self.detect_2d_on::<P>(ImageSource::Jpeg(jpeg_data), options)
+  }
+
+  /// Detects 2-D human body poses in already-decoded `pixels`.
+  ///
+  /// [`detect_2d`](Self::detect_2d) reached without the encode: same
+  /// request, same options, same output. The 3-D model is still not
+  /// loaded.
+  pub fn detect_2d_pixels<P: BodyPoseDetection>(
+    &self,
+    pixels: &PixelPlane<'_>,
+    options: &AppleVisionBodyPoserOptions,
+  ) -> Result<Vec<P>, AnalyzeError> {
+    self.detect_2d_on::<P>(ImageSource::Plane(pixels), options)
+  }
+
+  /// The one 2-D detection body both doors reach.
+  fn detect_2d_on<P: BodyPoseDetection>(
+    &self,
+    source: ImageSource<'_>,
+    options: &AppleVisionBodyPoserOptions,
+  ) -> Result<Vec<P>, AnalyzeError> {
     let requests = unsafe { [Retained::cast_unchecked::<VNRequest>(self.pose_2d.clone())] };
-    run_requests(jpeg_data, &requests, Vec::new(), || {
+    run_requests(source, &requests, Vec::new(), || {
       guard_vision_ffi("body_pose", Vec::new(), || self.extract_2d::<P>(options))
     })
   }
@@ -251,12 +273,35 @@ impl BodyPoser {
     jpeg_data: &[u8],
     options: &AppleVisionBodyPoserOptions,
   ) -> Result<Vec<P>, AnalyzeError> {
+    self.detect_3d_on::<P>(ImageSource::Jpeg(jpeg_data), options)
+  }
+
+  /// Detects 3-D human body poses in already-decoded `pixels`, in
+  /// model-space metres.
+  ///
+  /// [`detect_3d`](Self::detect_3d) reached without the encode: same
+  /// request, same options, same output. The 2-D model is still not
+  /// loaded.
+  pub fn detect_3d_pixels<P: BodyPose3DDetection>(
+    &self,
+    pixels: &PixelPlane<'_>,
+    options: &AppleVisionBodyPoserOptions,
+  ) -> Result<Vec<P>, AnalyzeError> {
+    self.detect_3d_on::<P>(ImageSource::Plane(pixels), options)
+  }
+
+  /// The one 3-D detection body both doors reach.
+  fn detect_3d_on<P: BodyPose3DDetection>(
+    &self,
+    source: ImageSource<'_>,
+    options: &AppleVisionBodyPoserOptions,
+  ) -> Result<Vec<P>, AnalyzeError> {
     let requests = unsafe { [Retained::cast_unchecked::<VNRequest>(self.pose_3d.clone())] };
     // `extract_3d` self-guards (inner `objc2::exception::catch` under
     // its `catch_unwind`); a call-site guard here would put
     // `catch_unwind` inside the ObjC barrier and could not catch the
     // foreign exception.
-    run_requests(jpeg_data, &requests, Vec::new(), || {
+    run_requests(source, &requests, Vec::new(), || {
       self.extract_3d::<P>(options)
     })
   }
@@ -552,9 +597,29 @@ impl BodyPoser {
 
   /// Non-macOS stub: always reports
   /// [`AnalyzeErrorKind::Unsupported`](crate::AnalyzeErrorKind::Unsupported).
+  pub fn detect_2d_pixels<P: BodyPoseDetection>(
+    &self,
+    _pixels: &PixelPlane<'_>,
+    _options: &AppleVisionBodyPoserOptions,
+  ) -> Result<Vec<P>, AnalyzeError> {
+    crate::error::unsupported()
+  }
+
+  /// Non-macOS stub: always reports
+  /// [`AnalyzeErrorKind::Unsupported`](crate::AnalyzeErrorKind::Unsupported).
   pub fn detect_3d<P: BodyPose3DDetection>(
     &self,
     _jpeg_data: &[u8],
+    _options: &AppleVisionBodyPoserOptions,
+  ) -> Result<Vec<P>, AnalyzeError> {
+    crate::error::unsupported()
+  }
+
+  /// Non-macOS stub: always reports
+  /// [`AnalyzeErrorKind::Unsupported`](crate::AnalyzeErrorKind::Unsupported).
+  pub fn detect_3d_pixels<P: BodyPose3DDetection>(
+    &self,
+    _pixels: &PixelPlane<'_>,
     _options: &AppleVisionBodyPoserOptions,
   ) -> Result<Vec<P>, AnalyzeError> {
     crate::error::unsupported()

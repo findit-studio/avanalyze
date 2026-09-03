@@ -34,6 +34,39 @@ Construct only what you use. A consumer that wants text builds a
 `TextRecognizer`, names one output type, and loads exactly one Vision model —
 no face, pose, or mask model is constructed, let alone run.
 
+## Two doors
+
+Every method above takes encoded JPEG bytes, and every one of them has a twin
+that takes pixels you have already decoded — `analyze_keyframe_pixels`,
+`recognize_pixels`, `detect_pixels`, and so on across all eleven:
+
+```rust,ignore
+use avanalyze::{AppleVisionFaceOptions, FaceDetector, PixelFormat, PixelPlane};
+
+// `rgb` is packed 24-bit RGB a decoder already handed you.
+let plane = PixelPlane::packed(rgb, width, height, PixelFormat::Rgb8)?;
+
+let options = AppleVisionFaceOptions::new();
+let faces = FaceDetector::new(&options).detect_pixels::<MyFace>(&plane, &options)?;
+```
+
+Use them if you hold decoded frames. The JPEG door makes you encode a picture
+you already have so Vision can decode it again, and a pipeline running four of
+these entry points over one frame pays for that round trip four times.
+
+A `PixelPlane` is a borrowed slice plus `width`, `height`, `stride` and a
+`PixelFormat` — `Rgb8`, `Rgba8`, `Bgra8` or `Gray8`. Construction is where the
+geometry is settled: a zero dimension, a stride narrower than one row, an
+extent past the engine's decoded-size ceiling, or a buffer shorter than the
+geometry claims are refused there, so nothing downstream re-checks. The alpha
+byte of the 32-bit formats says where the colour bytes sit and is never read.
+
+Neither door replaces the other, and they differ in what you hand in and in
+nothing else — same requests, same options, same ceilings, same degradation,
+same output — because an entry point's two methods are one body reached two
+ways. Detections agree across them to within the two decode paths' own
+difference (a few thousandths of a normalized coordinate), not bit for bit.
+
 ## What it does not do
 
 It does not know what a keyframe *is*. The engine mints no identifiers, carries
@@ -137,8 +170,11 @@ and the traits it builds:
 - `src/body_pose.rs`, `src/hand_pose.rs`, `src/animal_pose.rs` — the pose entry
   points, their traits, `Chirality`, `HeightEstimation`.
 - `src/person_mask.rs` — `PersonMasker`, both mask traits, the pixel-buffer copy.
+- `src/plane.rs` — `PixelPlane`, `PixelFormat`, and the decoded-size ceiling
+  both doors enforce. No platform code: a plane's rules are arithmetic.
 - `src/ffi.rs` — the shared Vision boundary: coordinate conversion, resource
-  ceilings, the Objective-C exception barrier.
+  ceilings, the Objective-C exception barrier, and the two doors' one
+  divergence — encoded bytes to `NSData`, a plane to a `CGImage`.
 - `src/conformance.rs` — runnable assertions, per entry point.
 - `src/options.rs` — per-entry configuration knobs
   (`AppleVisionTextOptions`, `AppleVisionFaceOptions`, …) and `AnalyzeOptions`.

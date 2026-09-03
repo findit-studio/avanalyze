@@ -26,6 +26,21 @@
 //! aggregate, and depends on no schema crate; Vision.framework is
 //! stateless per-request, so workers run in parallel — one entry-point
 //! instance per worker thread, never shared.
+//!
+//! # Two doors, one engine
+//!
+//! Every method in that table has a twin taking a [`PixelPlane`] —
+//! pixels the caller has already decoded — in place of encoded JPEG
+//! bytes: `analyze_keyframe_pixels`, `recognize_pixels`,
+//! `detect_pixels`, and so on. A caller that holds decoded frames
+//! should use them. The JPEG door makes it encode a picture it already
+//! has so that Vision can decode it again, and a pipeline running four
+//! detectors over one frame pays for that round trip four times.
+//!
+//! Neither door replaces the other, and they differ in what is handed
+//! in and in nothing else — same requests, same options, same ceilings,
+//! same per-detector degradation, same output vocabulary — because an
+//! entry point's two methods are one body reached two ways.
 
 pub use analysis::*;
 pub use analyzer::*;
@@ -39,6 +54,7 @@ pub use face_landmarks::*;
 pub use hand_pose::*;
 pub use options::*;
 pub use person_mask::*;
+pub use plane::*;
 pub use text::*;
 
 mod analysis;
@@ -54,6 +70,7 @@ mod face_landmarks;
 mod hand_pose;
 mod options;
 mod person_mask;
+mod plane;
 mod text;
 
 #[cfg(target_vendor = "apple")]

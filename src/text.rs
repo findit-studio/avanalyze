@@ -8,10 +8,10 @@ use objc2_vision::*;
 
 #[cfg(target_vendor = "apple")]
 use crate::ffi::{
-  MAX_VISION_RESULTS_PER_FRAME, ffi_nsstring_to_smolstr, guard_vision_ffi, run_requests,
-  sanitize_confidence, vision_rect_to_bbox,
+  ImageSource, MAX_VISION_RESULTS_PER_FRAME, ffi_nsstring_to_smolstr, guard_vision_ffi,
+  run_requests, sanitize_confidence, vision_rect_to_bbox,
 };
-use crate::{AnalyzeError, AppleVisionTextOptions, BoundingBox};
+use crate::{AnalyzeError, AppleVisionTextOptions, BoundingBox, PixelPlane};
 
 /// Hard ceiling on candidate strings per text-recognition
 /// observation. Apple's
@@ -134,8 +134,29 @@ impl TextRecognizer {
     jpeg_data: &[u8],
     options: &AppleVisionTextOptions,
   ) -> Result<Vec<T>, AnalyzeError> {
+    self.recognize_on::<T>(ImageSource::Jpeg(jpeg_data), options)
+  }
+
+  /// Recognises text in already-decoded `pixels`.
+  ///
+  /// [`recognize`](Self::recognize) reached without the encode: same
+  /// request, same options, same refusals, same output.
+  pub fn recognize_pixels<T: TextDetection>(
+    &self,
+    pixels: &PixelPlane<'_>,
+    options: &AppleVisionTextOptions,
+  ) -> Result<Vec<T>, AnalyzeError> {
+    self.recognize_on::<T>(ImageSource::Plane(pixels), options)
+  }
+
+  /// The one recognition body both doors reach.
+  fn recognize_on<T: TextDetection>(
+    &self,
+    source: ImageSource<'_>,
+    options: &AppleVisionTextOptions,
+  ) -> Result<Vec<T>, AnalyzeError> {
     let requests = unsafe { [Retained::cast_unchecked::<VNRequest>(self.request.clone())] };
-    run_requests(jpeg_data, &requests, Vec::new(), || {
+    run_requests(source, &requests, Vec::new(), || {
       guard_vision_ffi("text", Vec::new(), || self.extract::<T>(options))
     })
   }
@@ -209,6 +230,16 @@ impl TextRecognizer {
   pub fn recognize<T: TextDetection>(
     &self,
     _jpeg_data: &[u8],
+    _options: &AppleVisionTextOptions,
+  ) -> Result<Vec<T>, AnalyzeError> {
+    crate::error::unsupported()
+  }
+
+  /// Non-macOS stub: always reports
+  /// [`AnalyzeErrorKind::Unsupported`](crate::AnalyzeErrorKind::Unsupported).
+  pub fn recognize_pixels<T: TextDetection>(
+    &self,
+    _pixels: &PixelPlane<'_>,
     _options: &AppleVisionTextOptions,
   ) -> Result<Vec<T>, AnalyzeError> {
     crate::error::unsupported()

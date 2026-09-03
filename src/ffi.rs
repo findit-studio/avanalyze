@@ -11,12 +11,19 @@
 use std::{borrow::Cow, panic::AssertUnwindSafe};
 
 use objc2::{Message, exception::catch as catch_objc_exception, rc::Retained};
-use objc2_core_foundation::{CGPoint, CGRect};
+use objc2_core_foundation::{CFData, CFIndex, CFMutableData, CFRetained, CGPoint, CGRect};
+use objc2_core_graphics::{
+  CGBitmapInfo, CGColorRenderingIntent, CGColorSpace, CGDataProvider, CGImage, CGImageAlphaInfo,
+  CGImageByteOrderInfo,
+};
 use objc2_foundation::{NSArray, NSData, NSDictionary};
 use objc2_vision::{VNRequest, VNSequenceRequestHandler};
 use smol_str::{SmolStr, ToSmolStr};
 
-use crate::{AnalyzeError, AnalyzeErrorKind, BoundingBox};
+use crate::{
+  AnalyzeError, AnalyzeErrorKind, BoundingBox, PixelFormat, PixelPlane,
+  plane::MAX_DECODED_IMAGE_BYTES,
+};
 
 // ----- resource ceilings shared by more than one entry point ----------------
 
@@ -56,19 +63,6 @@ pub(crate) const MAX_POSE_JOINTS: usize = 256;
 /// surface as a structured [`AnalyzeError`] instead of an alloc-side
 /// crash.
 pub(crate) const MAX_INPUT_IMAGE_BYTES: usize = 64 * 1024 * 1024;
-
-/// Upper bound on the decoded-pixel byte count a JPEG's SOF marker may
-/// declare before [`check_decoded_dimensions`] refuses it.
-/// [`MAX_INPUT_IMAGE_BYTES`] bounds the *compressed* input, but a small
-/// JPEG can still declare gigantic *decoded* dimensions in its SOF
-/// marker — Vision / ImageIO allocates buffers proportional to
-/// `width × height` once it decodes the frame, before any downstream
-/// cap in this crate runs. 512 MiB (≈134 MP at the 8-bit-precision
-/// baseline rate of 4 bytes/pixel — see [`decoded_bytes_per_pixel`] for
-/// the higher-precision rate) is far past any real keyframe but bounded
-/// rather than unbounded, so a hostile or corrupted SOF cannot drive the
-/// worker into memory pressure or OOM through the decode alone.
-pub(crate) const MAX_DECODED_IMAGE_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Upper bound on the byte length of an FFI-sourced `NSString`
 /// before we refuse to convert it to a Rust `SmolStr` / `String`.
@@ -986,6 +980,16 @@ fn find_sof_dimensions(jpeg: &[u8]) -> Result<SofFrame, AnalyzeError> {
 /// [`MAX_DECODED_IMAGE_BYTES`], before `NSData::with_bytes` copies the
 /// compressed bytes and Vision/ImageIO allocates buffers proportional to
 /// the declared size.
+///
+/// [`MAX_INPUT_IMAGE_BYTES`] bounds the *compressed* input, and that is
+/// not the same bound: a small JPEG can declare gigantic *decoded*
+/// dimensions in its SOF marker, and Vision/ImageIO allocates for
+/// `width × height` the moment it decodes, before any downstream cap in
+/// this crate runs. This is the only place that allocation can be
+/// bounded, and it has to be bounded without performing it — hence a
+/// marker walk and the worst-case rate [`decoded_bytes_per_pixel`]
+/// charges. The pixel door needs none of this: it is handed the decoded
+/// bytes, so it measures them directly at [`PixelPlane::new`].
 #[inline]
 pub(crate) fn check_decoded_dimensions(jpeg: &[u8]) -> Result<(), AnalyzeError> {
   let frame = find_sof_dimensions(jpeg)?;
@@ -1036,7 +1040,7 @@ pub(crate) enum Performed {
   Raised,
 }
 
-/// Perform `requests` against `data` under the Objective-C exception
+/// Perform `requests` against `image` under the Objective-C exception
 /// barrier.
 ///
 /// A detector can fail three ways, and each is a different return:
@@ -1055,49 +1059,54 @@ pub(crate) enum Performed {
 /// this call — see [`Performed`] for what is in there.
 pub(crate) fn perform(
   handler: &VNSequenceRequestHandler,
-  data: &NSData,
+  image: &VisionImage,
   requests: &[Retained<VNRequest>],
 ) -> Result<Performed, AnalyzeError> {
   let array = NSArray::from_retained_slice(requests);
   guard_vision_ffi("performRequests", Ok(Performed::Raised), || unsafe {
-    handler
-      .performRequests_onImageData_error(&array, data)
-      .map(|()| Performed::Completed)
-      .map_err(|e| {
-        // Route NSError's localizedDescription through the bounded
-        // FFI-string helper so a pathological error message cannot
-        // drive the allocator into the abort path while the worker
-        // is already trying to report a failure.
-        let raw = e.localizedDescription();
-        let message = ffi_nsstring_to_smolstr(&raw)
-          .map(|m| Cow::Owned(String::from(m)))
-          .unwrap_or(Cow::Borrowed(
-            "apple-vision request failed (description elided)",
-          ));
-        AnalyzeError::new(AnalyzeErrorKind::RequestFailed, message)
-      })
+    match image {
+      VisionImage::Encoded(data) => handler.performRequests_onImageData_error(&array, data),
+      VisionImage::Decoded(image) => handler.performRequests_onCGImage_error(&array, image),
+    }
+    .map(|()| Performed::Completed)
+    .map_err(|e| {
+      // Route NSError's localizedDescription through the bounded
+      // FFI-string helper so a pathological error message cannot
+      // drive the allocator into the abort path while the worker
+      // is already trying to report a failure.
+      let raw = e.localizedDescription();
+      let message = ffi_nsstring_to_smolstr(&raw)
+        .map(|m| Cow::Owned(String::from(m)))
+        .unwrap_or(Cow::Borrowed(
+          "apple-vision request failed (description elided)",
+        ));
+      AnalyzeError::new(AnalyzeErrorKind::RequestFailed, message)
+    })
   })
 }
 
 /// The per-call preamble every entry point runs, without the perform:
-/// bound the input, open an autorelease pool, wrap the JPEG, build the
-/// sequence handler, then hand both to `body`.
+/// bound the input, open an autorelease pool, build the image object and
+/// the sequence handler, then hand both to `body`.
 ///
 /// Holding the perform out is what lets a caller perform TWICE on one
 /// image — [`FaceDetector`](crate::FaceDetector) needs a first pass's
 /// observations before it can feed the other two — while every other
 /// entry point keeps paying for exactly one, through
 /// [`run_requests`].
+///
+/// The pre-flight runs BEFORE the pool and before anything is copied:
+/// [`ImageSource::preflight`] is what stops an over-ceiling JPEG from
+/// reaching `NSData::with_bytes`.
 pub(crate) fn with_image<R>(
-  jpeg: &[u8],
-  body: impl FnOnce(&VNSequenceRequestHandler, &NSData) -> Result<R, AnalyzeError>,
+  source: ImageSource<'_>,
+  body: impl FnOnce(&VNSequenceRequestHandler, &VisionImage) -> Result<R, AnalyzeError>,
 ) -> Result<R, AnalyzeError> {
-  check_input_len(jpeg)?;
-  check_decoded_dimensions(jpeg)?;
+  source.preflight()?;
   objc2::rc::autoreleasepool(|_| {
-    let ns_data = NSData::with_bytes(jpeg);
+    let image = source.prepare()?;
     let handler = unsafe { VNSequenceRequestHandler::new() };
-    body(&handler, &ns_data)
+    body(&handler, &image)
   })
 }
 
@@ -1119,16 +1128,289 @@ pub(crate) fn with_image<R>(
 /// happened to still hold. `fallback` is therefore the caller's own
 /// empty value — the same one its inner extraction guard already
 /// passes.
+///
+/// `source` is the ONLY thing that differs between an entry point's two
+/// doors: same requests, same fallback, same extraction, same caps.
 pub(crate) fn run_requests<R>(
-  jpeg: &[u8],
+  source: ImageSource<'_>,
   requests: &[Retained<VNRequest>],
   fallback: R,
   extract: impl FnOnce() -> R,
 ) -> Result<R, AnalyzeError> {
-  with_image(jpeg, |handler, data| {
-    match perform(handler, data, requests)? {
+  with_image(source, |handler, image| {
+    match perform(handler, image, requests)? {
       Performed::Completed => Ok(extract()),
       Performed::Raised => Ok(fallback),
     }
+  })
+}
+
+// ----- the two doors ---------------------------------------------------------
+
+/// What a caller handed an entry point — the whole difference between
+/// this crate's two doors.
+///
+/// The doors diverge here and nowhere else. Both variants become a
+/// [`VisionImage`] and go through the same [`perform`], the same
+/// exception barrier, the same [`Performed`] discipline, and the same
+/// extractor: an entry point's two public methods are one private body
+/// that this enum is passed to.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ImageSource<'a> {
+  /// Encoded bytes. Vision hands them to ImageIO, which decodes.
+  Jpeg(&'a [u8]),
+  /// Pixels the caller already decoded. Nothing decodes them again.
+  Plane(&'a PixelPlane<'a>),
+}
+
+impl ImageSource<'_> {
+  /// Refuse an input the engine will not put in front of Vision, before
+  /// anything is allocated or copied.
+  ///
+  /// A JPEG is untrusted bytes and gets both checks — the compressed
+  /// ceiling and the SOF decoded-size walk. A plane has nothing left to
+  /// check: [`PixelPlane::new`] enforced the geometry, the extent and
+  /// the same [`MAX_DECODED_IMAGE_BYTES`] ceiling when the caller
+  /// constructed it, and a constructed plane is immutable.
+  fn preflight(&self) -> Result<(), AnalyzeError> {
+    match self {
+      Self::Jpeg(jpeg) => {
+        check_input_len(jpeg)?;
+        check_decoded_dimensions(jpeg)
+      }
+      Self::Plane(_) => Ok(()),
+    }
+  }
+
+  /// Build the Objective-C / Core Graphics object Vision performs
+  /// against. Call inside the autorelease pool.
+  fn prepare(&self) -> Result<VisionImage, AnalyzeError> {
+    match self {
+      Self::Jpeg(jpeg) => Ok(VisionImage::Encoded(NSData::with_bytes(jpeg))),
+      Self::Plane(plane) => cg_image_from_plane(plane).map(VisionImage::Decoded),
+    }
+  }
+}
+
+/// The prepared image one perform runs against.
+#[derive(Debug)]
+pub(crate) enum VisionImage {
+  /// `performRequests:onImageData:` — Vision decodes.
+  Encoded(Retained<NSData>),
+  /// `performRequests:onCGImage:` — nothing decodes.
+  Decoded(CFRetained<CGImage>),
+}
+
+/// The `(bits per pixel, colour space, bitmap info)` Core Graphics needs
+/// to read a plane of this format.
+///
+/// Every mapping is asserted bit-exactly in the test suite by rendering
+/// a plane back out through a Core Graphics bitmap context and comparing
+/// channels, so a wrong constant here is a failing test rather than a
+/// silently colour-swapped detection.
+fn cg_layout(format: PixelFormat) -> (usize, Option<CFRetained<CGColorSpace>>, CGBitmapInfo) {
+  match format {
+    PixelFormat::Rgb8 => (
+      24,
+      CGColorSpace::new_device_rgb(),
+      CGBitmapInfo(CGImageAlphaInfo::None.0),
+    ),
+    PixelFormat::Rgba8 => (
+      32,
+      CGColorSpace::new_device_rgb(),
+      // "Skip last", not "alpha last": the fourth byte is never read,
+      // so no premultiplication is assumed and none is undone.
+      CGBitmapInfo(CGImageAlphaInfo::NoneSkipLast.0),
+    ),
+    PixelFormat::Bgra8 => (
+      32,
+      CGColorSpace::new_device_rgb(),
+      // A little-endian 32-bit word over the bytes `B G R A` reads as
+      // `0xAARRGGBB`, so skipping the FIRST component skips the alpha
+      // byte and leaves the colour bytes in place.
+      CGBitmapInfo(CGImageAlphaInfo::NoneSkipFirst.0 | CGImageByteOrderInfo::Order32Little.0),
+    ),
+    PixelFormat::Gray8 => (
+      8,
+      CGColorSpace::new_device_gray(),
+      CGBitmapInfo(CGImageAlphaInfo::None.0),
+    ),
+  }
+}
+
+/// A refusal from the pixel door's own allocation path.
+#[inline]
+fn plane_alloc_refused(message: &'static str) -> AnalyzeError {
+  AnalyzeError::new(AnalyzeErrorKind::RequestFailed, message)
+}
+
+/// A `CGDataProvider` over ONE Core Foundation copy of the plane's
+/// pixels, row padding removed.
+///
+/// # One copy, and only one
+///
+/// The engine's addition to the caller's peak memory is exactly one copy
+/// of the image, whatever shape the plane arrives in — the same doubling
+/// the JPEG door's own [`MAX_INPUT_IMAGE_BYTES`] ceiling is written
+/// against ("cannot double the worker's peak memory"). That is the floor
+/// for a door that must own its bytes, and reaching it takes two
+/// different routes:
+///
+/// - a **tight** plane — every `PixelPlane::packed` caller — is already
+///   the tight buffer, so `CFDataCreate` copies straight out of the
+///   caller's slice and nothing of ours exists in between;
+/// - a **padded** plane is appended row by row into a `CFMutableData`
+///   sized up front, so the padding is dropped during the one copy
+///   rather than by a compacting pass that would exist alongside it.
+///
+/// The intermediate `Vec` those two replace was the bug: for a padded
+/// plane at the ceiling it held a third 512 MiB image live beside the
+/// caller's and Core Foundation's, and `Vec::with_capacity` is
+/// infallible, so failing to get it aborted the process instead of
+/// refusing the frame.
+///
+/// # Every allocation here is fallible
+///
+/// `CFDataCreate` and `CFDataCreateMutable` report failure as null,
+/// which becomes an [`AnalyzeErrorKind::RequestFailed`] like any other
+/// refusal. No Rust-side infallible allocation is on this path at all,
+/// so a plane the machine cannot hold costs the frame, never the worker.
+/// The appended length is verified against the length asked for, so an
+/// append that did not land is refused rather than shipped as a
+/// truncated image.
+///
+/// # The arithmetic is bounded by construction
+///
+/// `PixelPlane::new` established `stride * (height - 1) + row_bytes <=
+/// 512 MiB` and `stride >= row_bytes`, so `row_bytes * height <=
+/// stride * (height - 1) + row_bytes` — the product cannot overflow and
+/// cannot exceed the ceiling. The same statement is what puts every row
+/// slice in bounds: the last one ends at exactly that extent, and the
+/// plane's buffer is at least that long.
+fn plane_provider(plane: &PixelPlane<'_>) -> Result<CFRetained<CGDataProvider>, AnalyzeError> {
+  let row_bytes = plane.row_bytes();
+  let height = plane.height() as usize;
+  let tight_len = row_bytes * height;
+  // Bounded by the plane's own ceiling, well inside `CFIndex`, but
+  // converted rather than cast so a future ceiling cannot turn a length
+  // into a negative index.
+  let (Ok(length), Ok(row_length)) = (CFIndex::try_from(tight_len), CFIndex::try_from(row_bytes))
+  else {
+    return Err(plane_alloc_refused(
+      "pixel plane is too large to describe to core foundation",
+    ));
+  };
+
+  let provider = if plane.stride() == row_bytes {
+    // SAFETY: the plane's own buffer is a live slice of at least
+    // `tight_len` bytes — `PixelPlane::new` established exactly that —
+    // and `CFDataCreate` copies out of it before returning, so nothing
+    // of ours is borrowed past this call. `None` is the default
+    // allocator, which `CFDataCreate` accepts.
+    let data = unsafe { CFData::new(None, plane.data().as_ptr(), length) };
+    let Some(data) = data else {
+      return Err(plane_alloc_refused(
+        "core foundation declined to copy the pixel plane",
+      ));
+    };
+    CGDataProvider::with_cf_data(Some(&data))
+  } else {
+    let Some(data) = CFMutableData::new(None, length) else {
+      return Err(plane_alloc_refused(
+        "core foundation declined to allocate for the pixel plane",
+      ));
+    };
+    for row in 0..height {
+      let start = row * plane.stride();
+      let source = &plane.data()[start..start + row_bytes];
+      // SAFETY: `source` is a live slice of exactly `row_length` bytes,
+      // read and copied before this returns. The appends total
+      // `tight_len`, the capacity the buffer was created with, so none
+      // of them asks it to grow past it.
+      unsafe { CFMutableData::append_bytes(Some(&data), source.as_ptr(), row_length) };
+    }
+    if data.length() != length {
+      return Err(plane_alloc_refused(
+        "core foundation did not take the whole pixel plane",
+      ));
+    }
+    CGDataProvider::with_cf_data(Some(&data))
+  };
+
+  provider.ok_or_else(|| {
+    plane_alloc_refused("core graphics declined to create a data provider for the pixel plane")
+  })
+}
+
+/// Wrap a plane in a `CGImage` for `performRequests:onCGImage:`.
+///
+/// # Why the pixels are copied
+///
+/// A `CGDataProvider` can be built over borrowed memory, and that would
+/// make this door allocation-free. It would also stake the caller's
+/// buffer on a lifetime this crate cannot establish: the `CGImage` is
+/// handed to Vision, and nothing in Apple's contract says Vision does
+/// not retain it past `performRequests`. Rust would have no way to
+/// notice, and a read after the borrow ended is undefined behaviour, not
+/// a wrong answer.
+///
+/// So the provider is backed by Core Foundation, which COPIES what it is
+/// given and then owns it for as long as anything holds it — Core
+/// Graphics, Vision, or this function. The caller's slice is untouched
+/// and free the moment this returns, whoever is still holding the image.
+/// [`plane_provider`] is where that one copy is made, and why it is
+/// exactly one.
+///
+/// Core Foundation also removes the alternative's whole failure surface:
+/// a buffer handed over raw with a release callback would have to be
+/// freed by hand on every path where a create returned null, and getting
+/// that wrong is a leak in one direction and a double free in the other.
+/// Here every object is reference-counted from the moment it exists, so
+/// an early return drops what it holds and nothing else.
+///
+/// # Refusals
+///
+/// [`AnalyzeErrorKind::RequestFailed`], for a colour space, a pixel
+/// copy, a provider, or an image that the frameworks decline to
+/// create — never an abort. See [`plane_provider`] for the allocation
+/// half.
+pub(crate) fn cg_image_from_plane(
+  plane: &PixelPlane<'_>,
+) -> Result<CFRetained<CGImage>, AnalyzeError> {
+  let (bits_per_pixel, colour_space, bitmap_info) = cg_layout(plane.format());
+  let Some(colour_space) = colour_space else {
+    return Err(AnalyzeError::new(
+      AnalyzeErrorKind::RequestFailed,
+      "core graphics declined to create the plane's colour space",
+    ));
+  };
+
+  let provider = plane_provider(plane)?;
+
+  // SAFETY: `decode` is null, which the binding documents as the one
+  // alternative to a valid pointer. Every other argument describes the
+  // buffer the provider now owns: `row_bytes` bytes per row for
+  // `height` rows is exactly `pixels.len()`, so the image cannot
+  // describe a byte the provider does not hold.
+  let image = unsafe {
+    CGImage::new(
+      plane.width() as usize,
+      plane.height() as usize,
+      8,
+      bits_per_pixel,
+      plane.row_bytes(),
+      Some(&colour_space),
+      bitmap_info,
+      Some(&provider),
+      core::ptr::null(),
+      false,
+      CGColorRenderingIntent::RenderingIntentDefault,
+    )
+  };
+  image.ok_or_else(|| {
+    AnalyzeError::new(
+      AnalyzeErrorKind::RequestFailed,
+      "core graphics declined to create an image for the pixel plane",
+    )
   })
 }

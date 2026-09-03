@@ -1,5 +1,102 @@
 # Changelog
 
+## Unreleased
+
+The engine grows a second door: pixels a caller has already decoded, in place
+of encoded JPEG bytes. Nothing about the first door changes.
+
+### Added
+
+- **A raw-pixel door on all eleven analysis methods.** Every entry point gains
+  a twin that takes a `PixelPlane` instead of `&[u8]`:
+  `VisionAnalyzer::analyze_keyframe_pixels`, `TextRecognizer::recognize_pixels`,
+  `BarcodeDetector::detect_pixels`, `FaceDetector::detect_pixels`,
+  `FaceLandmarker::detect_pixels`, `BodyPoser::detect_2d_pixels` /
+  `detect_3d_pixels`, `HandPoser::detect_pixels`, `AnimalPoser::detect_pixels`,
+  `PersonMasker::instance_masks_pixels` / `segmentation_masks_pixels`. Purely
+  additive: no existing signature moved, and the JPEG doors stay first-class,
+  undeprecated, and unchanged in behaviour.
+
+  The door exists because a pipeline that holds decoded frames was paying to
+  encode a picture it already had so that Vision could decode it again — and
+  paying it once per detector. A caller running four of these entry points over
+  one frame paid for four encodes and four decodes of the same pixels.
+
+  Both doors are one body per capability: the public methods differ only in
+  what they hand to the shared preamble, so the requests performed, the options
+  read, the resource ceilings, the per-detector Objective-C exception barrier
+  and the output vocabulary are the same object either way, not two
+  implementations kept in step.
+
+- **`PixelPlane` and `PixelFormat`.** A plane is a borrowed byte slice plus
+  `width`, `height`, `stride` and format; `PixelPlane::new` takes the stride
+  and `PixelPlane::packed` computes it for the unpadded case. Construction is
+  the contract — a zero dimension, a stride narrower than one row, a byte
+  extent past `MAX_DECODED_IMAGE_BYTES` (the same 512 MiB ceiling the JPEG
+  door's SOF preflight enforces) and a buffer shorter than the geometry claims
+  are all refused there, as `AnalyzeErrorKind::RequestFailed`, the same kind
+  the JPEG door already returns for an input it will not put in front of
+  Vision. The extent is `stride * (height - 1) + row_bytes`, so a buffer that
+  ends with the last pixel rather than with a final row of padding is a whole
+  image. Every product is checked rather than wrapped.
+
+  `PixelFormat` is `Rgb8`, `Rgba8`, `Bgra8`, `Gray8` — the interleaved 8-bit
+  layouts a decoder hands back — and is `#[non_exhaustive]`, so more can be
+  admitted without a break. The alpha byte of the two 32-bit formats names
+  where the colour bytes sit and is never read: a plane is presented to Vision
+  as opaque whatever it holds, so straight and premultiplied alpha give the
+  same detections and a caller whose fourth byte is padding need not zero it.
+
+### Behaviour
+
+- **The pixel door copies the plane once, on purpose — and exactly once.** The
+  `CGImage` is backed by Core Foundation, which copies what it is given and
+  then owns it, not by a borrow of the caller's slice. Apple does not promise
+  Vision releases the image before `performRequests` returns, and a framework
+  outliving the borrow would be reading freed memory, undefined behaviour
+  rather than a wrong answer, so the borrow is not staked on it. The caller's
+  slice is untouched and free the moment the call returns, whoever is still
+  holding the image.
+
+  One copy is also the whole cost: a tight plane — every `PixelPlane::packed`
+  caller — is already the tight buffer, so `CFDataCreate` copies straight out
+  of it, and a padded plane is appended row by row into a `CFMutableData` sized
+  up front, so the padding is dropped *during* that copy rather than by a
+  compacting pass alongside it. Peak memory is therefore the caller's plane
+  plus one copy of it, the same doubling `MAX_INPUT_IMAGE_BYTES` is written
+  against for the JPEG door, and the floor for a door that must own its bytes.
+
+  Every allocation on the path is fallible: `CFDataCreate` and
+  `CFDataCreateMutable` report failure as null, which becomes an
+  `AnalyzeErrorKind::RequestFailed` like any other refusal, and the appended
+  length is verified against the length asked for. No Rust-side infallible
+  allocation is on the pixel path at all, so a plane the machine cannot hold
+  costs the frame, never the worker.
+
+- **Detections agree across the doors to within the decode paths' own
+  difference, not bit for bit.** Vision sees a compressed stream through one
+  door and pixels through the other, so its preprocessing differs slightly.
+  Measured on an Apple host over the crew fixture: three faces through each
+  door, agreeing to under 0.002 in every normalized coordinate and 0.005 in
+  confidence, and the two doors do not return one frame's faces in the same
+  order. Where a claim can be exact it is asserted exactly: each format's
+  Core Graphics mapping is checked by rendering the built image back out and
+  comparing channels, so a swapped red and blue is a byte mismatch rather than
+  a plausible detection.
+
+- **A third fixture, `tests/fixtures/qr_code.jpg`.** Generated for this
+  repository — no licence, no provenance chain — carrying the payload
+  `AVANALYZE-PIXEL-DOOR`. The barcode capability has no positive material in
+  the other two fixtures, so without it a barcode door that silently returned
+  nothing would pass every test in the suite: `run_requests` reports a caught
+  Objective-C exception as `Ok` with an empty fallback, and "returned `Ok`" is
+  not a claim about detections. Both doors must now decode the payload itself.
+
+- **No new crate enters the dependency graph.** `objc2-core-graphics` was
+  already there through `objc2-vision` and `objc2-core-video`; the door makes
+  the edge direct and names three features (`CGImage`, `CGDataProvider`,
+  `CGColorSpace`). `Cargo.lock` does not move.
+
 ## 0.5.0 — 2026-09-02
 
 The one 18-seat bundle becomes nine entry points, each owning exactly its own

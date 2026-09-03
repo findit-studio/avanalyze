@@ -7,11 +7,11 @@ use objc2_vision::*;
 
 #[cfg(target_vendor = "apple")]
 use crate::ffi::{
-  MAX_POSE_JOINTS, MAX_VISION_RESULTS_PER_FRAME, PoseBudget, PoseJoints, ffi_nsstring_to_smolstr,
-  guard_vision_ffi, pose_bbox_from_joint_bounds, read_pose_joints, run_requests,
-  sanitize_confidence, vision_point_to_normalized,
+  ImageSource, MAX_POSE_JOINTS, MAX_VISION_RESULTS_PER_FRAME, PoseBudget, PoseJoints,
+  ffi_nsstring_to_smolstr, guard_vision_ffi, pose_bbox_from_joint_bounds, read_pose_joints,
+  run_requests, sanitize_confidence, vision_point_to_normalized,
 };
-use crate::{AnalyzeError, AppleVisionHandPoseOptions, BodyPoseJoint, BoundingBox};
+use crate::{AnalyzeError, AppleVisionHandPoseOptions, BodyPoseJoint, BoundingBox, PixelPlane};
 
 /// Apple's documented maximum for
 /// `VNDetectHumanHandPoseRequest::setMaximumHandCount(_:)` at
@@ -130,8 +130,29 @@ impl HandPoser {
     jpeg_data: &[u8],
     options: &AppleVisionHandPoseOptions,
   ) -> Result<Vec<P>, AnalyzeError> {
+    self.detect_on::<P>(ImageSource::Jpeg(jpeg_data), options)
+  }
+
+  /// Detects hand poses in already-decoded `pixels`.
+  ///
+  /// [`detect`](Self::detect) reached without the encode: same request,
+  /// same baked knob, same options, same output.
+  pub fn detect_pixels<P: HandPoseDetection>(
+    &self,
+    pixels: &PixelPlane<'_>,
+    options: &AppleVisionHandPoseOptions,
+  ) -> Result<Vec<P>, AnalyzeError> {
+    self.detect_on::<P>(ImageSource::Plane(pixels), options)
+  }
+
+  /// The one detection body both doors reach.
+  fn detect_on<P: HandPoseDetection>(
+    &self,
+    source: ImageSource<'_>,
+    options: &AppleVisionHandPoseOptions,
+  ) -> Result<Vec<P>, AnalyzeError> {
     let requests = unsafe { [Retained::cast_unchecked::<VNRequest>(self.request.clone())] };
-    run_requests(jpeg_data, &requests, Vec::new(), || {
+    run_requests(source, &requests, Vec::new(), || {
       guard_vision_ffi("hand_pose", Vec::new(), || self.extract::<P>(options))
     })
   }
@@ -270,6 +291,16 @@ impl HandPoser {
   pub fn detect<P: HandPoseDetection>(
     &self,
     _jpeg_data: &[u8],
+    _options: &AppleVisionHandPoseOptions,
+  ) -> Result<Vec<P>, AnalyzeError> {
+    crate::error::unsupported()
+  }
+
+  /// Non-macOS stub: always reports
+  /// [`AnalyzeErrorKind::Unsupported`](crate::AnalyzeErrorKind::Unsupported).
+  pub fn detect_pixels<P: HandPoseDetection>(
+    &self,
+    _pixels: &PixelPlane<'_>,
     _options: &AppleVisionHandPoseOptions,
   ) -> Result<Vec<P>, AnalyzeError> {
     crate::error::unsupported()

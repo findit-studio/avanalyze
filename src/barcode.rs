@@ -8,10 +8,10 @@ use objc2_vision::*;
 
 #[cfg(target_vendor = "apple")]
 use crate::ffi::{
-  MAX_VISION_RESULTS_PER_FRAME, ffi_nsstring_to_smolstr, guard_vision_ffi, run_requests,
-  sanitize_confidence, vision_rect_to_bbox,
+  ImageSource, MAX_VISION_RESULTS_PER_FRAME, ffi_nsstring_to_smolstr, guard_vision_ffi,
+  run_requests, sanitize_confidence, vision_rect_to_bbox,
 };
-use crate::{AnalyzeError, AppleVisionBarcodeOptions, BoundingBox};
+use crate::{AnalyzeError, AppleVisionBarcodeOptions, BoundingBox, PixelPlane};
 
 /// One decoded barcode.
 ///
@@ -93,8 +93,29 @@ impl BarcodeDetector {
     jpeg_data: &[u8],
     options: &AppleVisionBarcodeOptions,
   ) -> Result<Vec<B>, AnalyzeError> {
+    self.detect_on::<B>(ImageSource::Jpeg(jpeg_data), options)
+  }
+
+  /// Decodes every barcode in already-decoded `pixels`.
+  ///
+  /// [`detect`](Self::detect) reached without the encode: same request,
+  /// same options, same refusals, same output.
+  pub fn detect_pixels<B: BarcodeDetection>(
+    &self,
+    pixels: &PixelPlane<'_>,
+    options: &AppleVisionBarcodeOptions,
+  ) -> Result<Vec<B>, AnalyzeError> {
+    self.detect_on::<B>(ImageSource::Plane(pixels), options)
+  }
+
+  /// The one detection body both doors reach.
+  fn detect_on<B: BarcodeDetection>(
+    &self,
+    source: ImageSource<'_>,
+    options: &AppleVisionBarcodeOptions,
+  ) -> Result<Vec<B>, AnalyzeError> {
     let requests = unsafe { [Retained::cast_unchecked::<VNRequest>(self.request.clone())] };
-    run_requests(jpeg_data, &requests, Vec::new(), || {
+    run_requests(source, &requests, Vec::new(), || {
       guard_vision_ffi("barcodes", Vec::new(), || self.extract::<B>(options))
     })
   }
@@ -152,6 +173,16 @@ impl BarcodeDetector {
   pub fn detect<B: BarcodeDetection>(
     &self,
     _jpeg_data: &[u8],
+    _options: &AppleVisionBarcodeOptions,
+  ) -> Result<Vec<B>, AnalyzeError> {
+    crate::error::unsupported()
+  }
+
+  /// Non-macOS stub: always reports
+  /// [`AnalyzeErrorKind::Unsupported`](crate::AnalyzeErrorKind::Unsupported).
+  pub fn detect_pixels<B: BarcodeDetection>(
+    &self,
+    _pixels: &PixelPlane<'_>,
     _options: &AppleVisionBarcodeOptions,
   ) -> Result<Vec<B>, AnalyzeError> {
     crate::error::unsupported()
