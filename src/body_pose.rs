@@ -4,10 +4,7 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 #[cfg(target_vendor = "apple")]
-use objc2::{
-  encode::{Encode, Encoding},
-  rc::Retained,
-};
+use objc2::rc::Retained;
 #[cfg(target_vendor = "apple")]
 use objc2_vision::*;
 
@@ -16,6 +13,7 @@ use crate::ffi::{
   ImageSource, MAX_POSE_JOINTS, MAX_VISION_RESULTS_PER_FRAME, PoseBudget, PoseJoints,
   ffi_nsstring_to_smolstr, finite_f32, guard_vision_ffi, pose_bbox_from_joint_bounds,
   read_pose_joints, run_requests, sanitize_confidence, vision_point_to_normalized,
+  vn_point3d_position,
 };
 use crate::{AnalyzeError, AppleVisionBodyPoserOptions, BoundingBox, PixelPlane};
 
@@ -80,12 +78,32 @@ pub trait BodyPoseDetection: Sized {
 /// `x` / `y` / `z` are model-space **metres**, not normalized
 /// coordinates: no flip, no clamp, no `0.0..=1.0` invariant. Only
 /// finiteness is enforced upstream.
+///
+/// `confidence` is `Option<f32>` because Apple's 3-D point hierarchy
+/// carries none. `VNPoint3D` declares `position`, `VNRecognizedPoint3D`
+/// adds `identifier`, and `VNHumanBodyRecognizedPoint3D` adds
+/// `localPosition` and `parentJoint` — and that is the whole roster.
+/// The 2-D road reaches a confidence through a *different* hierarchy
+/// (`VNPoint` → `VNDetectedPoint`, where `confidence` is declared, →
+/// `VNRecognizedPoint`), which the 3-D family does not descend from.
+/// The engine therefore passes `None` at
+/// `VNDetectHumanBodyPose3DRequestRevision1`, never a substituted
+/// number; the only confidence the 3-D road reports is the
+/// observation's, which arrives per pose on
+/// [`BodyPose3DDetection::try_new`]. A vocabulary that needs an `f32`
+/// makes that collapse itself, where it is visible.
 pub trait BodyPose3DJoint: Sized {
   /// Why a joint was refused.
   type Error;
 
   /// Builds a 3-D joint at a model-space position in metres.
-  fn try_new(name: &str, x: f32, y: f32, z: f32, confidence: f32) -> Result<Self, Self::Error>;
+  fn try_new(
+    name: &str,
+    x: f32,
+    y: f32,
+    z: f32,
+    confidence: Option<f32>,
+  ) -> Result<Self, Self::Error>;
 
   /// Joint name, as constructed.
   fn name(&self) -> &str;
@@ -132,48 +150,6 @@ pub enum HeightEstimation {
   Reference,
   /// Measured from the observation.
   Measured,
-}
-
-#[cfg(target_vendor = "apple")]
-#[repr(C, align(16))]
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct SimdFloat4(pub(crate) [f32; 4]);
-
-#[cfg(target_vendor = "apple")]
-unsafe impl Encode for SimdFloat4 {
-  // `simd_float4` is an `__attribute__((__ext_vector_type__))` type;
-  // Clang intentionally emits NO `@encode` for ext-vector elements, so
-  // the matching Rust-side encoding is [`Encoding::None`] (formats as
-  // empty string), NOT [`Encoding::Unknown`] (formats as `?`).
-  //
-  // objc2-encode's `Encoding::None` docstring explicitly calls this
-  // out as the SIMD-vector case. The previous `Encoding::Unknown`
-  // made the wrapping struct render as `{?=[4?]}`, while Vision's
-  // `-[VNHumanBodyRecognizedPoint3D position]` returns `{?=[4]}`
-  // (Clang refuses to emit an inner element character) — every
-  // msg_send for that selector failed verification on macOS 26.x,
-  // and the surrounding `catch_unwind` silently swallowed the
-  // panic so 3-D pose detections were always dropped to zero.
-  const ENCODING: Encoding = Encoding::None;
-}
-
-#[cfg(target_vendor = "apple")]
-#[repr(C, align(16))]
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct SimdFloat4x4 {
-  columns: [SimdFloat4; 4],
-}
-
-#[cfg(target_vendor = "apple")]
-unsafe impl Encode for SimdFloat4x4 {
-  // Apple's `simd_float4x4` is a struct-of-vectors. Clang reports
-  // `@encode(simd_float4x4)` as `{?=[4]}` — outer struct with no name
-  // wrapping an array of 4 whose element type Clang refuses to encode
-  // (the element is itself an ext-vector, see [`SimdFloat4`] above).
-  // The matching Rust encoding therefore uses `Array(4, &None)` so
-  // the inner array element formats to an empty string, producing the
-  // literal `[4]` Clang emits.
-  const ENCODING: Encoding = Encoding::Struct("?", &[Encoding::Array(4, &Encoding::None)]);
 }
 
 /// Apple Vision human body pose, 2-D and 3-D — one per worker thread.
@@ -291,19 +267,24 @@ impl BodyPoser {
   }
 
   /// The one 3-D detection body both doors reach.
+  ///
+  /// `_options` is unused:
+  /// [`AppleVisionBodyPose3DOptions`](crate::AppleVisionBodyPose3DOptions)
+  /// carries no gate for this crate to read, because the 3-D road
+  /// reports nothing per joint to gate on. The parameter stays on the
+  /// public doors so every entry point keeps one shape and a future 3-D
+  /// knob is additive rather than a signature change.
   fn detect_3d_on<P: BodyPose3DDetection>(
     &self,
     source: ImageSource<'_>,
-    options: &AppleVisionBodyPoserOptions,
+    _options: &AppleVisionBodyPoserOptions,
   ) -> Result<Vec<P>, AnalyzeError> {
     let requests = unsafe { [Retained::cast_unchecked::<VNRequest>(self.pose_3d.clone())] };
     // `extract_3d` self-guards (inner `objc2::exception::catch` under
     // its `catch_unwind`); a call-site guard here would put
     // `catch_unwind` inside the ObjC barrier and could not catch the
     // foreign exception.
-    run_requests(source, &requests, Vec::new(), || {
-      self.extract_3d::<P>(options)
-    })
+    run_requests(source, &requests, Vec::new(), || self.extract_3d::<P>())
   }
 
   /// A pose is emitted whole or not at all: when the call's cumulative
@@ -418,17 +399,21 @@ impl BodyPoser {
   /// A pose is emitted whole or not at all: when the call's cumulative
   /// [`PoseBudget`] cannot cover the pose in hand the extraction stops
   /// there, and no pose is ever truncated to fit what is left.
-  fn extract_3d<P: BodyPose3DDetection>(&self, options: &AppleVisionBodyPoserOptions) -> Vec<P> {
-    // Two nested barriers, innermost FIRST. The `VNHumanBodyRecognizedPoint3D`
-    // `position`/`confidence` msg_sends below have a `simd_float4x4` return
-    // encoding that objc2 rejects: in a DEBUG build objc2's runtime
-    // verification turns that into a *Rust panic* (caught by the outer
-    // `catch_unwind`), but in a RELEASE build verification is compiled out and
-    // the real Objective-C dispatch raises an `NSException` instead. That
-    // foreign exception MUST be caught by the inner `objc2::exception::catch`
-    // (`guard_vision_ffi`) — if it reached the outer `catch_unwind` it would
-    // abort the process (`catch_unwind` cannot catch foreign exceptions). So
-    // the ObjC barrier is innermost; the Rust-panic barrier wraps it.
+  fn extract_3d<P: BodyPose3DDetection>(&self) -> Vec<P> {
+    // Two nested barriers, innermost FIRST, and the order is load-bearing.
+    // Any send below can raise an `NSException`, and Rust's `catch_unwind`
+    // CANNOT catch a foreign exception — one reaching it aborts the process.
+    // So `objc2::exception::catch` (`guard_vision_ffi`) is innermost.
+    //
+    // The outer `catch_unwind` catches the other failure: objc2 verifies every
+    // message send against the runtime's own metadata in DEBUG builds, and a
+    // disagreement is a Rust panic. This path has been bitten by both. It sent
+    // `confidence` to a point that declares no such selector, which panicked
+    // here in debug and raised `doesNotRecognizeSelector:` into the inner
+    // barrier in release; before that, a `simd_float4x4` return encoding objc2
+    // rejected panicked here in debug alone. Verification is compiled out of
+    // release, so only the inner barrier stands there. Both are kept because
+    // each catches what the other cannot.
     catch_unwind(AssertUnwindSafe(|| {
       guard_vision_ffi("body_pose_3d", Vec::new(), || {
         let Some(results) = (unsafe { self.pose_3d.results() }) else {
@@ -470,14 +455,12 @@ impl BodyPoser {
             let Some((x, y, z)) = extract_body_pose_3d_coordinates(&point) else {
               continue;
             };
-            let raw_confidence: f32 = unsafe { objc2::msg_send![&*point, confidence] };
-            let Some(confidence) =
-              sanitize_confidence(raw_confidence, options.pose_3d().min_joint_confidence())
-            else {
-              continue;
-            };
 
-            let Ok(joint) = P::Joint::try_new(&name, x, y, z, confidence) else {
+            // No per-joint confidence exists to read. See
+            // [`BodyPose3DJoint`]: the whole 3-D point hierarchy declares
+            // `position`, `identifier`, `localPosition` and `parentJoint` and
+            // nothing else. `None` is the reading, not a fallback for one.
+            let Ok(joint) = P::Joint::try_new(&name, x, y, z, None) else {
               continue;
             };
             name_bytes = name_bytes.saturating_add(name.len());
@@ -544,19 +527,71 @@ pub(crate) fn sanitize_body_height_pair(
   }
 }
 
+/// How far the bottom row may sit from `(0, 0, 0, 1)` and still be one.
+///
+/// Deliberately loose. This separates "a transform" from "not a
+/// transform", not one transform from another: Apple writes that row as
+/// literals, any float noise it could pick up is orders of magnitude
+/// below this, and a read that missed its return value is orders of
+/// magnitude above — the observed failure put `3e-45` in the corner
+/// where a `1` belongs. An exact comparison would buy nothing and would
+/// refuse a whole pose over one representation bit.
 #[cfg(target_vendor = "apple")]
-fn extract_body_pose_3d_coordinates(
-  point: &VNHumanBodyRecognizedPoint3D,
-) -> Option<(f32, f32, f32)> {
-  let transform: SimdFloat4x4 = unsafe { objc2::msg_send![point, position] };
-  let translation = transform.columns.get(3)?;
-  let x = translation.0[0];
-  let y = translation.0[1];
-  let z = translation.0[2];
+pub(crate) const AFFINE_TOLERANCE: f32 = 1e-3;
+
+/// The translation of a column-major 4x4 affine transform, in the
+/// matrix's own units, or `None` if the sixteen floats are not one.
+///
+/// Split out of [`extract_body_pose_3d_coordinates`] so it can be tested
+/// on matrices this crate chooses rather than only on ones Vision
+/// happens to produce. Vision returns an affine transform for every
+/// joint of every pose it has ever been handed here, so the rejecting
+/// branch is unreachable through the framework — and it is the branch
+/// that stands between a broken read and coordinates that look
+/// plausible. It is tested directly, in `src/tests/body_pose.rs`.
+///
+/// A 4x4 affine transform's bottom row is `(0, 0, 0, 1)` by
+/// construction, so a read that does not satisfy it did not deliver a
+/// transform. That check is not decoration: the ABI defect this was
+/// written to catch produced *finite* coordinates — stale stack bytes
+/// reinterpreted as floats, around `1e26` metres — which every
+/// finiteness test in the crate passed. A wrong answer that looks
+/// plausible is the failure mode worth spending four comparisons on.
+///
+/// NaN fails every comparison here, so a NaN anywhere in the bottom row
+/// rejects the matrix rather than passing through it.
+#[cfg(target_vendor = "apple")]
+pub(crate) fn translation_if_affine(transform: &[f32; 16]) -> Option<(f32, f32, f32)> {
+  // Column-major: element (row, col) is `transform[col * 4 + row]`, so
+  // the bottom row is every fourth element from index 3.
+  let bottom_row_is_affine = transform[3].abs() < AFFINE_TOLERANCE
+    && transform[7].abs() < AFFINE_TOLERANCE
+    && transform[11].abs() < AFFINE_TOLERANCE
+    && (transform[15] - 1.0).abs() < AFFINE_TOLERANCE;
+  if !bottom_row_is_affine {
+    return None;
+  }
+
+  let [x, y, z] = [transform[12], transform[13], transform[14]];
   if !(x.is_finite() && y.is_finite() && z.is_finite()) {
     return None;
   }
   Some((x, y, z))
+}
+
+/// Reads a 3-D joint's model-space translation, in metres.
+///
+/// `-[VNPoint3D position]` returns a column-major `simd_float4x4`, and
+/// [`vn_point3d_position`](crate::ffi::vn_point3d_position) exists
+/// because Rust cannot receive that return type — see its own
+/// documentation for the ABI evidence. The matrix's last column is the
+/// translation, and [`translation_if_affine`] takes it only from a
+/// matrix that is one.
+#[cfg(target_vendor = "apple")]
+fn extract_body_pose_3d_coordinates(
+  point: &VNHumanBodyRecognizedPoint3D,
+) -> Option<(f32, f32, f32)> {
+  translation_if_affine(&unsafe { vn_point3d_position(point) })
 }
 
 #[cfg(target_vendor = "apple")]

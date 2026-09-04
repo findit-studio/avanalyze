@@ -396,55 +396,43 @@ impl AppleVisionAnimalPoseOptions {
   }
 }
 
-#[cfg_attr(not(tarpaulin), inline(always))]
-const fn default_body_pose_3d_min_joint_confidence() -> f32 {
-  0.1
-}
-
+/// The 3-D body-pose section — deliberately empty.
+///
+/// It held a `min_joint_confidence` floor, which gated a reading
+/// Apple's 3-D road does not report: the whole point hierarchy
+/// (`VNPoint3D` → `VNRecognizedPoint3D` →
+/// `VNHumanBodyRecognizedPoint3D`) declares `position`, `identifier`,
+/// `localPosition` and `parentJoint` and no confidence at any level, so
+/// the floor had nothing to compare a joint against. It never compared
+/// one: the send that fetched the missing value raised instead, so
+/// every 3-D joint was dropped in every released version and the gate
+/// ran zero times. Removing it removes no behaviour anyone could have
+/// observed.
+///
+/// The section stays. It is where a 3-D knob would land if Apple ever
+/// bakes one into `VNDetectHumanBodyPose3DRequest`, and it keeps
+/// [`AppleVisionBodyPoserOptions`]'s two-section shape. Like every
+/// options type in this crate it is unknown-field tolerant, so a config
+/// still naming `min_joint_confidence` under `pose_3d` parses and the
+/// key is dropped.
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct AppleVisionBodyPose3DOptions {
-  #[cfg_attr(
-    feature = "serde",
-    serde(default = "default_body_pose_3d_min_joint_confidence")
-  )]
-  min_joint_confidence: f32,
-}
+pub struct AppleVisionBodyPose3DOptions {}
 
 impl AppleVisionBodyPose3DOptions {
-  /// Default [`min_joint_confidence`](Self::min_joint_confidence).
-  pub const DEFAULT_MIN_JOINT_CONFIDENCE: f32 = default_body_pose_3d_min_joint_confidence();
-
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new() -> Self {
-    Self {
-      min_joint_confidence: Self::DEFAULT_MIN_JOINT_CONFIDENCE,
-    }
-  }
-
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn with_min_joint_confidence(mut self, min_joint_confidence: f32) -> Self {
-    self.set_min_joint_confidence(min_joint_confidence);
-    self
-  }
-
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn set_min_joint_confidence(&mut self, min_joint_confidence: f32) -> &mut Self {
-    self.min_joint_confidence = min_joint_confidence;
-    self
-  }
-
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn min_joint_confidence(&self) -> f32 {
-    self.min_joint_confidence
+    Self {}
   }
 }
 
 /// Everything [`BodyPoser`](crate::BodyPoser) reads — one section per
 /// pose dimensionality, because
 /// [`detect_2d`](crate::BodyPoser::detect_2d) and
-/// [`detect_3d`](crate::BodyPoser::detect_3d) run different models
-/// whose joint-confidence floors are not required to move together.
+/// [`detect_3d`](crate::BodyPoser::detect_3d) run different models, and
+/// what each reports per joint is not the same. The 2-D section carries
+/// a joint-confidence floor; the 3-D section carries nothing, because
+/// its model reports nothing per joint.
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct AppleVisionBodyPoserOptions {

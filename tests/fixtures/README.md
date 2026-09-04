@@ -24,12 +24,26 @@ apollo11_crew.jpg
     capture_quality 0.4387 / 0.3569 / 0.5088; all three with a complete five-point reduction,
     every point inside its own face's box.
   (the same image detects 3 faces at every scale tried from 384 px to the 4200 px original)
+  also carries the 3-D body pose. Verified on this host against Objective-C reading the same
+  frame through the same request at Revision1 (1 observation, confidence 1.0, bodyHeight 1.800,
+  heightEstimation Reference, 17 joints, none of them carrying a confidence):
+    human_root_3D       ( 0.000000,  0.000000,  0.000000)   <- model space is rooted at the hip
+    human_left_hip_3D   ( 0.156500,  0.000000,  0.000000)
+    human_right_hip_3D  (-0.156500,  0.000000,  0.000000)
+    human_center_head_3D(-0.050581,  0.631640,  0.174870)
+    human_top_head_3D   (-0.048227,  0.748985,  0.182247)
+    human_left_ankle_3D ( 0.244692, -0.612459, -0.078243)
+  metres, model space. `src/tests/body_pose.rs` asserts the Rust road against these.
 
 airport_keyframe.jpg
   the desktop's exact keyframe-extraction output for 01_airport.mp4 (AreaResampler downscale to
-  288x512 + jpeg-encoder q85) at the first frame whose 3-D body-pose detector raises an
+  288x512 + jpeg-encoder q85) at the first frame whose 3-D body-pose detector raised an
   Objective-C exception. 25930 bytes. Carries no face: it is the zero-face lane for the face
   fusion, and the no-abort regression fixture for every entry point.
+  The raise this frame was chosen for is gone, and was never about the frame: it was
+  `doesNotRecognizeSelector:`, from the crate sending `confidence` to a
+  `VNHumanBodyRecognizedPoint3D`, which has no such selector. The fixture keeps both lanes
+  above, and now yields a 3-D pose of its own.
 
 qr_code.jpg
   content:   AVANALYZE-PIXEL-DOOR

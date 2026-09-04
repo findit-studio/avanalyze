@@ -42,8 +42,8 @@ use crate::{
 /// `tests/fixtures/README.md`.
 const CREW: &[u8] = include_bytes!("../../tests/fixtures/apollo11_crew.jpg");
 
-/// The zero-face keyframe: no face, and the frame whose 3-D body-pose
-/// detector raises.
+/// The zero-face keyframe: no face, and the frame the 3-D body-pose
+/// detector used to raise on.
 const AIRPORT: &[u8] = include_bytes!("../../tests/fixtures/airport_keyframe.jpg");
 
 // ----- a vocabulary just wide enough to read a face back out ----------------
@@ -516,16 +516,20 @@ fn a_padded_plane_is_imaged_over_a_tight_buffer() {
 /// ```text
 ///   classifications 4   human subjects 3   attention 1   objectness 1
 ///   faces 3   landmark sets 3   body poses 3   hand poses 2
-///   instance masks 3   segmentation masks 1
-///   text 0   barcodes 0   animal poses 0   3-D body poses 0
+///   instance masks 3   segmentation masks 1   3-D body poses 1
+///   text 0   barcodes 0   animal poses 0
 /// ```
 ///
-/// The four zeros are honest: the photograph carries no text Vision
-/// reads at this scale, no barcode and no animal — and `detect_3d`
-/// returns nothing on this host through EITHER door, because
-/// `VNRecognizedPoint3D` has no `confidence` selector for
-/// `body_pose.rs` to send. That is a defect on `main`, not of this
-/// door; the barcode gap is closed separately by the QR fixture below.
+/// The three zeros are honest: the photograph carries no text Vision
+/// reads at this scale, no barcode and no animal. The barcode gap is
+/// closed separately by the QR fixture below.
+///
+/// 3-D body poses were a fourth zero when this door landed, for a
+/// defect on `main` rather than of this door. That defect is fixed and
+/// the capability is covered here like any other; what its joints
+/// actually contain is asserted against the framework's own numbers in
+/// `src/tests/body_pose.rs`, because a count alone would not have
+/// caught the second half of it.
 #[test]
 fn every_pixel_door_matches_its_jpeg_twin_on_the_crew_fixture() {
   use mediaschema::domain::aggregates::video as ms;
@@ -666,7 +670,7 @@ fn every_pixel_door_matches_its_jpeg_twin_on_the_crew_fixture() {
       .detect_3d_pixels::<ms::BodyPose3DDetection>(&plane, &options)
       .expect("pixels")
       .len(),
-    false,
+    true,
   );
 
   let options = AppleVisionHandPoseOptions::new();

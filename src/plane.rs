@@ -24,6 +24,12 @@ use crate::{AnalyzeError, AnalyzeErrorKind};
 /// 24-bit RGB — but bounded rather than unbounded, so a hostile or
 /// corrupted input cannot drive the worker into memory pressure through
 /// either door.
+///
+/// It bounds the image handed to Vision, not peak live memory: a door
+/// must own the bytes it hands over, so peak is up to **twice** this —
+/// the caller's own image plus the one copy the framework holds — which
+/// is the same doubling the JPEG door already accounts for against
+/// `MAX_INPUT_IMAGE_BYTES`.
 pub(crate) const MAX_DECODED_IMAGE_BYTES: u64 = 512 * 1024 * 1024;
 
 /// How one pixel of a [`PixelPlane`] is laid out in memory.

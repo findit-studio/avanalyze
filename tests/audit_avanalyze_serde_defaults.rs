@@ -196,18 +196,25 @@ mod serde_default_tests {
       o.pose_2d().min_joint_confidence(),
       AppleVisionBodyPoseOptions::DEFAULT_MIN_JOINT_CONFIDENCE
     );
-    assert_eq!(
-      o.pose_3d().min_joint_confidence(),
-      AppleVisionBodyPose3DOptions::DEFAULT_MIN_JOINT_CONFIDENCE
-    );
     restable(&o);
 
     let o: AppleVisionBodyPoserOptions =
       serde_json::from_str(r#"{"pose_2d": {"min_joint_confidence": 0.6}}"#).expect("partial json");
     assert_eq!(o.pose_2d().min_joint_confidence(), 0.6);
+
+    // The 3-D section lost its `min_joint_confidence` — Apple's 3-D
+    // points carry no confidence for a floor to gate. A config that
+    // still names it parses and the key is dropped, like every other
+    // unknown key on every options type in this crate.
+    let o: AppleVisionBodyPoserOptions = serde_json::from_str(
+      r#"{"pose_2d": {"min_joint_confidence": 0.6}, "pose_3d": {"min_joint_confidence": 0.35}}"#,
+    )
+    .expect("a config still naming the removed 3-D floor parses");
+    assert_eq!(o.pose_2d().min_joint_confidence(), 0.6);
     assert_eq!(
-      o.pose_3d().min_joint_confidence(),
-      AppleVisionBodyPose3DOptions::DEFAULT_MIN_JOINT_CONFIDENCE
+      serde_json::to_value(o.pose_3d()).expect("serialize the 3-D section"),
+      serde_json::json!({}),
+      "the removed floor must not survive the round trip"
     );
   }
 

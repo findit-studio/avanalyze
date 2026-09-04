@@ -136,13 +136,17 @@ pub struct HandPose {
 }
 
 /// A joint of the 3-D body skeleton, in model-space metres.
+///
+/// `confidence` keeps the engine's `Option` rather than collapsing it,
+/// so the roster can assert what Vision actually reports per 3-D joint
+/// — nothing.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Body3Joint {
   pub name: String,
   pub x: f32,
   pub y: f32,
   pub z: f32,
-  pub confidence: f32,
+  pub confidence: Option<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -431,7 +435,13 @@ impl HandPoseDetection for HandPose {
 impl BodyPose3DJoint for Body3Joint {
   type Error = Infallible;
 
-  fn try_new(name: &str, x: f32, y: f32, z: f32, confidence: f32) -> Result<Self, Self::Error> {
+  fn try_new(
+    name: &str,
+    x: f32,
+    y: f32,
+    z: f32,
+    confidence: Option<f32>,
+  ) -> Result<Self, Self::Error> {
     Ok(Self {
       name: name.to_owned(),
       x,

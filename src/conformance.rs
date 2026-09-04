@@ -377,11 +377,18 @@ pub fn assert_hand_pose_accepts<P: HandPoseDetection>() {
   }
 }
 
-/// A 3-D pose, including metre-scale coordinates and the coupled
-/// `(0.0, Unknown)` height fallback.
+/// A 3-D pose, including metre-scale coordinates, the absent per-joint
+/// confidence, and the coupled `(0.0, Unknown)` height fallback.
 pub fn assert_body_pose_3d_accepts<P: BodyPose3DDetection>() {
-  let Ok(joint_3d) = P::Joint::try_new("root", -1.5, 2.5, 0.75, 0.5) else {
-    panic!("BodyPose3DJoint::try_new refused model-space metres — 3-D joints are not normalized");
+  // `None` is what the engine passes for EVERY 3-D joint it emits:
+  // Apple's 3-D point hierarchy declares no confidence. A vocabulary
+  // that refuses it can never receive a 3-D pose at all, so this is
+  // the load-bearing case, asserted first.
+  let Ok(joint_3d) = P::Joint::try_new("root", -1.5, 2.5, 0.75, None) else {
+    panic!(
+      "BodyPose3DJoint::try_new refused an absent confidence — the engine passes None for every \
+       3-D joint, because Apple's 3-D points carry no confidence"
+    );
   };
   assert_eq!(
     joint_3d.name(),
@@ -392,7 +399,17 @@ pub fn assert_body_pose_3d_accepts<P: BodyPose3DDetection>() {
     P::try_new(0.5, 1.75, HeightEstimation::Measured, vec![joint_3d]).is_ok(),
     "BodyPose3DDetection::try_new must accept a measured height in metres"
   );
-  let Ok(joint_3d) = P::Joint::try_new("root", 0.0, 0.0, 0.0, 0.0) else {
+  // A present confidence is still part of the signature, so an
+  // implementor must handle it: the seat exists for a revision that
+  // reports one, and refusing `Some` would break silently on that day.
+  let Ok(joint_3d) = P::Joint::try_new("root", -1.5, 2.5, 0.75, Some(0.5)) else {
+    panic!("BodyPose3DJoint::try_new refused model-space metres — 3-D joints are not normalized");
+  };
+  assert!(
+    P::try_new(0.5, 1.75, HeightEstimation::Measured, vec![joint_3d]).is_ok(),
+    "BodyPose3DDetection::try_new must accept a joint carrying a confidence"
+  );
+  let Ok(joint_3d) = P::Joint::try_new("root", 0.0, 0.0, 0.0, None) else {
     panic!("BodyPose3DJoint::try_new refused a zeroed joint");
   };
   assert!(
