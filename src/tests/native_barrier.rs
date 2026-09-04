@@ -80,7 +80,7 @@ pub(super) unsafe fn synthetic_throw(kind: SyntheticThrow) {
   // SAFETY: the callee reads only the discriminant, which is a valid
   // one by construction, and either returns or throws. The caller
   // upholds the barrier requirement above.
-  unsafe { avanalyze_0_5_test_throw(kind as i32) }
+  unsafe { avanalyze_0_6_test_throw(kind as i32) }
 }
 
 // The test archive `build.rs` compiles with no cargo link directive:
@@ -91,22 +91,22 @@ pub(super) unsafe fn synthetic_throw(kind: SyntheticThrow) {
 // `C-unwind`, not `C`: throwing is the point. A `C` declaration would
 // mark the frame `nounwind` and turn each of these into an abort before
 // the barrier next door ever saw it.
-#[link(name = "avanalyze_0_5_objc_cxx_barrier_test", kind = "static")]
+#[link(name = "avanalyze_0_6_objc_cxx_barrier_test", kind = "static")]
 unsafe extern "C-unwind" {
   /// `src/objc_cxx_barrier_test.mm` — four throws and a return.
-  fn avanalyze_0_5_test_throw(kind: i32);
+  fn avanalyze_0_6_test_throw(kind: i32);
 }
 
 // The pool observers, in the same archive. `C`, not `C-unwind`: one
 // allocates and autoreleases and the other reads a counter, and neither
 // can raise.
-#[link(name = "avanalyze_0_5_objc_cxx_barrier_test", kind = "static")]
+#[link(name = "avanalyze_0_6_objc_cxx_barrier_test", kind = "static")]
 unsafe extern "C" {
   /// Autoreleases one sentinel into the innermost pool — inside a
   /// guarded closure, that is the barrier's own.
-  fn avanalyze_0_5_test_autorelease_sentinel();
+  fn avanalyze_0_6_test_autorelease_sentinel();
   /// How many sentinels this process has deallocated.
-  fn avanalyze_0_5_test_sentinel_deallocations() -> i32;
+  fn avanalyze_0_6_test_sentinel_deallocations() -> i32;
 }
 
 /// The floor: a guarded call that does not throw returns its value, and
@@ -358,20 +358,20 @@ static POOL_OBSERVATION: Mutex<()> = Mutex::new(());
 fn the_pool_pops_when_a_panic_passes_through_uncaught() {
   let _observation = POOL_OBSERVATION.lock().unwrap_or_else(|e| e.into_inner());
   // SAFETY: a counter read; cannot raise.
-  let before = unsafe { avanalyze_0_5_test_sentinel_deallocations() };
+  let before = unsafe { avanalyze_0_6_test_sentinel_deallocations() };
 
   let outcome = catch_unwind(AssertUnwindSafe(|| {
     guard_native("test_site", || {
       // SAFETY: allocates and autoreleases into the barrier's pool;
       // cannot raise.
-      unsafe { avanalyze_0_5_test_autorelease_sentinel() };
+      unsafe { avanalyze_0_6_test_autorelease_sentinel() };
       panic!("a synthetic Rust panic");
     })
   }));
   outcome.expect_err("the barrier must not swallow a Rust panic");
 
   // SAFETY: as above.
-  let after = unsafe { avanalyze_0_5_test_sentinel_deallocations() };
+  let after = unsafe { avanalyze_0_6_test_sentinel_deallocations() };
   assert_eq!(
     after,
     before + 1,
@@ -387,18 +387,18 @@ fn the_pool_pops_when_a_panic_passes_through_uncaught() {
 fn the_pool_pops_when_an_exception_is_caught() {
   let _observation = POOL_OBSERVATION.lock().unwrap_or_else(|e| e.into_inner());
   // SAFETY: a counter read; cannot raise.
-  let before = unsafe { avanalyze_0_5_test_sentinel_deallocations() };
+  let before = unsafe { avanalyze_0_6_test_sentinel_deallocations() };
 
   guard_native("test_site", || {
     // SAFETY: allocates and autoreleases into the barrier's pool.
-    unsafe { avanalyze_0_5_test_autorelease_sentinel() };
+    unsafe { avanalyze_0_6_test_autorelease_sentinel() };
     // SAFETY: inside the barrier.
     unsafe { synthetic_throw(SyntheticThrow::StdException) };
   })
   .expect_err("a C++ throw must be refused, not returned");
 
   // SAFETY: as above.
-  let after = unsafe { avanalyze_0_5_test_sentinel_deallocations() };
+  let after = unsafe { avanalyze_0_6_test_sentinel_deallocations() };
   assert_eq!(
     after,
     before + 1,

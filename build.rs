@@ -40,7 +40,7 @@ fn use_feature(feature: &str) {
 /// archives below and the `links` key in `Cargo.toml` are all scoped by
 /// this tag — the reasoning is on `src/objc_simd_shim.m`.
 /// [`assert_shim_abi_tag_matches_package_version`] keeps it honest.
-const SHIM_ABI_TAG: &str = "0_5";
+const SHIM_ABI_TAG: &str = "0_6";
 
 /// Fails the build when [`SHIM_ABI_TAG`] and the package version drift.
 ///
@@ -65,15 +65,25 @@ fn assert_shim_abi_tag_matches_package_version() {
 /// Fails the build when any hand-written copy of the tag disagrees with
 /// [`SHIM_ABI_TAG`].
 ///
-/// The archive name is derived from the constant, so it cannot drift.
-/// Every other site spells the tag out — a C function name, an
-/// Objective-C class name, two Rust `extern` declarations, the `links`
-/// key, and the test archive's `#[link]` attribute — because neither C
-/// nor Rust can build a linkage name out of a value at compile time
-/// (`#[link_name]` takes a literal, and no macro is allowed there). A
-/// bump that updated the constant and missed one of those would still
-/// build and still pass the ABI test, while two coexisting versions
-/// bound both wrappers to whichever old-named member resolved first.
+/// The four archive names are built from the constant, so they cannot
+/// drift. Every other site spells the tag out — the functions the two
+/// native halves export, the `@interface` and `@implementation` lines of
+/// the classes beside them, the callback typedef, the Rust `extern`
+/// declarations facing all of those, the `links` key and the two test
+/// archives' `#[link]` attributes — because neither C nor Rust can build
+/// a linkage name out of a value at compile time (`#[link_name]` takes a
+/// literal, and no macro is allowed there).
+///
+/// The roster below is complete rather than representative, and it names
+/// BOTH sides of every pair. One side moving alone is already loud — a
+/// Rust `extern` that no longer matches its definition is a link error,
+/// an `@implementation` without its `@interface` is a compile error —
+/// but that is no help against the failure this guard exists for, where
+/// a bump misses both halves of a name at once. That still builds, still
+/// links and still passes the ABI test, while two coexisting versions
+/// bind both wrappers to whichever old-named member resolved first. A
+/// name this list does not carry is a name the next stamp can leave
+/// behind.
 ///
 /// So the constant is the source of truth and this reads the copies back
 /// out of the files. Each site is `rerun-if-changed`, so editing one
@@ -81,7 +91,7 @@ fn assert_shim_abi_tag_matches_package_version() {
 fn assert_versioned_names_are_consistent() {
   let tag = SHIM_ABI_TAG;
   // (file, the exact text that must appear, required-to-exist)
-  let sites: [(&str, String, bool); 14] = [
+  let sites: [(&str, String, bool); 22] = [
     (
       "Cargo.toml",
       format!("links = \"avanalyze_{tag}_objc_simd_shim\""),
@@ -95,6 +105,11 @@ fn assert_versioned_names_are_consistent() {
     (
       "src/objc_simd_shim_test.m",
       format!("id avanalyze_{tag}_test_point3d_new("),
+      true,
+    ),
+    (
+      "src/objc_simd_shim_test.m",
+      format!("@interface Avanalyze_{tag}_TestPoint3D"),
       true,
     ),
     (
@@ -125,7 +140,17 @@ fn assert_versioned_names_are_consistent() {
     ),
     (
       "src/objc_cxx_barrier_test.mm",
+      format!("@interface Avanalyze_{tag}_TestUndescribableException"),
+      true,
+    ),
+    (
+      "src/objc_cxx_barrier_test.mm",
       format!("@implementation Avanalyze_{tag}_TestUndescribableException"),
+      true,
+    ),
+    (
+      "src/objc_cxx_barrier_test.mm",
+      format!("@interface Avanalyze_{tag}_TestSentinel"),
       true,
     ),
     (
@@ -138,6 +163,11 @@ fn assert_versioned_names_are_consistent() {
       format!("void avanalyze_{tag}_test_autorelease_sentinel("),
       true,
     ),
+    (
+      "src/objc_cxx_barrier_test.mm",
+      format!("int32_t avanalyze_{tag}_test_sentinel_deallocations("),
+      true,
+    ),
     // Test sources need not survive packaging, so a missing file here is
     // not a defect — a stale name in a present one still is.
     (
@@ -146,8 +176,28 @@ fn assert_versioned_names_are_consistent() {
       false,
     ),
     (
+      "src/tests/ffi.rs",
+      format!("fn avanalyze_{tag}_test_point3d_new("),
+      false,
+    ),
+    (
       "src/tests/native_barrier.rs",
       format!("#[link(name = \"avanalyze_{tag}_objc_cxx_barrier_test\", kind = \"static\")]"),
+      false,
+    ),
+    (
+      "src/tests/native_barrier.rs",
+      format!("fn avanalyze_{tag}_test_throw("),
+      false,
+    ),
+    (
+      "src/tests/native_barrier.rs",
+      format!("fn avanalyze_{tag}_test_autorelease_sentinel("),
+      false,
+    ),
+    (
+      "src/tests/native_barrier.rs",
+      format!("fn avanalyze_{tag}_test_sentinel_deallocations("),
       false,
     ),
   ];
@@ -299,13 +349,14 @@ fn objc_build() -> cc::Build {
 
 /// The compiler settings both Objective-C++ files are built with.
 ///
-/// `cpp(true)` is what puts libc++ on the link line — a translation
-/// unit that catches `std::exception` and asks
-/// `abi::__cxa_current_exception_type()` for the type in flight needs
-/// the C++ runtime present, and nothing else in this crate's graph
-/// brings it. `-xobjective-c++` is spelled out rather than left to the
-/// `.mm` extension so the language cannot depend on how `cc` decided to
-/// invoke the driver.
+/// `cpp(true)` is what puts libc++ on the link line, which a typed
+/// clause list needs at every step: `catch (const std::exception &)`
+/// binds that class's typeinfo and calls its virtual `what()`, and the
+/// `try` around it binds the C++ personality routine and the `__cxa_*`
+/// entry points the unwinder reaches it through. Nothing else in this
+/// crate's graph brings that runtime. `-xobjective-c++` is spelled out
+/// rather than left to the `.mm` extension so the language cannot depend
+/// on how `cc` decided to invoke the driver.
 ///
 /// Exception support is not optional here in the way it is elsewhere:
 /// this is the frame the whole barrier is. Without `-fexceptions` there

@@ -68,7 +68,7 @@
  * The exception is caught on the Rust side, by the
  * `objc2::exception::catch` every 3-D extraction already runs inside.
  */
-void avanalyze_0_5_vn_point3d_position(id receiver, float *out) {
+void avanalyze_0_6_vn_point3d_position(id receiver, float *out) {
   simd_float4x4 matrix = [(id<AvanalyzePoint3D>)receiver position];
   memcpy(out, &matrix, sizeof matrix);
 }

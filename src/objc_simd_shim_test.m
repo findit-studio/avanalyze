@@ -47,11 +47,11 @@
  * that reads a translation out of them is pure Rust and is tested
  * directly, on synthetic matrices, in `src/tests/body_pose.rs`.
  */
-@interface Avanalyze_0_5_TestPoint3D : NSObject
+@interface Avanalyze_0_6_TestPoint3D : NSObject
 - (simd_float4x4)position;
 @end
 
-@implementation Avanalyze_0_5_TestPoint3D
+@implementation Avanalyze_0_6_TestPoint3D
 - (simd_float4x4)position {
   simd_float4x4 matrix;
   for (int col = 0; col < 4; col++) {
@@ -74,6 +74,6 @@
  * and two versions of avanalyze in one graph must not define the same
  * one.
  */
-id avanalyze_0_5_test_point3d_new(void) {
-  return [[Avanalyze_0_5_TestPoint3D alloc] init];
+id avanalyze_0_6_test_point3d_new(void) {
+  return [[Avanalyze_0_6_TestPoint3D alloc] init];
 }

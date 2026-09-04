@@ -1265,14 +1265,14 @@ fn guard_vision_ffi_catches_objc_exception_and_returns_fallback() {
 //
 // `C`, not `C-unwind`: this one allocates and initialises, and neither
 // can raise. The send that can is the shim's, next door.
-#[link(name = "avanalyze_0_5_objc_simd_shim_test", kind = "static")]
+#[link(name = "avanalyze_0_6_objc_simd_shim_test", kind = "static")]
 unsafe extern "C" {
   /// `src/objc_simd_shim_test.m` — a class that answers `position` with
   /// a matrix fixed in its own source, at +1 for the caller to own.
   ///
-  /// The `0_5` matches the shim's own version scope; see the extern
+  /// The `0_6` matches the shim's own version scope; see the extern
   /// block in `src/ffi.rs` for why the names carry one at all.
-  fn avanalyze_0_5_test_point3d_new() -> *mut AnyObject;
+  fn avanalyze_0_6_test_point3d_new() -> *mut AnyObject;
 }
 
 /// The shim's ABI, proved against a matrix this crate wrote down.
@@ -1305,7 +1305,7 @@ unsafe extern "C" {
 /// own synthetic matrices.
 #[test]
 fn the_simd_shim_reads_a_known_matrix_exactly() {
-  let point = unsafe { Retained::from_raw(avanalyze_0_5_test_point3d_new()) }
+  let point = unsafe { Retained::from_raw(avanalyze_0_6_test_point3d_new()) }
     .expect("the test object's initializer must not return nil");
 
   let got = unsafe { vn_point3d_position(&*point) };

@@ -649,7 +649,7 @@ pub(crate) fn validate_raw_slice_elems<T>(elem_count: usize, max_elems: usize) -
 /// which NUL-terminates regardless.
 const GUARD_MESSAGE_CAPACITY: usize = 512;
 
-/// What [`avanalyze_0_5_guard`] reports about the call it ran.
+/// What [`avanalyze_0_6_guard`] reports about the call it ran.
 ///
 /// The numbers are the trampoline's, spelled out in
 /// `src/objc_cxx_barrier.mm`; this is where they are given meaning. A
@@ -807,7 +807,7 @@ pub(crate) fn guard_native<R, F: FnOnce() -> R>(
   // length passed, which is its own. The call may return through a
   // rethrown Rust panic, which is why the declaration is `C-unwind`.
   let status = unsafe {
-    avanalyze_0_5_guard(
+    avanalyze_0_6_guard(
       run::<F, R>,
       core::ptr::from_mut(&mut call).cast(),
       message.as_mut_ptr().cast(),
@@ -871,9 +871,9 @@ unsafe extern "C-unwind" {
   /// `src/objc_cxx_barrier.mm` — one `try`, three outcomes, and
   /// everything it cannot name left to keep unwinding.
   ///
-  /// The `0_5` is the crate's major.minor, for the reason the simd
+  /// The `0_6` is the crate's major.minor, for the reason the simd
   /// shim's declaration below spells out.
-  fn avanalyze_0_5_guard(
+  fn avanalyze_0_6_guard(
     body: unsafe extern "C-unwind" fn(*mut c_void),
     context: *mut c_void,
     message: *mut c_char,
@@ -974,11 +974,11 @@ pub(crate) fn guard_vision_ffi<R>(detector: &'static str, fallback: R, f: impl F
 unsafe extern "C-unwind" {
   /// `src/objc_simd_shim.m` — one message send, emitted by Clang.
   ///
-  /// The `0_5` is the crate's major.minor, not decoration: C has no
+  /// The `0_6` is the crate's major.minor, not decoration: C has no
   /// namespaces, so an unversioned name would collide with a second
   /// avanalyze in the same graph. `build.rs` scopes the archive and
   /// fails the build if the tag stops matching the package version.
-  fn avanalyze_0_5_vn_point3d_position(receiver: *mut objc2::runtime::AnyObject, out: *mut f32);
+  fn avanalyze_0_6_vn_point3d_position(receiver: *mut objc2::runtime::AnyObject, out: *mut f32);
 }
 
 /// Reads `-[VNPoint3D position]` off `receiver`, as 16 floats in
@@ -1049,7 +1049,7 @@ pub(crate) unsafe fn vn_point3d_position<T: Message>(receiver: &T) -> [f32; 16] 
   // which is the length of `matrix`. The receiver is borrowed for the
   // call, so it outlives it; the caller upholds the receiver contract.
   unsafe {
-    avanalyze_0_5_vn_point3d_position(
+    avanalyze_0_6_vn_point3d_position(
       core::ptr::from_ref(receiver).cast_mut().cast(),
       matrix.as_mut_ptr(),
     );

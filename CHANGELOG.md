@@ -1,9 +1,14 @@
 # Changelog
 
-## Unreleased
+## 0.6.0 — 2026-09-04
 
-The engine grows a second door: pixels a caller has already decoded, in place
-of encoded JPEG bytes. Nothing about the first door changes.
+Three arrivals. The engine grows a second door — pixels a caller has already
+decoded, in place of encoded JPEG bytes — and nothing about the first door
+changes. `detect_3d`, which produced nothing in every released version,
+produces poses. And nothing Apple raises kills the process any more: an
+exception out of Vision, CoreML or the Neural Engine layers beneath them
+refuses the call it came from instead of aborting the worker, which is why
+every entry point's constructor is now a `Result`.
 
 ### Added
 
@@ -99,6 +104,32 @@ of encoded JPEG bytes. Nothing about the first door changes.
 
 ### Breaking
 
+- **The nine entry-point constructors return `Result<Self, AnalyzeError>`.**
+  `VisionAnalyzer::new`, `TextRecognizer::new`, `BarcodeDetector::new`,
+  `FaceDetector::new`, `FaceLandmarker::new`, `BodyPoser::new`,
+  `HandPoser::new`, `AnimalPoser::new` and `PersonMasker::new` each returned
+  `Self`; every one now returns a `Result`, so every construction site gains a
+  `?`.
+
+  Constructing an entry point builds its Vision requests, and building a Vision
+  request loads a model — which is exactly where Apple's stack raises instead
+  of returning. An infallible constructor had nowhere to put that, and this is
+  not hypothetical; see *Fixed*.
+
+- **`AnalyzeErrorKind` gains `Environment`, and the enum is not
+  `#[non_exhaustive]`.** A downstream `match` naming `RequestFailed` and
+  `Unsupported` and nothing else stops compiling until it names the third, and
+  a `serde` round-trip gains a third string. The enum stays exhaustive on
+  purpose — its own documentation calls the failure surface "deliberately
+  tiny" — so a new kind is a break the consumer sees rather than a case a
+  wildcard swallows.
+
+  The variant is what the barrier returns: Apple's native stack raised, this
+  crate caught it, and the message carries the exception's own name and reason.
+  It is per-call rather than `Unsupported` because it is a host refusing one
+  model, not a platform lacking Vision — a sibling entry point whose model does
+  load is unaffected.
+
 - **`BodyPose3DJoint::try_new` takes `Option<f32>` for `confidence`, and the
   engine always passes `None`.** Apple's 3-D point hierarchy declares no
   confidence at any level: `VNPoint3D` has `position`, `VNRecognizedPoint3D`
@@ -123,6 +154,41 @@ of encoded JPEG bytes. Nothing about the first door changes.
   parses and drops it.
 
 ### Fixed
+
+- **An exception out of Apple's stack killed the process instead of failing the
+  call.** Rust's `catch_unwind` aborts the moment a FOREIGN exception reaches
+  it — `fatal runtime error: Rust cannot catch foreign exceptions` — and
+  Apple's frameworks raise foreign exceptions. Every such raise therefore took
+  the whole worker down at whichever `catch_unwind` it met first, the test
+  harness's included. A daemon that indexes media has to refuse one frame, not
+  die.
+
+  Measured, not supposed: on a host whose Neural Engine is denied — a sandbox
+  that refuses the ANE device, a policy that withholds it —
+  `VNDetectHumanBodyPose3DRequest`'s own initialiser raises
+  `EspressoPlanFailure` out of the model load, before any image exists to
+  blame. That is the shape `src/tests/ane_denied.rs` keeps.
+
+  Every path that can enter CoreML now runs inside a barrier: the nine
+  constructors, the image preparation, each `performRequests`, each extraction.
+  What the barrier catches becomes `AnalyzeErrorKind::Environment`; what it
+  cannot name keeps unwinding. `objc2::exception::catch` alone was not enough —
+  it is `@catch (id)`, which matches Objective-C objects and deliberately lets
+  a C++ exception through, and Vision sits on CoreML, CoreML on Espresso and
+  ANECF, which are C++ libraries.
+
+  A Rust panic raised inside a guarded call is *not* caught, and is not meant
+  to be: none of the barrier's clauses names it, so it passes through the frame
+  and is caught by the runtime that raised it. A consumer whose vocabulary
+  constructor panics still gets their panic.
+
+  One precondition, stated because no barrier of this shape could avoid it: it
+  needs `panic = "unwind"`, the default. The raise has to cross one Rust frame —
+  the callback — to reach the `try`, and `panic = "abort"` puts an
+  abort-on-unwind shim on exactly that boundary. `objc2::exception::catch`,
+  used in this crate since long before the barrier existed and built on the
+  same geometry, documents the identical limitation. Under `panic = "abort"` a
+  consumer gets what they had before: nothing is newly broken.
 
 - **`BodyPoser::detect_3d` produced nothing, through either door, in every
   released version — and the road under it was broken twice.**
@@ -187,6 +253,40 @@ of encoded JPEG bytes. Nothing about the first door changes.
 
 ### Internal
 
+- **A second native half: `src/objc_cxx_barrier.mm`, Objective-C++, with its
+  synthetic-throw twin beside it.** Catching both worlds takes one `try` that
+  can name both — `catch (NSException *)` needs the Objective-C half of the
+  compiler and `catch (const std::exception &)` the C++ half, and the two are
+  one mechanism only inside a translation unit that speaks both. It exports one
+  function: run a callback, report what came out as a status code plus a
+  message. Rust calls it through `extern "C-unwind"`.
+
+  Every clause is a NAMED type and there is deliberately no `catch (...)`. A
+  Rust panic is foreign to C++ exactly as an `NSException` is foreign to Rust,
+  so `catch (...)` would match one, and no inspection inside the handler makes
+  that safe: `__cxa_begin_catch` runs before any check the handler could make,
+  and the Rust Reference gives no guarantees about a foreign runtime disposing
+  of a panic payload. `src/tests/native_barrier.rs` pins that residual with a
+  child process, so re-adding a `catch (...)` fails a test rather than passing
+  one.
+
+  The autorelease pool is an RAII guard rather than an `@autoreleasepool`
+  block, because a C++ destructor is emitted as a normal AND an EH cleanup
+  while the language construct's pop is not run on the pass-through path.
+  Measured on arm64 and x86_64: a sentinel autoreleased under the guard is
+  deallocated on all three paths — normal return, matched catch, pass-through —
+  and under the block on only the first two. Without it, a refusal a caller
+  retries would strand a pool boundary and everything autoreleased after it,
+  once per attempt. The pop is a cleanup and never a catch, which is what keeps
+  a Rust panic's crossing supported rather than merely observed.
+
+- **The translation unit that needs `Foundation` names it.**
+  `catch (NSException *)` binds `_OBJC_EHTYPE_$_NSException`, which lives in
+  Foundation. It arrives through a dependency's own link directive today, but a
+  barrier that silently stops catching Objective-C exceptions if that directive
+  ever moves is not a barrier. A duplicate `-framework` on the link line is
+  free.
+
 - **`cc` joins the build dependencies, for Apple targets only.** It compiles
   the one Objective-C function above, without ARC — nothing there is retained,
   released or stored. Every other target builds the crate's stubs and needs no
@@ -208,8 +308,8 @@ of encoded JPEG bytes. Nothing about the first door changes.
   two definitions of one symbol into one process, and the linker would bind
   both Rust wrappers to whichever archive member it reached first — a
   calling-convention mismatch rather than a link error on the day the two shims
-  differ. So the exported function is `avanalyze_0_5_vn_point3d_position`, the
-  static archive is `avanalyze_0_5_objc_simd_shim`, and `links` names the same
+  differ. So the exported function is `avanalyze_0_6_vn_point3d_position`, the
+  static archive is `avanalyze_0_6_objc_simd_shim`, and `links` names the same
   string, which is how `objc2-exception-helper` — already in this crate's graph
   — scopes `objc2_exception_helper_0_1`. Neither C nor Rust can build a linkage
   name out of a value at compile time, so the remaining sites spell the tag out;
@@ -217,6 +317,15 @@ of encoded JPEG bytes. Nothing about the first door changes.
   and reads every hand-written copy back out of the files, so a bump that
   updated some of them and not the rest is a build error rather than a silent
   re-collision.
+
+  The barrier joined that discipline when it arrived — `avanalyze_0_6_guard`
+  and `Avanalyze_0_6_GuardBody` beside the shim's names, four archives in all —
+  and the guard's roster is now twenty-two sites. It names BOTH sides of every
+  pair: the C definition and the Rust `extern`, the `@interface` and the
+  `@implementation`. One side moving alone is already loud, a link error or a
+  compile error; it is a bump that misses both halves of a name that builds,
+  links, passes the ABI test, and ships the previous version's symbol under the
+  new one.
 
 - **The deterministic test object is compiled into an archive of its own, which
   nothing links.** It would have been natural to put it beside the shim as a
