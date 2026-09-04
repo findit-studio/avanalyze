@@ -61,7 +61,7 @@
 //! `OBJC_DEBUG_MISSING_POOLS=YES`, where Apple reports every object
 //! autoreleased outside a pool as "just leaking". The absence of that
 //! phrase is the assertion: it is what says the pool inside
-//! `avanalyze_0_5_guard` really spans the failure.
+//! `avanalyze_0_6_guard` really spans the failure.
 
 use std::{
   env,
@@ -201,7 +201,7 @@ fn a_denied_neural_engine_is_refused_and_the_process_lives() {
   assert!(
     !stderr.contains(NO_POOL_DIAGNOSTIC),
     "the child stranded objects outside an autorelease pool across {ATTEMPTS} refusals, so a \
-     caller that retries accumulates them — the pool in avanalyze_0_5_guard is not spanning the \
+     caller that retries accumulates them — the pool in avanalyze_0_6_guard is not spanning the \
      failure.\n--- child stderr ---\n{stderr}"
   );
 

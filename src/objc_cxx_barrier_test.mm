@@ -65,10 +65,10 @@ enum {
  * symbol and two avanalyze versions in one graph must not define the
  * same one.
  */
-@interface Avanalyze_0_5_TestUndescribableException : NSException
+@interface Avanalyze_0_6_TestUndescribableException : NSException
 @end
 
-@implementation Avanalyze_0_5_TestUndescribableException
+@implementation Avanalyze_0_6_TestUndescribableException
 - (NSString *)reason {
   throw std::runtime_error("a synthetic throw from -reason");
 }
@@ -90,12 +90,12 @@ enum {
  * skips the pop; a C++ destructor does not. This class is how that
  * difference is asserted rather than described.
  */
-@interface Avanalyze_0_5_TestSentinel : NSObject
+@interface Avanalyze_0_6_TestSentinel : NSObject
 @end
 
 static int32_t g_avanalyze_test_sentinel_deallocations = 0;
 
-@implementation Avanalyze_0_5_TestSentinel
+@implementation Avanalyze_0_6_TestSentinel
 - (void)dealloc {
   g_avanalyze_test_sentinel_deallocations++;
   [super dealloc];
@@ -110,8 +110,8 @@ extern "C" {
  * Called from inside a guarded closure, that is the barrier's own pool.
  * Compiled without ARC, so the `autorelease` is written out.
  */
-void avanalyze_0_5_test_autorelease_sentinel(void) {
-  [[[Avanalyze_0_5_TestSentinel alloc] init] autorelease];
+void avanalyze_0_6_test_autorelease_sentinel(void) {
+  [[[Avanalyze_0_6_TestSentinel alloc] init] autorelease];
 }
 
 /*
@@ -121,7 +121,7 @@ void avanalyze_0_5_test_autorelease_sentinel(void) {
  * pool popped. Not atomic, and not required to be: every caller is a
  * single-threaded test.
  */
-int32_t avanalyze_0_5_test_sentinel_deallocations(void) {
+int32_t avanalyze_0_6_test_sentinel_deallocations(void) {
   return g_avanalyze_test_sentinel_deallocations;
 }
 
@@ -133,7 +133,7 @@ int32_t avanalyze_0_5_test_sentinel_deallocations(void) {
  * cannot name, and it is what the residual test uses to prove no
  * `catch (...)` has come back.
  */
-void avanalyze_0_5_test_throw(int32_t kind) {
+void avanalyze_0_6_test_throw(int32_t kind) {
   switch (kind) {
     case AVANALYZE_TEST_THROW_NSEXCEPTION:
       [NSException raise:@"AvanalyzeSyntheticException"
@@ -144,7 +144,7 @@ void avanalyze_0_5_test_throw(int32_t kind) {
     case AVANALYZE_TEST_THROW_INT:
       throw 42;
     case AVANALYZE_TEST_THROW_UNDESCRIBABLE_NSEXCEPTION:
-      @throw [Avanalyze_0_5_TestUndescribableException
+      @throw [Avanalyze_0_6_TestUndescribableException
           exceptionWithName:@"AvanalyzeUndescribableException"
                      reason:nil
                    userInfo:nil];
