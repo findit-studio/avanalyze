@@ -351,7 +351,8 @@ fn the_alpha_byte_is_never_read() {
 #[test]
 fn the_face_detector_finds_the_same_faces_through_both_doors() {
   let options = AppleVisionFaceOptions::new();
-  let detector = FaceDetector::new(&options);
+  let detector =
+    FaceDetector::new(&options).expect("FaceDetector::new builds its Vision requests on this host");
 
   let mut through_jpeg = detector
     .detect::<Face>(CREW, &options)
@@ -409,7 +410,8 @@ fn the_face_detector_finds_the_same_faces_through_both_doors() {
 #[test]
 fn the_analyzer_batch_survives_the_pixel_door() {
   let options = AnalyzeOptions::new();
-  let analyzer = VisionAnalyzer::new(&options);
+  let analyzer = VisionAnalyzer::new(&options)
+    .expect("VisionAnalyzer::new builds its Vision requests on this host");
 
   let (width, height, rgba) = decode_rgba(AIRPORT);
   let (packed, _) = repack(&rgba, PixelFormat::Rgb8);
@@ -433,7 +435,8 @@ fn the_analyzer_batch_survives_the_pixel_door() {
 #[test]
 fn a_gray8_plane_is_a_real_image() {
   let options = AppleVisionFaceOptions::new();
-  let detector = FaceDetector::new(&options);
+  let detector =
+    FaceDetector::new(&options).expect("FaceDetector::new builds its Vision requests on this host");
   let (width, height, rgba) = decode_rgba(CREW);
   let (packed, _) = repack(&rgba, PixelFormat::Gray8);
   let plane = PixelPlane::packed(&packed, width, height, PixelFormat::Gray8).expect("plane");
@@ -538,7 +541,8 @@ fn every_pixel_door_matches_its_jpeg_twin_on_the_crew_fixture() {
   let plane = PixelPlane::packed(&packed, width, height, PixelFormat::Rgb8).expect("plane");
 
   let options = AnalyzeOptions::new();
-  let analyzer = VisionAnalyzer::new(&options);
+  let analyzer = VisionAnalyzer::new(&options)
+    .expect("VisionAnalyzer::new builds its Vision requests on this host");
   let jpeg = analyzer
     .analyze_keyframe::<MediaSchema>(CREW, &options)
     .expect("jpeg door");
@@ -587,7 +591,8 @@ fn every_pixel_door_matches_its_jpeg_twin_on_the_crew_fixture() {
   }
 
   let options = AppleVisionTextOptions::new();
-  let recognizer = TextRecognizer::new(&options);
+  let recognizer = TextRecognizer::new(&options)
+    .expect("TextRecognizer::new builds its Vision requests on this host");
   agree(
     "text",
     recognizer
@@ -602,7 +607,8 @@ fn every_pixel_door_matches_its_jpeg_twin_on_the_crew_fixture() {
   );
 
   let options = AppleVisionBarcodeOptions::new();
-  let detector = BarcodeDetector::new(&options);
+  let detector = BarcodeDetector::new(&options)
+    .expect("BarcodeDetector::new builds its Vision requests on this host");
   agree(
     "barcodes",
     detector
@@ -617,7 +623,8 @@ fn every_pixel_door_matches_its_jpeg_twin_on_the_crew_fixture() {
   );
 
   let options = AppleVisionFaceOptions::new();
-  let detector = FaceDetector::new(&options);
+  let detector =
+    FaceDetector::new(&options).expect("FaceDetector::new builds its Vision requests on this host");
   agree(
     "faces",
     detector
@@ -632,7 +639,8 @@ fn every_pixel_door_matches_its_jpeg_twin_on_the_crew_fixture() {
   );
 
   let options = AppleVisionFaceLandmarkOptions::new();
-  let landmarker = FaceLandmarker::new(&options);
+  let landmarker = FaceLandmarker::new(&options)
+    .expect("FaceLandmarker::new builds its Vision requests on this host");
   agree(
     "landmark sets",
     landmarker
@@ -647,7 +655,8 @@ fn every_pixel_door_matches_its_jpeg_twin_on_the_crew_fixture() {
   );
 
   let options = AppleVisionBodyPoserOptions::new();
-  let poser = BodyPoser::new(&options);
+  let poser =
+    BodyPoser::new(&options).expect("BodyPoser::new builds its Vision requests on this host");
   agree(
     "2-D body poses",
     poser
@@ -674,7 +683,8 @@ fn every_pixel_door_matches_its_jpeg_twin_on_the_crew_fixture() {
   );
 
   let options = AppleVisionHandPoseOptions::new();
-  let hands = HandPoser::new(&options);
+  let hands =
+    HandPoser::new(&options).expect("HandPoser::new builds its Vision requests on this host");
   agree(
     "hand poses",
     hands
@@ -689,7 +699,8 @@ fn every_pixel_door_matches_its_jpeg_twin_on_the_crew_fixture() {
   );
 
   let options = AppleVisionAnimalPoseOptions::new();
-  let animals = AnimalPoser::new(&options);
+  let animals =
+    AnimalPoser::new(&options).expect("AnimalPoser::new builds its Vision requests on this host");
   agree(
     "animal poses",
     animals
@@ -704,7 +715,8 @@ fn every_pixel_door_matches_its_jpeg_twin_on_the_crew_fixture() {
   );
 
   let options = AppleVisionPersonMaskerOptions::new();
-  let masker = PersonMasker::new(&options);
+  let masker =
+    PersonMasker::new(&options).expect("PersonMasker::new builds its Vision requests on this host");
   agree(
     "instance masks",
     masker
@@ -745,7 +757,8 @@ fn the_pixel_door_reads_a_barcode_payload() {
   let plane = PixelPlane::packed(&packed, width, height, PixelFormat::Rgb8).expect("plane");
 
   let options = AppleVisionBarcodeOptions::new();
-  let detector = BarcodeDetector::new(&options);
+  let detector = BarcodeDetector::new(&options)
+    .expect("BarcodeDetector::new builds its Vision requests on this host");
   let through_jpeg = detector
     .detect::<ms::BarcodeDetection>(QR, &options)
     .expect("the jpeg door must return Ok");
@@ -788,7 +801,8 @@ fn the_pixel_door_reads_text_even_where_the_two_doors_count_differently() {
   let plane = PixelPlane::packed(&packed, width, height, PixelFormat::Rgb8).expect("plane");
 
   let options = AppleVisionTextOptions::new();
-  let recognizer = TextRecognizer::new(&options);
+  let recognizer = TextRecognizer::new(&options)
+    .expect("TextRecognizer::new builds its Vision requests on this host");
   let through_jpeg = recognizer
     .recognize::<ms::TextDetection>(AIRPORT, &options)
     .expect("the jpeg door must return Ok");

@@ -15,8 +15,8 @@ use crate::BodyPoseJoint;
 #[cfg(target_vendor = "apple")]
 use crate::ffi::{
   ImageSource, MAX_POSE_JOINTS, MAX_VISION_RESULTS_PER_FRAME, PoseBudget, PoseJoints,
-  ffi_nsstring_to_smolstr, guard_vision_ffi, pose_bbox_from_joint_bounds, read_pose_joints,
-  run_requests, sanitize_confidence, vision_point_to_normalized,
+  ffi_nsstring_to_smolstr, guard_native, guard_vision_ffi, pose_bbox_from_joint_bounds,
+  read_pose_joints, run_requests, sanitize_confidence, vision_point_to_normalized,
 };
 use crate::{AnalyzeError, AppleVisionAnimalPoseOptions, BodyPoseDetection, PixelPlane};
 
@@ -41,14 +41,24 @@ impl AnimalPoser {
   ///
   /// `_options` is unused: Apple bakes no knob this crate exposes into
   /// the request object, so every gate is read per call.
+  ///
+  /// # Errors
+  ///
+  /// Building a Vision request loads a model, and a model load is where
+  /// Apple's stack raises instead of returning: on a host whose Neural
+  /// Engine is denied it throws, and a throw that crosses into Rust
+  /// unguarded takes the process down. This refuses with
+  /// [`AnalyzeErrorKind::Environment`](crate::AnalyzeErrorKind::Environment)
+  /// instead — the constructor is where a whole entry point can still
+  /// be declined, before any frame has been handed to it.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn new(_options: &AppleVisionAnimalPoseOptions) -> Self {
-    let request = unsafe {
+  pub fn new(_options: &AppleVisionAnimalPoseOptions) -> Result<Self, AnalyzeError> {
+    let request = guard_native("AnimalPoser::new", || unsafe {
       let request = VNDetectAnimalBodyPoseRequest::new();
       request.setRevision(VNDetectAnimalBodyPoseRequestRevision1);
       request
-    };
-    Self { request }
+    })?;
+    Ok(Self { request })
   }
 
   /// Logs the pinned revision of the animal-body-pose request.
@@ -214,8 +224,14 @@ pub struct AnimalPoser;
 impl AnimalPoser {
   /// Constructs a non-macOS stub poser. The options are ignored.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn new(_options: &AppleVisionAnimalPoseOptions) -> Self {
-    Self
+  ///
+  /// # Errors
+  ///
+  /// Never off Apple: there is no Vision framework to raise, so the
+  /// constructor cannot fail. The `Result` is the Apple signature kept
+  /// whole, so a caller writes `?` once and compiles on every host.
+  pub fn new(_options: &AppleVisionAnimalPoseOptions) -> Result<Self, AnalyzeError> {
+    Ok(Self)
   }
 
   /// Non-macOS stub: always reports

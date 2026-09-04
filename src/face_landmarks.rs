@@ -14,9 +14,9 @@ use objc2_vision::*;
 
 #[cfg(target_vendor = "apple")]
 use crate::ffi::{
-  ImageSource, MAX_VISION_RESULTS_PER_FRAME, guard_vision_ffi, project_landmark_to_image,
-  run_requests, sanitize_confidence, validate_raw_slice_elems, vision_point_to_normalized,
-  vision_rect_to_bbox,
+  ImageSource, MAX_VISION_RESULTS_PER_FRAME, guard_native, guard_vision_ffi,
+  project_landmark_to_image, run_requests, sanitize_confidence, validate_raw_slice_elems,
+  vision_point_to_normalized, vision_rect_to_bbox,
 };
 use crate::{AnalyzeError, AppleVisionFaceLandmarkOptions, BoundingBox, PixelPlane};
 
@@ -230,14 +230,24 @@ impl FaceLandmarker {
   ///
   /// `_options` is unused: Apple bakes no knob this crate exposes into
   /// the request object, so every gate is read per call.
+  ///
+  /// # Errors
+  ///
+  /// Building a Vision request loads a model, and a model load is where
+  /// Apple's stack raises instead of returning: on a host whose Neural
+  /// Engine is denied it throws, and a throw that crosses into Rust
+  /// unguarded takes the process down. This refuses with
+  /// [`AnalyzeErrorKind::Environment`](crate::AnalyzeErrorKind::Environment)
+  /// instead — the constructor is where a whole entry point can still
+  /// be declined, before any frame has been handed to it.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn new(_options: &AppleVisionFaceLandmarkOptions) -> Self {
-    let request = unsafe {
+  pub fn new(_options: &AppleVisionFaceLandmarkOptions) -> Result<Self, AnalyzeError> {
+    let request = guard_native("FaceLandmarker::new", || unsafe {
       let request = VNDetectFaceLandmarksRequest::new();
       request.setRevision(VNDetectFaceLandmarksRequestRevision3);
       request
-    };
-    Self { request }
+    })?;
+    Ok(Self { request })
   }
 
   /// Logs the pinned revision of the face-landmarks request.
@@ -657,8 +667,14 @@ pub struct FaceLandmarker;
 impl FaceLandmarker {
   /// Constructs a non-macOS stub landmarker. The options are ignored.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn new(_options: &AppleVisionFaceLandmarkOptions) -> Self {
-    Self
+  ///
+  /// # Errors
+  ///
+  /// Never off Apple: there is no Vision framework to raise, so the
+  /// constructor cannot fail. The `Result` is the Apple signature kept
+  /// whole, so a caller writes `?` once and compiles on every host.
+  pub fn new(_options: &AppleVisionFaceLandmarkOptions) -> Result<Self, AnalyzeError> {
+    Ok(Self)
   }
 
   /// Non-macOS stub: always reports

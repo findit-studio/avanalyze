@@ -17,7 +17,8 @@ use objc2_vision::*;
 
 #[cfg(target_vendor = "apple")]
 use crate::ffi::{
-  ImageSource, MAX_VISION_RESULTS_PER_FRAME, guard_vision_ffi, run_requests, sanitize_confidence,
+  ImageSource, MAX_VISION_RESULTS_PER_FRAME, guard_native, guard_vision_ffi, run_requests,
+  sanitize_confidence,
 };
 use crate::{AnalyzeError, AppleVisionPersonMaskerOptions, BoundingBox, PixelPlane};
 
@@ -148,9 +149,19 @@ impl PersonMasker {
   ///
   /// `_options` is unused: Apple bakes no knob this crate exposes into
   /// these request objects, so every gate is read per call.
+  ///
+  /// # Errors
+  ///
+  /// Building a Vision request loads a model, and a model load is where
+  /// Apple's stack raises instead of returning: on a host whose Neural
+  /// Engine is denied it throws, and a throw that crosses into Rust
+  /// unguarded takes the process down. This refuses with
+  /// [`AnalyzeErrorKind::Environment`](crate::AnalyzeErrorKind::Environment)
+  /// instead — the constructor is where a whole entry point can still
+  /// be declined, before any frame has been handed to it.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn new(_options: &AppleVisionPersonMaskerOptions) -> Self {
-    unsafe {
+  pub fn new(_options: &AppleVisionPersonMaskerOptions) -> Result<Self, AnalyzeError> {
+    guard_native("PersonMasker::new", || unsafe {
       let instances = VNGeneratePersonInstanceMaskRequest::new();
       instances.setRevision(VNGeneratePersonInstanceMaskRequestRevision1);
 
@@ -161,7 +172,7 @@ impl PersonMasker {
         instances,
         segmentation,
       }
-    }
+    })
   }
 
   /// Logs the pinned revision of both mask requests.
@@ -965,8 +976,14 @@ pub struct PersonMasker;
 impl PersonMasker {
   /// Constructs a non-macOS stub masker. The options are ignored.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn new(_options: &AppleVisionPersonMaskerOptions) -> Self {
-    Self
+  ///
+  /// # Errors
+  ///
+  /// Never off Apple: there is no Vision framework to raise, so the
+  /// constructor cannot fail. The `Result` is the Apple signature kept
+  /// whole, so a caller writes `?` once and compiles on every host.
+  pub fn new(_options: &AppleVisionPersonMaskerOptions) -> Result<Self, AnalyzeError> {
+    Ok(Self)
   }
 
   /// Non-macOS stub: always reports

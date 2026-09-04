@@ -24,7 +24,7 @@ use crate::{
   },
   ffi::{
     ImageSource, MAX_VISION_RESULTS_PER_FRAME, Performed, ffi_nsstring_to_smolstr, finite_f32,
-    guard_vision_ffi, perform, sanitize_confidence, vision_rect_to_bbox, with_image,
+    guard_native, guard_vision_ffi, perform, sanitize_confidence, vision_rect_to_bbox, with_image,
   },
 };
 
@@ -265,9 +265,19 @@ impl FaceDetector {
   ///
   /// `_options` is unused: Apple bakes no knob this crate exposes into
   /// these request objects, so every gate is read per call.
+  ///
+  /// # Errors
+  ///
+  /// Building a Vision request loads a model, and a model load is where
+  /// Apple's stack raises instead of returning: on a host whose Neural
+  /// Engine is denied it throws, and a throw that crosses into Rust
+  /// unguarded takes the process down. This refuses with
+  /// [`AnalyzeErrorKind::Environment`](crate::AnalyzeErrorKind::Environment)
+  /// instead — the constructor is where a whole entry point can still
+  /// be declined, before any frame has been handed to it.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn new(_options: &AppleVisionFaceOptions) -> Self {
-    unsafe {
+  pub fn new(_options: &AppleVisionFaceOptions) -> Result<Self, AnalyzeError> {
+    guard_native("FaceDetector::new", || unsafe {
       let rectangles = VNDetectFaceRectanglesRequest::new();
       rectangles.setRevision(VNDetectFaceRectanglesRequestRevision3);
 
@@ -282,7 +292,7 @@ impl FaceDetector {
         quality,
         landmarks,
       }
-    }
+    })
   }
 
   /// Logs the pinned revision of all three face requests.
@@ -1213,8 +1223,14 @@ pub struct FaceDetector;
 impl FaceDetector {
   /// Constructs a non-macOS stub detector. The options are ignored.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn new(_options: &AppleVisionFaceOptions) -> Self {
-    Self
+  ///
+  /// # Errors
+  ///
+  /// Never off Apple: there is no Vision framework to raise, so the
+  /// constructor cannot fail. The `Result` is the Apple signature kept
+  /// whole, so a caller writes `?` once and compiles on every host.
+  pub fn new(_options: &AppleVisionFaceOptions) -> Result<Self, AnalyzeError> {
+    Ok(Self)
   }
 
   /// Non-macOS stub: always reports

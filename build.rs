@@ -25,7 +25,7 @@ fn main() {
   // or if the toolchain we used for feature detection changes.
   println!("cargo:rerun-if-env-changed=CARGO_FEATURE_TARPAULIN");
 
-  build_objc_simd_shim();
+  build_native_half();
 }
 
 fn use_feature(feature: &str) {
@@ -35,11 +35,11 @@ fn use_feature(feature: &str) {
 /// The major.minor version every exported native name carries.
 ///
 /// C has no namespaces, and Cargo permits two semver-incompatible
-/// versions of one crate in a single graph, so the shim's function, its
-/// test object's class, the static archive below and the `links` key in
-/// `Cargo.toml` are all scoped by this tag — the reasoning is on
-/// `src/objc_simd_shim.m`. [`assert_shim_abi_tag_matches_package_version`]
-/// keeps it honest.
+/// versions of one crate in a single graph, so every function this
+/// crate's native half exports, its test object's class, the static
+/// archives below and the `links` key in `Cargo.toml` are all scoped by
+/// this tag — the reasoning is on `src/objc_simd_shim.m`.
+/// [`assert_shim_abi_tag_matches_package_version`] keeps it honest.
 const SHIM_ABI_TAG: &str = "0_5";
 
 /// Fails the build when [`SHIM_ABI_TAG`] and the package version drift.
@@ -81,7 +81,7 @@ fn assert_shim_abi_tag_matches_package_version() {
 fn assert_versioned_names_are_consistent() {
   let tag = SHIM_ABI_TAG;
   // (file, the exact text that must appear, required-to-exist)
-  let sites: [(&str, String, bool); 6] = [
+  let sites: [(&str, String, bool); 14] = [
     (
       "Cargo.toml",
       format!("links = \"avanalyze_{tag}_objc_simd_shim\""),
@@ -107,11 +107,47 @@ fn assert_versioned_names_are_consistent() {
       format!("fn avanalyze_{tag}_vn_point3d_position("),
       true,
     ),
+    (
+      "src/objc_cxx_barrier.mm",
+      format!("typedef void (*Avanalyze_{tag}_GuardBody)(void *context);"),
+      true,
+    ),
+    (
+      "src/objc_cxx_barrier.mm",
+      format!("int32_t avanalyze_{tag}_guard("),
+      true,
+    ),
+    ("src/ffi.rs", format!("fn avanalyze_{tag}_guard("), true),
+    (
+      "src/objc_cxx_barrier_test.mm",
+      format!("void avanalyze_{tag}_test_throw("),
+      true,
+    ),
+    (
+      "src/objc_cxx_barrier_test.mm",
+      format!("@implementation Avanalyze_{tag}_TestUndescribableException"),
+      true,
+    ),
+    (
+      "src/objc_cxx_barrier_test.mm",
+      format!("@implementation Avanalyze_{tag}_TestSentinel"),
+      true,
+    ),
+    (
+      "src/objc_cxx_barrier_test.mm",
+      format!("void avanalyze_{tag}_test_autorelease_sentinel("),
+      true,
+    ),
     // Test sources need not survive packaging, so a missing file here is
     // not a defect — a stale name in a present one still is.
     (
       "src/tests/ffi.rs",
       format!("#[link(name = \"avanalyze_{tag}_objc_simd_shim_test\", kind = \"static\")]"),
+      false,
+    ),
+    (
+      "src/tests/native_barrier.rs",
+      format!("#[link(name = \"avanalyze_{tag}_objc_cxx_barrier_test\", kind = \"static\")]"),
       false,
     ),
   ];
@@ -162,7 +198,18 @@ fn assert_versioned_names_are_consistent() {
 /// runtime. An archive nothing links cannot be force-loaded. The only
 /// thing that names it is a `#[link]` attribute in `src/tests/ffi.rs`,
 /// which exists only in a `cfg(test)` build.
-fn build_objc_simd_shim() {
+///
+/// # The second translation unit, and why it is C++
+///
+/// `src/objc_cxx_barrier.mm` is compiled beside the shim, under the
+/// same version-tag discipline and into an archive of its own. It is
+/// Objective-C++ because it has to name BOTH exception worlds in one
+/// `try`: `catch (NSException *)` needs the Objective-C half of the
+/// compiler and `catch (const std::exception &)` the C++ half, and the
+/// two are one mechanism only inside a translation unit that speaks
+/// both. `src/objc_cxx_barrier_test.mm` — three synthetic throws Vision
+/// cannot be asked for on demand — follows the test archive's rules.
+fn build_native_half() {
   println!("cargo:rerun-if-env-changed=DOCS_RS");
 
   // Before the target gate: a stale tag is a defect on every host, and a
@@ -198,10 +245,31 @@ fn build_objc_simd_shim() {
     .cargo_metadata(false)
     .compile(&format!("avanalyze_{SHIM_ABI_TAG}_objc_simd_shim_test"));
 
-  // Emitted here rather than left to the production archive's own
-  // metadata, so the test archive is findable by name without depending
-  // on which `cc::Build` happened to print a search path first. Both
-  // land in OUT_DIR.
+  objcxx_build()
+    .file("src/objc_cxx_barrier.mm")
+    .compile(&format!("avanalyze_{SHIM_ABI_TAG}_objc_cxx_barrier"));
+
+  // `catch (NSException *)` binds `_OBJC_EHTYPE_$_NSException`, which
+  // lives in Foundation. Every other Apple framework this crate links
+  // arrives through an objc2 crate's own link directive, and Foundation
+  // does too — but a barrier that silently stops catching Objective-C
+  // exceptions if a dependency's directive ever moves is not a barrier,
+  // so the translation unit that needs the symbol names the framework
+  // that defines it. A duplicate `-framework` on the link line is free.
+  println!("cargo:rustc-link-lib=framework=Foundation");
+
+  // The synthetic throws, under the test archive's rules: its own
+  // archive, no cargo link directive, named only by the `#[link]`
+  // attribute in `src/tests/native_barrier.rs`.
+  objcxx_build()
+    .file("src/objc_cxx_barrier_test.mm")
+    .cargo_metadata(false)
+    .compile(&format!("avanalyze_{SHIM_ABI_TAG}_objc_cxx_barrier_test"));
+
+  // Emitted here rather than left to the production archives' own
+  // metadata, so the test archives are findable by name without
+  // depending on which `cc::Build` happened to print a search path
+  // first. All four land in OUT_DIR.
   println!(
     "cargo:rustc-link-search=native={}",
     var("OUT_DIR").expect("cargo sets OUT_DIR")
@@ -224,6 +292,35 @@ fn objc_build() -> cc::Build {
     // not to unwind. The Rust declaration is `extern "C-unwind"` to
     // match, and `src/tests/ffi.rs` raises through this frame to prove
     // the pair holds.
+    .flag("-fobjc-exceptions")
+    .flag("-fexceptions");
+  build
+}
+
+/// The compiler settings both Objective-C++ files are built with.
+///
+/// `cpp(true)` is what puts libc++ on the link line — a translation
+/// unit that catches `std::exception` and asks
+/// `abi::__cxa_current_exception_type()` for the type in flight needs
+/// the C++ runtime present, and nothing else in this crate's graph
+/// brings it. `-xobjective-c++` is spelled out rather than left to the
+/// `.mm` extension so the language cannot depend on how `cc` decided to
+/// invoke the driver.
+///
+/// Exception support is not optional here in the way it is elsewhere:
+/// this is the frame the whole barrier is. Without `-fexceptions` there
+/// is no `try` at all, and without `-fobjc-exceptions` an
+/// `NSException` is not something `catch (NSException *)` can name.
+///
+/// No ARC, matching the Objective-C half: the barrier retains nothing
+/// and stores nothing, and the one object it touches — the exception in
+/// flight — is owned by the runtime for the length of the handler.
+fn objcxx_build() -> cc::Build {
+  let mut build = cc::Build::new();
+  build
+    .cpp(true)
+    .flag("-xobjective-c++")
+    .flag("-std=c++17")
     .flag("-fobjc-exceptions")
     .flag("-fexceptions");
   build

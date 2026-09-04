@@ -8,7 +8,11 @@
 //!
 //! Nothing in this module is public API.
 
-use std::{borrow::Cow, panic::AssertUnwindSafe};
+use std::{
+  borrow::Cow,
+  ffi::{c_char, c_void},
+  panic::AssertUnwindSafe,
+};
 
 use objc2::{Message, exception::catch as catch_objc_exception, rc::Retained};
 use objc2_core_foundation::{CFData, CFIndex, CFMutableData, CFRetained, CGPoint, CGRect};
@@ -634,23 +638,268 @@ pub(crate) fn validate_raw_slice_elems<T>(elem_count: usize, max_elems: usize) -
   Some(())
 }
 
-// ----- the exception barrier ------------------------------------------------
+// ----- the native barrier ---------------------------------------------------
 
-/// Run `f` under an Objective-C exception barrier, returning `fallback`
-/// (the empty/degraded result for that detector) if Apple's Vision
-/// framework raises an `NSException` that unwinds across the FFI
-/// boundary.
+/// The bytes reserved for a caught exception's message.
 ///
-/// Rust's [`std::panic::catch_unwind`] (used in the 3-D body-pose path
-/// for a *Rust*-panic quirk) explicitly **cannot** catch a foreign
-/// Objective-C exception — one that escaped would abort the entire
-/// process with `fatal runtime error: Rust cannot catch foreign
-/// exceptions`. [`objc2::exception::catch`] is the only sanctioned
-/// barrier: it converts the unwinding `NSException` into a `Result`, so
-/// one misbehaving detector degrades to an empty result for that
-/// detector instead of taking the whole worker (and pipeline) down. A
-/// caught exception's `name`/`reason` is logged via the exception's
-/// (safe) `Display` impl.
+/// Apple's raises carry a model path and an error code — the ANE
+/// refusal is a URL plus a sentence — and 512 bytes holds those whole
+/// while keeping the buffer on the stack of a function that runs on
+/// every guarded call. Anything longer is truncated by the trampoline,
+/// which NUL-terminates regardless.
+const GUARD_MESSAGE_CAPACITY: usize = 512;
+
+/// What [`avanalyze_0_5_guard`] reports about the call it ran.
+///
+/// The numbers are the trampoline's, spelled out in
+/// `src/objc_cxx_barrier.mm`; this is where they are given meaning. A
+/// status the trampoline never returns has none, and
+/// [`guard_native`] refuses rather than guesses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuardStatus {
+  /// The guarded call returned normally.
+  Completed,
+  /// An Objective-C exception — `NSException` or any other `@throw`n
+  /// object — was caught.
+  ObjCException,
+  /// A `std::exception` was caught. This is the one Apple's C++ layers
+  /// (Espresso, ANECF) throw natively, before their Objective-C
+  /// wrappers turn it into an `NSException`.
+  CxxException,
+}
+
+impl GuardStatus {
+  /// Reads a trampoline status, or `None` for a number it never
+  /// returns.
+  const fn from_raw(status: i32) -> Option<Self> {
+    match status {
+      0 => Some(Self::Completed),
+      1 => Some(Self::ObjCException),
+      2 => Some(Self::CxxException),
+      _ => None,
+    }
+  }
+
+  /// How the caught exception is named in the error message.
+  const fn describe(self) -> &'static str {
+    match self {
+      Self::Completed => "completed",
+      Self::ObjCException => "an Objective-C exception",
+      Self::CxxException => "a C++ exception",
+    }
+  }
+}
+
+/// Run `f` under a barrier NO Apple framework exception can cross, and
+/// report a caught one as an [`AnalyzeErrorKind::Environment`] refusal.
+///
+/// This is the crate's floor. Every other guard is built on it, and
+/// every path that can enter CoreML — the nine entry-point
+/// constructors, the image preparation, the perform, each extraction —
+/// runs inside one.
+///
+/// # Why a C++ frame and not [`objc2::exception::catch`]
+///
+/// Because objc2's barrier is `@catch (id)`: it matches Objective-C
+/// objects and lets everything else keep unwinding, which is correct
+/// for what it promises and is not a barrier against the layer beneath.
+/// Vision sits on CoreML, CoreML on Espresso and ANECF, and those are
+/// C++ libraries. The `NSException` a denied Neural Engine produces is
+/// one their Objective-C wrapper made; nothing in the API contract says
+/// the wrapper is total, and what escapes it reaches Rust as a foreign
+/// exception that aborts the process at the first
+/// [`catch_unwind`](std::panic::catch_unwind) it meets — `fatal runtime
+/// error: Rust cannot catch foreign exceptions`.
+///
+/// `src/objc_cxx_barrier.mm` names both worlds in one `try`, which only
+/// an Objective-C++ translation unit can do, and returns a status
+/// instead of unwinding.
+///
+/// # Nothing catches between the raise and the trampoline
+///
+/// The callback below is `extern "C-unwind"` and installs no
+/// `catch_unwind`, and that is the load-bearing part of this design
+/// rather than an omission. A Rust `catch_unwind` anywhere between the
+/// raise and the C++ `try` would claim the exception first — its
+/// landing pad matches every exception class — and abort on the
+/// mismatch. The containment has to sit in the frame that can name what
+/// it caught.
+///
+/// # A Rust panic is not this barrier's to catch
+///
+/// The trampoline's clauses are all NAMED C++ types and there is no
+/// `catch (...)`, so a panic raised inside `f` passes THROUGH the C++
+/// frame and is caught by the Rust runtime that raised it — the only
+/// arrangement the Rust Reference sanctions, since it gives no
+/// guarantees for a foreign runtime that disposes of or rethrows a Rust
+/// panic payload. Concretely that is what lets
+/// [`BodyPoser::extract_3d`](crate::BodyPoser) keep the `catch_unwind`
+/// it wraps this barrier in for objc2's debug-build encoding checks,
+/// and what keeps a CONSUMER's panic — their vocabulary constructors
+/// run inside the extraction guards — a panic rather than a dead
+/// process.
+///
+/// The price is one named residual: a C++ throw of a type unrelated to
+/// `std::exception` is not caught either, and behaves exactly as it did
+/// before this barrier existed. `src/objc_cxx_barrier.mm` argues that
+/// trade, and `src/tests/native_barrier.rs` pins it.
+///
+/// # It needs `panic = "unwind"`
+///
+/// The raise crosses one Rust frame — the `run` callback below — on its
+/// way to the C++
+/// `try`, because the code that calls Vision is Rust. Under
+/// `panic = "abort"` rustc puts an abort-on-unwind shim on every
+/// `extern "C-unwind"` boundary, so the exception dies in that frame
+/// and this function never sees it.
+///
+/// That is not a constraint this barrier introduced.
+/// [`objc2::exception::catch`], which this crate has always used and
+/// which is built on the identical geometry — a Rust `extern "C-unwind"`
+/// callback inside an Objective-C `@try` — documents the same
+/// limitation, and the `catch_unwind` in
+/// [`BodyPoser::extract_3d`](crate::BodyPoser) is equally inert there.
+/// A `panic = "abort"` consumer therefore gets exactly the behaviour
+/// they had before this barrier existed.
+///
+/// # Safety of the closure
+///
+/// `f` may capture `&mut` state and non-`UnwindSafe` handles; no
+/// unwind-safety bound is asked for, because nothing here observes the
+/// closure's captures after a caught exception. On a catch the
+/// closure's frame has already been unwound, its borrows dropped, and
+/// this function returns an error built from the message alone.
+pub(crate) fn guard_native<R, F: FnOnce() -> R>(
+  site: &'static str,
+  f: F,
+) -> Result<R, AnalyzeError> {
+  /// The closure and its result, reached through the `void *` the
+  /// trampoline hands back to [`run`].
+  struct Call<F, R> {
+    body: Option<F>,
+    out: Option<R>,
+  }
+
+  /// The callback the trampoline calls, once.
+  ///
+  /// `C-unwind`, because an Apple raise has to unwind THROUGH this
+  /// frame to reach the `try` outside it; a `C` declaration would mark
+  /// it `nounwind` and turn that into an abort.
+  unsafe extern "C-unwind" fn run<F: FnOnce() -> R, R>(context: *mut c_void) {
+    // SAFETY: the only caller is the trampoline below, which is handed
+    // `context` as a pointer to the `Call` on this function's caller's
+    // stack. That `Call` outlives the trampoline call, and nothing else
+    // borrows it while the call is in flight, so the exclusive
+    // reference is sound and unaliased.
+    let call = unsafe { &mut *context.cast::<Call<F, R>>() };
+    if let Some(body) = call.body.take() {
+      call.out = Some(body());
+    }
+  }
+
+  let mut call = Call {
+    body: Some(f),
+    out: None,
+  };
+  let mut message = [0u8; GUARD_MESSAGE_CAPACITY];
+  // SAFETY: `run::<F, R>` matches the trampoline's `void (*)(void *)`
+  // and is handed the matching context; the buffer is writable for the
+  // length passed, which is its own. The call may return through a
+  // rethrown Rust panic, which is why the declaration is `C-unwind`.
+  let status = unsafe {
+    avanalyze_0_5_guard(
+      run::<F, R>,
+      core::ptr::from_mut(&mut call).cast(),
+      message.as_mut_ptr().cast(),
+      message.len(),
+    )
+  };
+
+  match GuardStatus::from_raw(status) {
+    Some(GuardStatus::Completed) => call.out.ok_or_else(|| {
+      // Unreachable while the trampoline honours its contract: a
+      // completed status means the callback ran, and the callback's
+      // only exit sets `out`. Refused rather than unwrapped, because
+      // this crate's answer to an impossible native state is an error,
+      // not a panic.
+      AnalyzeError::new(
+        AnalyzeErrorKind::Environment,
+        format!("{site}: the native barrier reported success without running the guarded call"),
+      )
+    }),
+    Some(caught) => {
+      let detail = guard_message(&message);
+      #[cfg(feature = "tracing")]
+      tracing::warn!(
+        site,
+        status = caught.describe(),
+        detail = %detail,
+        "Apple's native stack raised across the FFI boundary; the call is refused",
+      );
+      Err(AnalyzeError::new(
+        AnalyzeErrorKind::Environment,
+        format!("{site}: {} — {detail}", caught.describe()),
+      ))
+    }
+    None => Err(AnalyzeError::new(
+      AnalyzeErrorKind::Environment,
+      format!("{site}: the native barrier returned an unknown status {status}"),
+    )),
+  }
+}
+
+/// Read the trampoline's message buffer back as text.
+///
+/// The buffer is NUL-terminated by the trampoline and truncated to fit,
+/// which can split a UTF-8 sequence — so the conversion is lossy rather
+/// than fallible: a caught exception must always produce a message, and
+/// a replacement character in a diagnostic is better than no diagnostic.
+/// A buffer with no NUL at all is a broken contract, and reads as empty.
+fn guard_message(buffer: &[u8]) -> Cow<'_, str> {
+  let bytes =
+    core::ffi::CStr::from_bytes_until_nul(buffer).map_or(&[][..], |message| message.to_bytes());
+  String::from_utf8_lossy(bytes)
+}
+
+// `C-unwind`, not `C`: the trampoline names only the C++ types it can
+// handle, so an exception it does not name — a Rust panic on its way
+// out of the guarded closure, above all — keeps unwinding straight
+// through it. A `C` declaration would mark the frame `nounwind` and
+// turn that crossing into an abort instead of a panic the caller can
+// catch.
+unsafe extern "C-unwind" {
+  /// `src/objc_cxx_barrier.mm` — one `try`, three outcomes, and
+  /// everything it cannot name left to keep unwinding.
+  ///
+  /// The `0_5` is the crate's major.minor, for the reason the simd
+  /// shim's declaration below spells out.
+  fn avanalyze_0_5_guard(
+    body: unsafe extern "C-unwind" fn(*mut c_void),
+    context: *mut c_void,
+    message: *mut c_char,
+    message_capacity: usize,
+  ) -> i32;
+}
+
+/// Run `f` under the crate's exception barriers, returning `fallback`
+/// (the empty/degraded result for that detector) if Apple's Vision
+/// framework raises across the FFI boundary.
+///
+/// Two barriers, and each catches what the other does not.
+/// [`objc2::exception::catch`] is the inner one: it converts an
+/// unwinding Objective-C object into a `Result`, and a caught
+/// exception's `name`/`reason` is logged via the exception's (safe)
+/// `Display` impl. [`guard_native`] is the outer one, and it is what
+/// stands between this crate and everything objc2's `@catch (id)`
+/// deliberately lets through — the C++ exceptions of the CoreML stack
+/// underneath Vision.
+///
+/// Either way one misbehaving detector degrades to an empty result for
+/// that detector instead of taking the whole worker (and pipeline)
+/// down. Rust's [`std::panic::catch_unwind`] (used in the 3-D body-pose
+/// path for a *Rust*-panic quirk) explicitly **cannot** stand in for
+/// either: a foreign exception reaching it aborts the entire process
+/// with `fatal runtime error: Rust cannot catch foreign exceptions`.
 ///
 /// `detector` names the Vision request whose perform/result-extraction
 /// raised, so the warning pins the culprit.
@@ -676,9 +925,14 @@ pub(crate) fn validate_raw_slice_elems<T>(elem_count: usize, max_elems: usize) -
 /// request state after one — see [`Performed`] for what that state
 /// would be.
 pub(crate) fn guard_vision_ffi<R>(detector: &'static str, fallback: R, f: impl FnOnce() -> R) -> R {
-  match catch_objc_exception(AssertUnwindSafe(f)) {
-    Ok(value) => value,
-    Err(exception) => {
+  // The nesting is load-bearing. objc2's barrier is INSIDE, so an
+  // Objective-C raise keeps the handling and the logging it always had;
+  // the native barrier is OUTSIDE, so a C++ throw — which objc2's
+  // `@catch (id)` does not match and does not stop — meets a frame that
+  // can name it before it reaches any Rust one.
+  match guard_native(detector, || catch_objc_exception(AssertUnwindSafe(f))) {
+    Ok(Ok(value)) => value,
+    Ok(Err(exception)) => {
       #[cfg(feature = "tracing")]
       match &exception {
         // The `Exception` `Display` impl is safe: it checks
@@ -700,6 +954,11 @@ pub(crate) fn guard_vision_ffi<R>(detector: &'static str, fallback: R, f: impl F
       let _ = (detector, exception);
       fallback
     }
+    // `guard_native` has already logged what it caught, and the
+    // degradation contract for an extraction is the same whichever
+    // world the exception came from: nothing was read, so nothing is
+    // emitted.
+    Err(_error) => fallback,
   }
 }
 
@@ -1157,8 +1416,11 @@ pub(crate) fn perform(
   image: &VisionImage,
   requests: &[Retained<VNRequest>],
 ) -> Result<Performed, AnalyzeError> {
-  let array = NSArray::from_retained_slice(requests);
   guard_vision_ffi("performRequests", Ok(Performed::Raised), || unsafe {
+    // Inside the barrier, not before it: building the array is a
+    // retained clone per request and a Foundation allocation, which is
+    // FFI like everything else here.
+    let array = NSArray::from_retained_slice(requests);
     match image {
       VisionImage::Encoded(data) => handler.performRequests_onImageData_error(&array, data),
       VisionImage::Decoded(image) => handler.performRequests_onCGImage_error(&array, image),
@@ -1193,16 +1455,29 @@ pub(crate) fn perform(
 /// The pre-flight runs BEFORE the pool and before anything is copied:
 /// [`ImageSource::preflight`] is what stops an over-ceiling JPEG from
 /// reaching `NSData::with_bytes`.
+///
+/// # The preamble is guarded too
+///
+/// Building the image object and the sequence handler are Objective-C
+/// allocations, and `body` is where every perform and every extraction
+/// runs, so the whole of it sits inside [`guard_native`]. A native
+/// exception from any of it refuses the call with an
+/// [`AnalyzeErrorKind::Environment`] error rather than unwinding into a
+/// caller that has no barrier of its own. The autorelease pool is
+/// inside the guard, so an exception caught by the trampoline has
+/// already run the pool's drain on its way out.
 pub(crate) fn with_image<R>(
   source: ImageSource<'_>,
   body: impl FnOnce(&VNSequenceRequestHandler, &VisionImage) -> Result<R, AnalyzeError>,
 ) -> Result<R, AnalyzeError> {
   source.preflight()?;
-  objc2::rc::autoreleasepool(|_| {
-    let image = source.prepare()?;
-    let handler = unsafe { VNSequenceRequestHandler::new() };
-    body(&handler, &image)
-  })
+  guard_native("with_image", || {
+    objc2::rc::autoreleasepool(|_| {
+      let image = source.prepare()?;
+      let handler = unsafe { VNSequenceRequestHandler::new() };
+      body(&handler, &image)
+    })
+  })?
 }
 
 /// The whole per-call preamble every single-perform entry point runs:

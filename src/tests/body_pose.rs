@@ -267,6 +267,7 @@ fn three_d_joints_carry_a_human_skeleton_in_metres() {
 
   let options = AppleVisionBodyPoserOptions::new();
   let poses = BodyPoser::new(&options)
+    .expect("BodyPoser::new builds its Vision requests on this host")
     .detect_3d::<Pose3>(CREW, &options)
     .expect("detect_3d must return Ok");
 

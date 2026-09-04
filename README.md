@@ -47,7 +47,7 @@ use avanalyze::{AppleVisionFaceOptions, FaceDetector, PixelFormat, PixelPlane};
 let plane = PixelPlane::packed(rgb, width, height, PixelFormat::Rgb8)?;
 
 let options = AppleVisionFaceOptions::new();
-let faces = FaceDetector::new(&options).detect_pixels::<MyFace>(&plane, &options)?;
+let faces = FaceDetector::new(&options)?.detect_pixels::<MyFace>(&plane, &options)?;
 ```
 
 Use them if you hold decoded frames. The JPEG door makes you encode a picture
@@ -88,7 +88,7 @@ struct MyVocabulary;
 impl Detections for MyVocabulary { /* … */ }
 
 let options = AnalyzeOptions::new();
-let analyzer = VisionAnalyzer::new(&options);
+let analyzer = VisionAnalyzer::new(&options)?;
 let analysis = analyzer.analyze_keyframe::<MyVocabulary>(&jpeg, &options)?;
 
 for subject in analysis.human_subjects() { /* your type */ }
@@ -104,7 +104,7 @@ struct MyTextRun { /* … */ }
 impl TextDetection for MyTextRun { /* … */ }
 
 let options = AppleVisionTextOptions::new();
-let runs = TextRecognizer::new(&options).recognize::<MyTextRun>(&jpeg, &options)?;
+let runs = TextRecognizer::new(&options)?.recognize::<MyTextRun>(&jpeg, &options)?;
 ```
 
 Every seat on every constructor is a primitive — `f32`, `u32`, `usize`, `&str`,
@@ -137,13 +137,46 @@ fn my_vocabulary_fits_the_engine() {
 
 ## Degradation
 
-Failure is per detector, not per frame. A Vision request that raises an
-Objective-C exception contributes an empty result while every other detector's
-results still land — an empty slot inside `Analysis`, an empty `Vec` from an
-entry point of its own. Individual detections are filtered before construction —
-non-finite geometry, out-of-range confidences, degenerate boxes — and a refused
-detection is silently absent; there is no "dropped" counter. An `Err` means no
-analysis happened at all, which is a surface of exactly two kinds.
+Failure is per detector, not per frame. A Vision request that raises — an
+Objective-C exception, or a C++ one out of the CoreML stack underneath —
+contributes an empty result while every other detector's results still land: an
+empty slot inside `Analysis`, an empty `Vec` from an entry point of its own.
+Individual detections are filtered before construction — non-finite geometry,
+out-of-range confidences, degenerate boxes — and a refused detection is silently
+absent; there is no "dropped" counter. An `Err` means no analysis happened at
+all, which is a surface of exactly three kinds.
+
+## Nothing Apple raises kills the process (with `panic = "unwind"`)
+
+Every entry point's constructor returns a `Result`, and that is not ceremony.
+Building a Vision request loads a model, and a model load is where Apple's stack
+raises instead of returning: on a host whose Neural Engine is denied,
+`VNDetectHumanBodyPose3DRequest`'s own initialiser raises `EspressoPlanFailure`
+out of the ANE load, before any frame exists to blame.
+
+A raise that crosses into Rust unguarded is not an error — it is the end of the
+process. Rust's `catch_unwind` refuses foreign exceptions by aborting (`fatal
+runtime error: Rust cannot catch foreign exceptions`), so an unguarded raise
+takes the whole worker down at whichever `catch_unwind` it meets first, the test
+harness's included.
+
+So every path that can enter CoreML — the nine constructors, the image
+preparation, each perform, each extraction — runs inside a barrier written in
+Objective-C++, because catching BOTH worlds needs a translation unit that speaks
+both: `objc2::exception::catch` is `@catch (id)` and deliberately lets C++
+exceptions keep unwinding. What the barrier catches becomes
+`AnalyzeErrorKind::Environment`, carrying the exception's own name and reason.
+A Rust panic raised inside a guarded call is *not* caught: it is foreign to C++
+exactly as an `NSException` is foreign to Rust, none of the barrier's clauses
+names it, and it passes through to reach you as the panic it was.
+
+One precondition, stated because it cannot be engineered away: this needs
+`panic = "unwind"`, the default. The raise has to cross one Rust frame to reach
+the barrier, and `panic = "abort"` puts an abort-on-unwind shim on exactly that
+boundary. `objc2::exception::catch` — which this crate has always used, on the
+same geometry — documents the identical limitation, and `catch_unwind` is inert
+there too. Under `panic = "abort"` you get what you had before this barrier
+existed: nothing is newly broken, and nothing is quietly weakened.
 
 ## Requirements
 
@@ -173,12 +206,17 @@ and the traits it builds:
 - `src/plane.rs` — `PixelPlane`, `PixelFormat`, and the decoded-size ceiling
   both doors enforce. No platform code: a plane's rules are arithmetic.
 - `src/ffi.rs` — the shared Vision boundary: coordinate conversion, resource
-  ceilings, the Objective-C exception barrier, and the two doors' one
-  divergence — encoded bytes to `NSData`, a plane to a `CGImage`.
+  ceilings, both exception barriers, and the two doors' one divergence —
+  encoded bytes to `NSData`, a plane to a `CGImage`.
+- `src/objc_simd_shim.m` — the one message send Rust cannot make itself, because
+  rustc cannot receive a `simd_float4x4`.
+- `src/objc_cxx_barrier.mm` — the barrier no Apple framework exception crosses:
+  one `try`, four outcomes, and a rethrow for the Rust panics that are not its
+  to catch.
 - `src/conformance.rs` — runnable assertions, per entry point.
 - `src/options.rs` — per-entry configuration knobs
   (`AppleVisionTextOptions`, `AppleVisionFaceOptions`, …) and `AnalyzeOptions`.
-- `src/error.rs` — `AnalyzeError` and its two kinds.
+- `src/error.rs` — `AnalyzeError` and its three kinds.
 
 ## License
 

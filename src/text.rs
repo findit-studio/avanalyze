@@ -8,8 +8,8 @@ use objc2_vision::*;
 
 #[cfg(target_vendor = "apple")]
 use crate::ffi::{
-  ImageSource, MAX_VISION_RESULTS_PER_FRAME, ffi_nsstring_to_smolstr, guard_vision_ffi,
-  run_requests, sanitize_confidence, vision_rect_to_bbox,
+  ImageSource, MAX_VISION_RESULTS_PER_FRAME, ffi_nsstring_to_smolstr, guard_native,
+  guard_vision_ffi, run_requests, sanitize_confidence, vision_rect_to_bbox,
 };
 use crate::{AnalyzeError, AppleVisionTextOptions, BoundingBox, PixelPlane};
 
@@ -97,14 +97,24 @@ impl TextRecognizer {
   /// the request object, so every gate is read per call. The parameter
   /// stays so the constructor keeps the shape every other entry point
   /// uses, and so a future baked knob does not move the signature.
+  ///
+  /// # Errors
+  ///
+  /// Building a Vision request loads a model, and a model load is where
+  /// Apple's stack raises instead of returning: on a host whose Neural
+  /// Engine is denied it throws, and a throw that crosses into Rust
+  /// unguarded takes the process down. This refuses with
+  /// [`AnalyzeErrorKind::Environment`](crate::AnalyzeErrorKind::Environment)
+  /// instead — the constructor is where a whole entry point can still
+  /// be declined, before any frame has been handed to it.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn new(_options: &AppleVisionTextOptions) -> Self {
-    let request = unsafe {
+  pub fn new(_options: &AppleVisionTextOptions) -> Result<Self, AnalyzeError> {
+    let request = guard_native("TextRecognizer::new", || unsafe {
       let request = VNRecognizeTextRequest::new();
       request.setRevision(VNRecognizeTextRequestRevision3);
       request
-    };
-    Self { request }
+    })?;
+    Ok(Self { request })
   }
 
   /// Logs the pinned revision of the text request.
@@ -221,8 +231,14 @@ pub struct TextRecognizer;
 impl TextRecognizer {
   /// Constructs a non-macOS stub recognizer. The options are ignored.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn new(_options: &AppleVisionTextOptions) -> Self {
-    Self
+  ///
+  /// # Errors
+  ///
+  /// Never off Apple: there is no Vision framework to raise, so the
+  /// constructor cannot fail. The `Result` is the Apple signature kept
+  /// whole, so a caller writes `?` once and compiles on every host.
+  pub fn new(_options: &AppleVisionTextOptions) -> Result<Self, AnalyzeError> {
+    Ok(Self)
   }
 
   /// Non-macOS stub: always reports

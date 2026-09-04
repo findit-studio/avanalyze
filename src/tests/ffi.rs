@@ -1378,6 +1378,44 @@ fn a_raise_on_the_joint_read_path_never_reaches_the_outer_catch_unwind() {
   );
 }
 
+/// The same production nesting, against the exception class the
+/// Objective-C barrier does NOT catch.
+///
+/// The test above pins the order for an Objective-C raise, which
+/// `objc2::exception::catch` consumes. A C++ throw walks straight
+/// through that `@catch (id)` — deliberately: it matches Objective-C
+/// objects and lets everything else keep unwinding — and until this
+/// crate grew a C++-aware barrier there was nothing further out to stop
+/// it. It reached `extract_3d`'s `catch_unwind` and aborted the
+/// process.
+///
+/// So this asserts the same shape one layer deeper: the throw must be
+/// consumed by the NATIVE barrier that now sits outside the
+/// Objective-C one, and the outer `catch_unwind` must still come back
+/// `Ok`. An abort here means the C++ exception crossed both barriers
+/// untouched, which is the defect itself.
+#[test]
+fn a_cxx_throw_on_the_joint_read_path_never_reaches_the_outer_catch_unwind() {
+  use std::panic::{AssertUnwindSafe, catch_unwind};
+
+  use crate::tests::native_barrier::{SyntheticThrow, synthetic_throw};
+
+  let outcome = catch_unwind(AssertUnwindSafe(|| {
+    guard_vision_ffi("body_pose_3d", [f32::NAN; 16], || {
+      // SAFETY: inside `guard_vision_ffi`, which is how the native
+      // barrier is reached.
+      unsafe { synthetic_throw(SyntheticThrow::StdException) };
+      [0f32; 16]
+    })
+  }));
+
+  let got = outcome.expect("the native barrier must consume the throw, not the Rust one");
+  assert!(
+    got[0].is_nan(),
+    "the guard must return the fallback after catching the C++ throw"
+  );
+}
+
 /// A perform has exactly two outcomes and they must never collapse
 /// into one another. `Completed` licenses a caller to read the
 /// requests' `results`; `Raised` forbids it, because a retained

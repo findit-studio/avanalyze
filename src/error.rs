@@ -15,6 +15,32 @@ pub enum AnalyzeErrorKind {
   RequestFailed,
   /// Apple's Vision framework is not available on this platform.
   Unsupported,
+  /// Apple's native stack raised instead of returning: an Objective-C
+  /// or C++ exception escaped Vision, CoreML, or the Neural Engine
+  /// layers beneath them, and this crate's barrier caught it.
+  ///
+  /// This is a refusal by the HOST, not by the frame. The reproducible
+  /// case is a machine whose Neural Engine is denied — a sandbox that
+  /// refuses the ANE device, a policy that withholds it — where
+  /// building the 3-D body-pose request raises `EspressoPlanFailure`
+  /// while loading its model, before any image exists to blame. The
+  /// same call on the same host refuses again; a sibling entry point
+  /// whose model does load is unaffected, which is why this is
+  /// per-call and not a platform-wide [`Unsupported`](Self::Unsupported).
+  ///
+  /// It exists because the alternative is not an error at all. A raise
+  /// that crosses into Rust unguarded takes the whole process down —
+  /// `fatal runtime error: Rust cannot catch foreign exceptions` — and
+  /// a daemon that indexes media must refuse one frame, not die.
+  ///
+  /// Reaching this variant requires `panic = "unwind"`, the default. A
+  /// raise has to cross one Rust frame to reach the barrier that names
+  /// it, and `panic = "abort"` puts an abort-on-unwind shim on exactly
+  /// that boundary — the same reason
+  /// [`objc2::exception::catch`](https://docs.rs/objc2/latest/objc2/exception/fn.catch.html)
+  /// documents itself as unable to catch there. Under that setting a
+  /// consumer gets what they had before this variant existed.
+  Environment,
 }
 
 impl fmt::Display for AnalyzeErrorKind {
@@ -22,6 +48,7 @@ impl fmt::Display for AnalyzeErrorKind {
     match self {
       Self::RequestFailed => f.write_str("apple-vision request failed"),
       Self::Unsupported => f.write_str("apple-vision unavailable"),
+      Self::Environment => f.write_str("apple-vision raised a native exception"),
     }
   }
 }
