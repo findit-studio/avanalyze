@@ -27,7 +27,8 @@ mod non_macos {
   #[test]
   fn analyzer_stub_returns_error() {
     let options = AnalyzeOptions::new();
-    let analyzer = VisionAnalyzer::new(&options);
+    let analyzer = VisionAnalyzer::new(&options)
+      .expect("VisionAnalyzer::new builds its Vision requests on this host");
     let err = analyzer
       .analyze_keyframe::<Plain>(&[], &options)
       .expect_err("stub must Err");
@@ -37,7 +38,8 @@ mod non_macos {
   #[test]
   fn analyzer_stub_error_mentions_macos() {
     let options = AnalyzeOptions::new();
-    let analyzer = VisionAnalyzer::new(&options);
+    let analyzer = VisionAnalyzer::new(&options)
+      .expect("VisionAnalyzer::new builds its Vision requests on this host");
     let err = analyzer
       .analyze_keyframe::<Plain>(&[0xFF, 0xD8], &options)
       .expect_err("stub must Err");
@@ -47,7 +49,8 @@ mod non_macos {
   #[test]
   fn analyzer_stub_ignores_data_size() {
     let options = AnalyzeOptions::new();
-    let analyzer = VisionAnalyzer::new(&options);
+    let analyzer = VisionAnalyzer::new(&options)
+      .expect("VisionAnalyzer::new builds its Vision requests on this host");
     let e1 = analyzer
       .analyze_keyframe::<Plain>(&[], &options)
       .expect_err("empty");
@@ -60,7 +63,8 @@ mod non_macos {
   #[test]
   fn analyzer_error_has_kind_and_message() {
     let options = AnalyzeOptions::new();
-    let analyzer = VisionAnalyzer::new(&options);
+    let analyzer = VisionAnalyzer::new(&options)
+      .expect("VisionAnalyzer::new builds its Vision requests on this host");
     let err = analyzer
       .analyze_keyframe::<Plain>(&[], &options)
       .expect_err("stub");
@@ -84,6 +88,7 @@ mod non_macos {
     let text = AppleVisionTextOptions::new();
     check(
       TextRecognizer::new(&text)
+        .expect("TextRecognizer::new builds its Vision requests on this host")
         .recognize::<Text>(&[], &text)
         .expect_err("stub must Err"),
     );
@@ -91,6 +96,7 @@ mod non_macos {
     let barcode = AppleVisionBarcodeOptions::new();
     check(
       BarcodeDetector::new(&barcode)
+        .expect("BarcodeDetector::new builds its Vision requests on this host")
         .detect::<Barcode>(&[], &barcode)
         .expect_err("stub must Err"),
     );
@@ -98,6 +104,7 @@ mod non_macos {
     let face = AppleVisionFaceOptions::new();
     check(
       FaceDetector::new(&face)
+        .expect("FaceDetector::new builds its Vision requests on this host")
         .detect::<Face>(&[], &face)
         .expect_err("stub must Err"),
     );
@@ -105,6 +112,7 @@ mod non_macos {
     let landmarks = AppleVisionFaceLandmarkOptions::new();
     check(
       FaceLandmarker::new(&landmarks)
+        .expect("FaceLandmarker::new builds its Vision requests on this host")
         .detect::<FaceLandmarks>(&[], &landmarks)
         .expect_err("stub must Err"),
     );
@@ -112,11 +120,13 @@ mod non_macos {
     let poser = AppleVisionBodyPoserOptions::new();
     check(
       BodyPoser::new(&poser)
+        .expect("BodyPoser::new builds its Vision requests on this host")
         .detect_2d::<Pose>(&[], &poser)
         .expect_err("stub must Err"),
     );
     check(
       BodyPoser::new(&poser)
+        .expect("BodyPoser::new builds its Vision requests on this host")
         .detect_3d::<Pose3>(&[], &poser)
         .expect_err("stub must Err"),
     );
@@ -124,6 +134,7 @@ mod non_macos {
     let hand = AppleVisionHandPoseOptions::new();
     check(
       HandPoser::new(&hand)
+        .expect("HandPoser::new builds its Vision requests on this host")
         .detect::<HandPose>(&[], &hand)
         .expect_err("stub must Err"),
     );
@@ -131,6 +142,7 @@ mod non_macos {
     let animal = AppleVisionAnimalPoseOptions::new();
     check(
       AnimalPoser::new(&animal)
+        .expect("AnimalPoser::new builds its Vision requests on this host")
         .detect::<AnimalPose>(&[], &animal)
         .expect_err("stub must Err"),
     );
@@ -138,11 +150,13 @@ mod non_macos {
     let masker = AppleVisionPersonMaskerOptions::new();
     check(
       PersonMasker::new(&masker)
+        .expect("PersonMasker::new builds its Vision requests on this host")
         .instance_masks::<InstanceMask>(&[], &masker)
         .expect_err("stub must Err"),
     );
     check(
       PersonMasker::new(&masker)
+        .expect("PersonMasker::new builds its Vision requests on this host")
         .segmentation_masks::<SegmentationMask>(&[], &masker)
         .expect_err("stub must Err"),
     );
@@ -166,6 +180,7 @@ mod non_macos {
     let options = AnalyzeOptions::new();
     check(
       VisionAnalyzer::new(&options)
+        .expect("VisionAnalyzer::new builds its Vision requests on this host")
         .analyze_keyframe_pixels::<Plain>(&plane, &options)
         .expect_err("stub must Err"),
     );
@@ -173,6 +188,7 @@ mod non_macos {
     let text = AppleVisionTextOptions::new();
     check(
       TextRecognizer::new(&text)
+        .expect("TextRecognizer::new builds its Vision requests on this host")
         .recognize_pixels::<Text>(&plane, &text)
         .expect_err("stub must Err"),
     );
@@ -180,6 +196,7 @@ mod non_macos {
     let barcode = AppleVisionBarcodeOptions::new();
     check(
       BarcodeDetector::new(&barcode)
+        .expect("BarcodeDetector::new builds its Vision requests on this host")
         .detect_pixels::<Barcode>(&plane, &barcode)
         .expect_err("stub must Err"),
     );
@@ -187,6 +204,7 @@ mod non_macos {
     let face = AppleVisionFaceOptions::new();
     check(
       FaceDetector::new(&face)
+        .expect("FaceDetector::new builds its Vision requests on this host")
         .detect_pixels::<Face>(&plane, &face)
         .expect_err("stub must Err"),
     );
@@ -194,6 +212,7 @@ mod non_macos {
     let landmarks = AppleVisionFaceLandmarkOptions::new();
     check(
       FaceLandmarker::new(&landmarks)
+        .expect("FaceLandmarker::new builds its Vision requests on this host")
         .detect_pixels::<FaceLandmarks>(&plane, &landmarks)
         .expect_err("stub must Err"),
     );
@@ -201,11 +220,13 @@ mod non_macos {
     let poser = AppleVisionBodyPoserOptions::new();
     check(
       BodyPoser::new(&poser)
+        .expect("BodyPoser::new builds its Vision requests on this host")
         .detect_2d_pixels::<Pose>(&plane, &poser)
         .expect_err("stub must Err"),
     );
     check(
       BodyPoser::new(&poser)
+        .expect("BodyPoser::new builds its Vision requests on this host")
         .detect_3d_pixels::<Pose3>(&plane, &poser)
         .expect_err("stub must Err"),
     );
@@ -213,6 +234,7 @@ mod non_macos {
     let hand = AppleVisionHandPoseOptions::new();
     check(
       HandPoser::new(&hand)
+        .expect("HandPoser::new builds its Vision requests on this host")
         .detect_pixels::<HandPose>(&plane, &hand)
         .expect_err("stub must Err"),
     );
@@ -220,6 +242,7 @@ mod non_macos {
     let animal = AppleVisionAnimalPoseOptions::new();
     check(
       AnimalPoser::new(&animal)
+        .expect("AnimalPoser::new builds its Vision requests on this host")
         .detect_pixels::<AnimalPose>(&plane, &animal)
         .expect_err("stub must Err"),
     );
@@ -227,11 +250,13 @@ mod non_macos {
     let masker = AppleVisionPersonMaskerOptions::new();
     check(
       PersonMasker::new(&masker)
+        .expect("PersonMasker::new builds its Vision requests on this host")
         .instance_masks_pixels::<InstanceMask>(&plane, &masker)
         .expect_err("stub must Err"),
     );
     check(
       PersonMasker::new(&masker)
+        .expect("PersonMasker::new builds its Vision requests on this host")
         .segmentation_masks_pixels::<SegmentationMask>(&plane, &masker)
         .expect_err("stub must Err"),
     );
@@ -242,37 +267,67 @@ mod non_macos {
 
 #[test]
 fn every_entry_point_is_debug() {
-  assert!(format!("{:?}", VisionAnalyzer::new(&AnalyzeOptions::new())).contains("VisionAnalyzer"));
   assert!(
-    format!("{:?}", TextRecognizer::new(&AppleVisionTextOptions::new())).contains("TextRecognizer")
+    format!(
+      "{:?}",
+      VisionAnalyzer::new(&AnalyzeOptions::new())
+        .expect("VisionAnalyzer::new builds its Vision requests on this host")
+    )
+    .contains("VisionAnalyzer")
+  );
+  assert!(
+    format!(
+      "{:?}",
+      TextRecognizer::new(&AppleVisionTextOptions::new())
+        .expect("TextRecognizer::new builds its Vision requests on this host")
+    )
+    .contains("TextRecognizer")
   );
   assert!(
     format!(
       "{:?}",
       BarcodeDetector::new(&AppleVisionBarcodeOptions::new())
+        .expect("BarcodeDetector::new builds its Vision requests on this host")
     )
     .contains("BarcodeDetector")
   );
   assert!(
-    format!("{:?}", FaceDetector::new(&AppleVisionFaceOptions::new())).contains("FaceDetector")
+    format!(
+      "{:?}",
+      FaceDetector::new(&AppleVisionFaceOptions::new())
+        .expect("FaceDetector::new builds its Vision requests on this host")
+    )
+    .contains("FaceDetector")
   );
   assert!(
     format!(
       "{:?}",
       FaceLandmarker::new(&AppleVisionFaceLandmarkOptions::new())
+        .expect("FaceLandmarker::new builds its Vision requests on this host")
     )
     .contains("FaceLandmarker")
   );
   assert!(
-    format!("{:?}", BodyPoser::new(&AppleVisionBodyPoserOptions::new())).contains("BodyPoser")
+    format!(
+      "{:?}",
+      BodyPoser::new(&AppleVisionBodyPoserOptions::new())
+        .expect("BodyPoser::new builds its Vision requests on this host")
+    )
+    .contains("BodyPoser")
   );
   assert!(
-    format!("{:?}", HandPoser::new(&AppleVisionHandPoseOptions::new())).contains("HandPoser")
+    format!(
+      "{:?}",
+      HandPoser::new(&AppleVisionHandPoseOptions::new())
+        .expect("HandPoser::new builds its Vision requests on this host")
+    )
+    .contains("HandPoser")
   );
   assert!(
     format!(
       "{:?}",
       AnimalPoser::new(&AppleVisionAnimalPoseOptions::new())
+        .expect("AnimalPoser::new builds its Vision requests on this host")
     )
     .contains("AnimalPoser")
   );
@@ -280,6 +335,7 @@ fn every_entry_point_is_debug() {
     format!(
       "{:?}",
       PersonMasker::new(&AppleVisionPersonMaskerOptions::new())
+        .expect("PersonMasker::new builds its Vision requests on this host")
     )
     .contains("PersonMasker")
   );
@@ -295,7 +351,8 @@ fn analyze_options_is_send() {
 fn multiple_analyzer_constructions() {
   let options = AnalyzeOptions::new();
   for _ in 0..10 {
-    let _ = VisionAnalyzer::new(&options);
+    let _ = VisionAnalyzer::new(&options)
+      .expect("VisionAnalyzer::new builds its Vision requests on this host");
   }
 }
 
@@ -304,7 +361,8 @@ fn analyzer_with_custom_options() {
   let mut opts = AnalyzeOptions::new().with_workers(4);
   opts.classifications_mut().set_min_confidence(0.5);
   opts.classifications_mut().set_max_results(5);
-  let analyzer = VisionAnalyzer::new(&opts);
+  let analyzer = VisionAnalyzer::new(&opts)
+    .expect("VisionAnalyzer::new builds its Vision requests on this host");
   let _ = format!("{analyzer:?}");
 }
 
@@ -314,7 +372,7 @@ fn analyzer_with_custom_options() {
 fn hand_poser_takes_its_baked_knob() {
   for count in [1usize, 2, 6, 64] {
     let opts = AppleVisionHandPoseOptions::new().with_maximum_hand_count(count);
-    let _ = HandPoser::new(&opts);
+    let _ = HandPoser::new(&opts).expect("HandPoser::new builds its Vision requests on this host");
   }
 }
 
@@ -421,7 +479,8 @@ mod real_inference {
   #[test]
   fn analyze_keyframe_does_not_abort_on_real_airport_keyframe() {
     let options = AnalyzeOptions::new();
-    let analyzer = VisionAnalyzer::new(&options);
+    let analyzer = VisionAnalyzer::new(&options)
+      .expect("VisionAnalyzer::new builds its Vision requests on this host");
     let analysis = analyzer
       .analyze_keyframe::<Plain>(JPEG, &options)
       .expect("analyze_keyframe must return Ok (a partial analysis), never abort the process");
@@ -442,7 +501,8 @@ mod real_inference {
   #[test]
   fn text_recognizer_runs_on_a_real_keyframe() {
     let options = AppleVisionTextOptions::new();
-    let recognizer = TextRecognizer::new(&options);
+    let recognizer = TextRecognizer::new(&options)
+      .expect("TextRecognizer::new builds its Vision requests on this host");
     let runs = recognizer
       .recognize::<Text>(JPEG, &options)
       .expect("recognize must return Ok");
@@ -459,7 +519,8 @@ mod real_inference {
   #[test]
   fn barcode_detector_runs_on_a_real_keyframe() {
     let options = AppleVisionBarcodeOptions::new();
-    let detector = BarcodeDetector::new(&options);
+    let detector = BarcodeDetector::new(&options)
+      .expect("BarcodeDetector::new builds its Vision requests on this host");
     let _ = detector
       .detect::<Barcode>(JPEG, &options)
       .expect("detect must return Ok");
@@ -472,7 +533,8 @@ mod real_inference {
   #[test]
   fn face_detector_runs_on_a_real_keyframe() {
     let options = AppleVisionFaceOptions::new();
-    let detector = FaceDetector::new(&options);
+    let detector = FaceDetector::new(&options)
+      .expect("FaceDetector::new builds its Vision requests on this host");
     let faces = detector
       .detect::<Face>(JPEG, &options)
       .expect("detect must return Ok");
@@ -526,7 +588,8 @@ mod real_inference {
   #[test]
   fn face_detector_attaches_each_face_its_own_readings_on_a_multi_face_keyframe() {
     let options = AppleVisionFaceOptions::new();
-    let detector = FaceDetector::new(&options);
+    let detector = FaceDetector::new(&options)
+      .expect("FaceDetector::new builds its Vision requests on this host");
     let faces = detector
       .detect::<Face>(CREW, &options)
       .expect("detect must return Ok");
@@ -658,7 +721,8 @@ mod real_inference {
   #[test]
   fn one_face_detector_reused_across_frames_carries_no_state_between_them() {
     let options = AppleVisionFaceOptions::new();
-    let detector = FaceDetector::new(&options);
+    let detector = FaceDetector::new(&options)
+      .expect("FaceDetector::new builds its Vision requests on this host");
 
     let mut crew_runs: Vec<Vec<Face>> = Vec::new();
     for (call, frame) in [CREW, JPEG, CREW, JPEG, CREW].into_iter().enumerate() {
@@ -696,7 +760,8 @@ mod real_inference {
   #[test]
   fn face_landmarker_runs_on_a_real_keyframe() {
     let options = AppleVisionFaceLandmarkOptions::new();
-    let landmarker = FaceLandmarker::new(&options);
+    let landmarker = FaceLandmarker::new(&options)
+      .expect("FaceLandmarker::new builds its Vision requests on this host");
     let _ = landmarker
       .detect::<FaceLandmarks>(JPEG, &options)
       .expect("detect must return Ok");
@@ -707,7 +772,8 @@ mod real_inference {
   #[test]
   fn body_poser_runs_both_dimensions_on_a_real_keyframe() {
     let options = AppleVisionBodyPoserOptions::new();
-    let poser = BodyPoser::new(&options);
+    let poser =
+      BodyPoser::new(&options).expect("BodyPoser::new builds its Vision requests on this host");
     let _ = poser
       .detect_2d::<Pose>(JPEG, &options)
       .expect("detect_2d must return Ok");
@@ -719,7 +785,8 @@ mod real_inference {
   #[test]
   fn hand_poser_runs_on_a_real_keyframe() {
     let options = AppleVisionHandPoseOptions::new();
-    let poser = HandPoser::new(&options);
+    let poser =
+      HandPoser::new(&options).expect("HandPoser::new builds its Vision requests on this host");
     let _ = poser
       .detect::<HandPose>(JPEG, &options)
       .expect("detect must return Ok");
@@ -728,7 +795,8 @@ mod real_inference {
   #[test]
   fn animal_poser_runs_on_a_real_keyframe() {
     let options = AppleVisionAnimalPoseOptions::new();
-    let poser = AnimalPoser::new(&options);
+    let poser =
+      AnimalPoser::new(&options).expect("AnimalPoser::new builds its Vision requests on this host");
     let _ = poser
       .detect::<AnimalPose>(JPEG, &options)
       .expect("detect must return Ok");
@@ -737,7 +805,8 @@ mod real_inference {
   #[test]
   fn person_masker_runs_both_kinds_on_a_real_keyframe() {
     let options = AppleVisionPersonMaskerOptions::new();
-    let masker = PersonMasker::new(&options);
+    let masker = PersonMasker::new(&options)
+      .expect("PersonMasker::new builds its Vision requests on this host");
     let instances = masker
       .instance_masks::<InstanceMask>(JPEG, &options)
       .expect("instance_masks must return Ok");
@@ -776,6 +845,7 @@ mod real_inference {
     let options = AnalyzeOptions::new();
     check(
       VisionAnalyzer::new(&options)
+        .expect("VisionAnalyzer::new builds its Vision requests on this host")
         .analyze_keyframe::<Plain>(&huge, &options)
         .expect_err("oversized input must be refused"),
     );
@@ -783,6 +853,7 @@ mod real_inference {
     let text = AppleVisionTextOptions::new();
     check(
       TextRecognizer::new(&text)
+        .expect("TextRecognizer::new builds its Vision requests on this host")
         .recognize::<Text>(&huge, &text)
         .expect_err("oversized input must be refused"),
     );
@@ -790,6 +861,7 @@ mod real_inference {
     let barcode = AppleVisionBarcodeOptions::new();
     check(
       BarcodeDetector::new(&barcode)
+        .expect("BarcodeDetector::new builds its Vision requests on this host")
         .detect::<Barcode>(&huge, &barcode)
         .expect_err("oversized input must be refused"),
     );
@@ -797,6 +869,7 @@ mod real_inference {
     let face = AppleVisionFaceOptions::new();
     check(
       FaceDetector::new(&face)
+        .expect("FaceDetector::new builds its Vision requests on this host")
         .detect::<Face>(&huge, &face)
         .expect_err("oversized input must be refused"),
     );
@@ -804,6 +877,7 @@ mod real_inference {
     let landmarks = AppleVisionFaceLandmarkOptions::new();
     check(
       FaceLandmarker::new(&landmarks)
+        .expect("FaceLandmarker::new builds its Vision requests on this host")
         .detect::<FaceLandmarks>(&huge, &landmarks)
         .expect_err("oversized input must be refused"),
     );
@@ -811,11 +885,13 @@ mod real_inference {
     let poser = AppleVisionBodyPoserOptions::new();
     check(
       BodyPoser::new(&poser)
+        .expect("BodyPoser::new builds its Vision requests on this host")
         .detect_2d::<Pose>(&huge, &poser)
         .expect_err("oversized input must be refused"),
     );
     check(
       BodyPoser::new(&poser)
+        .expect("BodyPoser::new builds its Vision requests on this host")
         .detect_3d::<Pose3>(&huge, &poser)
         .expect_err("oversized input must be refused"),
     );
@@ -823,6 +899,7 @@ mod real_inference {
     let hand = AppleVisionHandPoseOptions::new();
     check(
       HandPoser::new(&hand)
+        .expect("HandPoser::new builds its Vision requests on this host")
         .detect::<HandPose>(&huge, &hand)
         .expect_err("oversized input must be refused"),
     );
@@ -830,6 +907,7 @@ mod real_inference {
     let animal = AppleVisionAnimalPoseOptions::new();
     check(
       AnimalPoser::new(&animal)
+        .expect("AnimalPoser::new builds its Vision requests on this host")
         .detect::<AnimalPose>(&huge, &animal)
         .expect_err("oversized input must be refused"),
     );
@@ -837,11 +915,13 @@ mod real_inference {
     let masker = AppleVisionPersonMaskerOptions::new();
     check(
       PersonMasker::new(&masker)
+        .expect("PersonMasker::new builds its Vision requests on this host")
         .instance_masks::<InstanceMask>(&huge, &masker)
         .expect_err("oversized input must be refused"),
     );
     check(
       PersonMasker::new(&masker)
+        .expect("PersonMasker::new builds its Vision requests on this host")
         .segmentation_masks::<SegmentationMask>(&huge, &masker)
         .expect_err("oversized input must be refused"),
     );
@@ -878,6 +958,7 @@ mod real_inference {
     let options = AnalyzeOptions::new();
     check(
       VisionAnalyzer::new(&options)
+        .expect("VisionAnalyzer::new builds its Vision requests on this host")
         .analyze_keyframe::<Plain>(huge_dims, &options)
         .expect_err("over-cap decoded dimensions must be refused"),
     );
@@ -885,6 +966,7 @@ mod real_inference {
     let text = AppleVisionTextOptions::new();
     check(
       TextRecognizer::new(&text)
+        .expect("TextRecognizer::new builds its Vision requests on this host")
         .recognize::<Text>(huge_dims, &text)
         .expect_err("over-cap decoded dimensions must be refused"),
     );
@@ -892,6 +974,7 @@ mod real_inference {
     let barcode = AppleVisionBarcodeOptions::new();
     check(
       BarcodeDetector::new(&barcode)
+        .expect("BarcodeDetector::new builds its Vision requests on this host")
         .detect::<Barcode>(huge_dims, &barcode)
         .expect_err("over-cap decoded dimensions must be refused"),
     );
@@ -899,6 +982,7 @@ mod real_inference {
     let face = AppleVisionFaceOptions::new();
     check(
       FaceDetector::new(&face)
+        .expect("FaceDetector::new builds its Vision requests on this host")
         .detect::<Face>(huge_dims, &face)
         .expect_err("over-cap decoded dimensions must be refused"),
     );
@@ -906,6 +990,7 @@ mod real_inference {
     let landmarks = AppleVisionFaceLandmarkOptions::new();
     check(
       FaceLandmarker::new(&landmarks)
+        .expect("FaceLandmarker::new builds its Vision requests on this host")
         .detect::<FaceLandmarks>(huge_dims, &landmarks)
         .expect_err("over-cap decoded dimensions must be refused"),
     );
@@ -913,11 +998,13 @@ mod real_inference {
     let poser = AppleVisionBodyPoserOptions::new();
     check(
       BodyPoser::new(&poser)
+        .expect("BodyPoser::new builds its Vision requests on this host")
         .detect_2d::<Pose>(huge_dims, &poser)
         .expect_err("over-cap decoded dimensions must be refused"),
     );
     check(
       BodyPoser::new(&poser)
+        .expect("BodyPoser::new builds its Vision requests on this host")
         .detect_3d::<Pose3>(huge_dims, &poser)
         .expect_err("over-cap decoded dimensions must be refused"),
     );
@@ -925,6 +1012,7 @@ mod real_inference {
     let hand = AppleVisionHandPoseOptions::new();
     check(
       HandPoser::new(&hand)
+        .expect("HandPoser::new builds its Vision requests on this host")
         .detect::<HandPose>(huge_dims, &hand)
         .expect_err("over-cap decoded dimensions must be refused"),
     );
@@ -932,6 +1020,7 @@ mod real_inference {
     let animal = AppleVisionAnimalPoseOptions::new();
     check(
       AnimalPoser::new(&animal)
+        .expect("AnimalPoser::new builds its Vision requests on this host")
         .detect::<AnimalPose>(huge_dims, &animal)
         .expect_err("over-cap decoded dimensions must be refused"),
     );
@@ -939,11 +1028,13 @@ mod real_inference {
     let masker = AppleVisionPersonMaskerOptions::new();
     check(
       PersonMasker::new(&masker)
+        .expect("PersonMasker::new builds its Vision requests on this host")
         .instance_masks::<InstanceMask>(huge_dims, &masker)
         .expect_err("over-cap decoded dimensions must be refused"),
     );
     check(
       PersonMasker::new(&masker)
+        .expect("PersonMasker::new builds its Vision requests on this host")
         .segmentation_masks::<SegmentationMask>(huge_dims, &masker)
         .expect_err("over-cap decoded dimensions must be refused"),
     );
@@ -1066,7 +1157,8 @@ mod real_inference {
     }
 
     let options = AnalyzeOptions::new();
-    let analyzer = VisionAnalyzer::new(&options);
+    let analyzer = VisionAnalyzer::new(&options)
+      .expect("VisionAnalyzer::new builds its Vision requests on this host");
     let jpeg = analyzer
       .analyze_keyframe::<Plain>(CREW, &options)
       .expect("the analyzer's jpeg door must return Ok");
@@ -1089,7 +1181,8 @@ mod real_inference {
     assert!(pixels.aesthetics().is_some());
 
     let text = AppleVisionTextOptions::new();
-    let recognizer = TextRecognizer::new(&text);
+    let recognizer = TextRecognizer::new(&text)
+      .expect("TextRecognizer::new builds its Vision requests on this host");
     agree(
       "text",
       recognizer
@@ -1104,7 +1197,8 @@ mod real_inference {
     );
 
     let barcode = AppleVisionBarcodeOptions::new();
-    let detector = BarcodeDetector::new(&barcode);
+    let detector = BarcodeDetector::new(&barcode)
+      .expect("BarcodeDetector::new builds its Vision requests on this host");
     agree(
       "barcodes",
       detector
@@ -1119,7 +1213,8 @@ mod real_inference {
     );
 
     let face = AppleVisionFaceOptions::new();
-    let faces = FaceDetector::new(&face);
+    let faces =
+      FaceDetector::new(&face).expect("FaceDetector::new builds its Vision requests on this host");
     let through_pixels = faces
       .detect_pixels::<Face>(&plane, &face)
       .expect("the face fusion's pixel door must return Ok");
@@ -1150,7 +1245,8 @@ mod real_inference {
     }
 
     let landmarks = AppleVisionFaceLandmarkOptions::new();
-    let landmarker = FaceLandmarker::new(&landmarks);
+    let landmarker = FaceLandmarker::new(&landmarks)
+      .expect("FaceLandmarker::new builds its Vision requests on this host");
     agree(
       "landmark sets",
       landmarker
@@ -1165,7 +1261,8 @@ mod real_inference {
     );
 
     let poser = AppleVisionBodyPoserOptions::new();
-    let bodies = BodyPoser::new(&poser);
+    let bodies =
+      BodyPoser::new(&poser).expect("BodyPoser::new builds its Vision requests on this host");
     agree(
       "2-D body poses",
       bodies.detect_2d::<Pose>(CREW, &poser).expect("jpeg").len(),
@@ -1193,7 +1290,8 @@ mod real_inference {
     }
 
     let hand = AppleVisionHandPoseOptions::new();
-    let hands = HandPoser::new(&hand);
+    let hands =
+      HandPoser::new(&hand).expect("HandPoser::new builds its Vision requests on this host");
     agree(
       "hand poses",
       hands.detect::<HandPose>(CREW, &hand).expect("jpeg").len(),
@@ -1205,7 +1303,8 @@ mod real_inference {
     );
 
     let animal = AppleVisionAnimalPoseOptions::new();
-    let animals = AnimalPoser::new(&animal);
+    let animals =
+      AnimalPoser::new(&animal).expect("AnimalPoser::new builds its Vision requests on this host");
     agree(
       "animal poses",
       animals
@@ -1220,7 +1319,8 @@ mod real_inference {
     );
 
     let masker = AppleVisionPersonMaskerOptions::new();
-    let masks = PersonMasker::new(&masker);
+    let masks = PersonMasker::new(&masker)
+      .expect("PersonMasker::new builds its Vision requests on this host");
     let instances = masks
       .instance_masks_pixels::<InstanceMask>(&plane, &masker)
       .expect("instance masks' pixel door must return Ok");
@@ -1264,7 +1364,8 @@ mod real_inference {
     let plane = PixelPlane::packed(&packed, width, height, PixelFormat::Rgb8).expect("plane");
 
     let options = AppleVisionBarcodeOptions::new();
-    let detector = BarcodeDetector::new(&options);
+    let detector = BarcodeDetector::new(&options)
+      .expect("BarcodeDetector::new builds its Vision requests on this host");
     let through_jpeg = detector
       .detect::<Barcode>(QR, &options)
       .expect("the jpeg door must return Ok");

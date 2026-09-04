@@ -11,7 +11,7 @@ use objc2_vision::*;
 #[cfg(target_vendor = "apple")]
 use crate::ffi::{
   ImageSource, MAX_POSE_JOINTS, MAX_VISION_RESULTS_PER_FRAME, PoseBudget, PoseJoints,
-  ffi_nsstring_to_smolstr, finite_f32, guard_vision_ffi, pose_bbox_from_joint_bounds,
+  ffi_nsstring_to_smolstr, finite_f32, guard_native, guard_vision_ffi, pose_bbox_from_joint_bounds,
   read_pose_joints, run_requests, sanitize_confidence, vision_point_to_normalized,
   vn_point3d_position,
 };
@@ -176,9 +176,24 @@ impl BodyPoser {
   ///
   /// `_options` is unused: Apple bakes no knob this crate exposes into
   /// these request objects, so every gate is read per call.
+  ///
+  /// # Errors
+  ///
+  /// Building a Vision request loads a model, and a model load is where
+  /// Apple's stack raises instead of returning: on a host whose Neural
+  /// Engine is denied it throws, and a throw that crosses into Rust
+  /// unguarded takes the process down. This refuses with
+  /// [`AnalyzeErrorKind::Environment`](crate::AnalyzeErrorKind::Environment)
+  /// instead — the constructor is where a whole entry point can still
+  /// be declined, before any frame has been handed to it.
+  ///
+  /// This is the entry point the refusal was FOUND on: with the Neural
+  /// Engine denied, `VNDetectHumanBodyPose3DRequest`'s own initialiser
+  /// raises `EspressoPlanFailure` out of the ANE model load, and before
+  /// this guard existed that raise aborted the process.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn new(_options: &AppleVisionBodyPoserOptions) -> Self {
-    unsafe {
+  pub fn new(_options: &AppleVisionBodyPoserOptions) -> Result<Self, AnalyzeError> {
+    guard_native("BodyPoser::new", || unsafe {
       let pose_2d = VNDetectHumanBodyPoseRequest::new();
       pose_2d.setRevision(VNDetectHumanBodyPoseRequestRevision1);
 
@@ -186,7 +201,7 @@ impl BodyPoser {
       pose_3d.setRevision(VNDetectHumanBodyPose3DRequestRevision1);
 
       Self { pose_2d, pose_3d }
-    }
+    })
   }
 
   /// Logs the pinned revision of both body-pose requests.
@@ -616,8 +631,14 @@ pub struct BodyPoser;
 impl BodyPoser {
   /// Constructs a non-macOS stub poser. The options are ignored.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn new(_options: &AppleVisionBodyPoserOptions) -> Self {
-    Self
+  ///
+  /// # Errors
+  ///
+  /// Never off Apple: there is no Vision framework to raise, so the
+  /// constructor cannot fail. The `Result` is the Apple signature kept
+  /// whole, so a caller writes `?` once and compiles on every host.
+  pub fn new(_options: &AppleVisionBodyPoserOptions) -> Result<Self, AnalyzeError> {
+    Ok(Self)
   }
 
   /// Non-macOS stub: always reports

@@ -8,8 +8,8 @@ use objc2_vision::*;
 
 #[cfg(target_vendor = "apple")]
 use crate::ffi::{
-  ImageSource, MAX_VISION_RESULTS_PER_FRAME, ffi_nsstring_to_smolstr, guard_vision_ffi,
-  run_requests, sanitize_confidence, vision_rect_to_bbox,
+  ImageSource, MAX_VISION_RESULTS_PER_FRAME, ffi_nsstring_to_smolstr, guard_native,
+  guard_vision_ffi, run_requests, sanitize_confidence, vision_rect_to_bbox,
 };
 use crate::{AnalyzeError, AppleVisionBarcodeOptions, BoundingBox, PixelPlane};
 
@@ -56,14 +56,24 @@ impl BarcodeDetector {
   ///
   /// `_options` is unused: Apple bakes no knob this crate exposes into
   /// the request object, so every gate is read per call.
+  ///
+  /// # Errors
+  ///
+  /// Building a Vision request loads a model, and a model load is where
+  /// Apple's stack raises instead of returning: on a host whose Neural
+  /// Engine is denied it throws, and a throw that crosses into Rust
+  /// unguarded takes the process down. This refuses with
+  /// [`AnalyzeErrorKind::Environment`](crate::AnalyzeErrorKind::Environment)
+  /// instead — the constructor is where a whole entry point can still
+  /// be declined, before any frame has been handed to it.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn new(_options: &AppleVisionBarcodeOptions) -> Self {
-    let request = unsafe {
+  pub fn new(_options: &AppleVisionBarcodeOptions) -> Result<Self, AnalyzeError> {
+    let request = guard_native("BarcodeDetector::new", || unsafe {
       let request = VNDetectBarcodesRequest::new();
       request.setRevision(VNDetectBarcodesRequestRevision4);
       request
-    };
-    Self { request }
+    })?;
+    Ok(Self { request })
   }
 
   /// Logs the pinned revision of the barcode request.
@@ -164,8 +174,14 @@ pub struct BarcodeDetector;
 impl BarcodeDetector {
   /// Constructs a non-macOS stub detector. The options are ignored.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn new(_options: &AppleVisionBarcodeOptions) -> Self {
-    Self
+  ///
+  /// # Errors
+  ///
+  /// Never off Apple: there is no Vision framework to raise, so the
+  /// constructor cannot fail. The `Result` is the Apple signature kept
+  /// whole, so a caller writes `?` once and compiles on every host.
+  pub fn new(_options: &AppleVisionBarcodeOptions) -> Result<Self, AnalyzeError> {
+    Ok(Self)
   }
 
   /// Non-macOS stub: always reports

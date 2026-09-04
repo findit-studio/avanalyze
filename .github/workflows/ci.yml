@@ -112,6 +112,12 @@ jobs:
   # Sanity check: the non-macOS stub (`VisionAnalyzer::analyze_keyframe`
   # returns a structured platform-unavailable error) must still compile so
   # downstream workspaces can keep avanalyze in their dep tree on any host.
+  #
+  # `--all-targets`, not a bare `cargo check`: the stubs have `cfg(test)`
+  # coverage of their own, and a bare check compiles none of it. A change
+  # to a stub's signature that left `src/tests.rs` behind built green here
+  # and failed for anyone who ran the suite off Apple — where the macOS
+  # jobs above cannot see it, because that code is compiled nowhere else.
   build-stub-linux:
     name: build stub (linux)
     runs-on: ubuntu-latest
@@ -119,5 +125,5 @@ jobs:
       - uses: actions/checkout@v7
       - name: Install Rust
         run: rustup update stable && rustup default stable
-      - name: cargo check --all-features (cfg-gated stub)
-        run: cargo check --all-features
+      - name: cargo check --all-features --all-targets (cfg-gated stub)
+        run: cargo check --all-features --all-targets

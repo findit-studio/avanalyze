@@ -2,6 +2,8 @@ mod plane;
 mod reference;
 
 #[cfg(target_vendor = "apple")]
+mod ane_denied;
+#[cfg(target_vendor = "apple")]
 mod body_pose;
 #[cfg(target_vendor = "apple")]
 mod face;
@@ -9,6 +11,8 @@ mod face;
 mod ffi;
 #[cfg(target_vendor = "apple")]
 mod mask;
+#[cfg(target_vendor = "apple")]
+mod native_barrier;
 #[cfg(target_vendor = "apple")]
 mod pixel_door;
 
@@ -115,7 +119,9 @@ fn non_macos_stub_reports_unavailable() {
   use crate::{AnalyzeErrorKind, AnalyzeOptions, VisionAnalyzer};
 
   let options = AnalyzeOptions::new();
-  let analyzer = VisionAnalyzer::new(&options);
+  // The stub's `new` is fallible only to keep one signature across
+  // hosts: off Apple there is no framework to raise, so it is `Ok`.
+  let analyzer = VisionAnalyzer::new(&options).expect("the stub constructor cannot fail");
   let err = analyzer
     .analyze_keyframe::<MediaSchema>(&[], &options)
     .expect_err("the stub must refuse");

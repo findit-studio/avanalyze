@@ -18,8 +18,8 @@ use crate::{
   DocumentSegment, HorizonInfo, SaliencyRegion, SubjectDetection,
   ffi::{
     ImageSource, MAX_VISION_RESULTS_PER_FRAME, effective_results_cap, ffi_nsstring_to_smolstr,
-    finite_f32, guard_vision_ffi, run_requests, sanitize_confidence, vision_point_to_normalized,
-    vision_rect_to_bbox,
+    finite_f32, guard_native, guard_vision_ffi, run_requests, sanitize_confidence,
+    vision_point_to_normalized, vision_rect_to_bbox,
   },
 };
 
@@ -86,8 +86,8 @@ impl VisionRequests {
   /// parameter stays so the constructor keeps the shape every other
   /// entry point uses, and so a future baked knob does not move the
   /// public signature.
-  fn new(_options: &AnalyzeOptions) -> Self {
-    unsafe {
+  fn new(_options: &AnalyzeOptions) -> Result<Self, AnalyzeError> {
+    guard_native("VisionAnalyzer::new", || unsafe {
       let classify = VNClassifyImageRequest::new();
       classify.setRevision(VNClassifyImageRequestRevision2);
 
@@ -123,7 +123,7 @@ impl VisionRequests {
         document_segments,
         aesthetics,
       }
-    }
+    })
   }
 
   /// The eight requests as one erased slice, in the order they are
@@ -151,11 +151,21 @@ impl VisionAnalyzer {
   /// Every knob is read per call by
   /// [`analyze_keyframe`](VisionAnalyzer::analyze_keyframe); the
   /// analyzer carries no configuration of its own.
+  ///
+  /// # Errors
+  ///
+  /// Building a Vision request loads a model, and a model load is where
+  /// Apple's stack raises instead of returning: on a host whose Neural
+  /// Engine is denied it throws, and a throw that crosses into Rust
+  /// unguarded takes the process down. This refuses with
+  /// [`AnalyzeErrorKind::Environment`](crate::AnalyzeErrorKind::Environment)
+  /// instead — the constructor is where a whole entry point can still
+  /// be declined, before any frame has been handed to it.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn new(options: &AnalyzeOptions) -> Self {
-    Self {
-      requests: VisionRequests::new(options),
-    }
+  pub fn new(options: &AnalyzeOptions) -> Result<Self, AnalyzeError> {
+    Ok(Self {
+      requests: VisionRequests::new(options)?,
+    })
   }
 
   /// Logs the pinned revision of every Vision request this analyzer
@@ -609,8 +619,14 @@ impl VisionAnalyzer {
   /// every `analyze_keyframe` call reports
   /// [`AnalyzeErrorKind::Unsupported`](crate::AnalyzeErrorKind::Unsupported).
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn new(_options: &AnalyzeOptions) -> Self {
-    Self
+  ///
+  /// # Errors
+  ///
+  /// Never off Apple: there is no Vision framework to raise, so the
+  /// constructor cannot fail. The `Result` is the Apple signature kept
+  /// whole, so a caller writes `?` once and compiles on every host.
+  pub fn new(_options: &AnalyzeOptions) -> Result<Self, AnalyzeError> {
+    Ok(Self)
   }
 
   /// Non-macOS stub: Apple's Vision.framework is only available on
