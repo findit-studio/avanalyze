@@ -9,7 +9,6 @@ use objc2_vision::*;
 #[cfg(target_vendor = "apple")]
 use smol_str::{SmolStr, StrExt};
 
-use crate::AnalyzeError;
 #[cfg(target_vendor = "apple")]
 use crate::PixelPlane;
 #[cfg(target_vendor = "apple")]
@@ -25,6 +24,7 @@ use crate::{
 
 #[cfg(not(target_vendor = "apple"))]
 use crate::{Analysis, AnalyzeOptions};
+use crate::{AnalyzeError, Revisions};
 
 /// Hard ceiling on labels per recognised-animal observation.
 #[cfg(target_vendor = "apple")]
@@ -174,21 +174,61 @@ impl VisionAnalyzer {
   /// Revisions are fixed at construction and a drift changes detection
   /// semantics **silently** — same API, different numbers. This is the
   /// diagnostic that makes the drift visible; wrap the call in your own
-  /// span if you need to attribute it to a worker.
+  /// span if you need to attribute it to a worker. [`revisions`](Self::revisions)
+  /// is the reader this renders — the two never fall out of step because
+  /// there is only one spelling of the revisions themselves.
   #[cfg(feature = "tracing")]
   pub fn log_request_revisions(&self) {
+    tracing::info!(
+      revisions = %self.revisions(),
+      "initialized pinned Apple Vision request revisions"
+    );
+  }
+
+  /// The eight Vision request revisions this analyzer pinned at
+  /// construction, one entry per request, in the order the constructor
+  /// set them.
+  ///
+  /// Every value is read back from the request object itself — never
+  /// from a second constant kept beside the `setRevision` call it
+  /// pinned — so it can never disagree with what
+  /// [`log_request_revisions`](Self::log_request_revisions) would log.
+  ///
+  /// ```ignore
+  /// let analyzer = VisionAnalyzer::new(&AnalyzeOptions::new())?;
+  /// let revisions = analyzer.revisions();
+  /// assert_eq!(revisions.classify(), 2);
+  /// assert_eq!(
+  ///   revisions.to_string(),
+  ///   "classify@2,human_rectangles@2,animals@2,attention_saliency@2,\
+  ///    objectness_saliency@2,horizon@1,document_segments@1,aesthetics@1"
+  /// );
+  /// # Ok::<(), avanalyze::AnalyzeError>(())
+  /// ```
+  pub fn revisions(&self) -> Revisions<8> {
     unsafe {
-      tracing::info!(
-        classify_rev = self.requests.classify.revision(),
-        human_rectangles_rev = self.requests.human_rectangles.revision(),
-        animals_rev = self.requests.animals.revision(),
-        attention_saliency_rev = self.requests.attention_saliency.revision(),
-        objectness_saliency_rev = self.requests.objectness_saliency.revision(),
-        horizon_rev = self.requests.horizon.revision(),
-        document_segments_rev = self.requests.document_segments.revision(),
-        aesthetics_rev = self.requests.aesthetics.revision(),
-        "initialized pinned Apple Vision request revisions"
-      );
+      Revisions::new([
+        ("classify", self.requests.classify.revision()),
+        (
+          "human_rectangles",
+          self.requests.human_rectangles.revision(),
+        ),
+        ("animals", self.requests.animals.revision()),
+        (
+          "attention_saliency",
+          self.requests.attention_saliency.revision(),
+        ),
+        (
+          "objectness_saliency",
+          self.requests.objectness_saliency.revision(),
+        ),
+        ("horizon", self.requests.horizon.revision()),
+        (
+          "document_segments",
+          self.requests.document_segments.revision(),
+        ),
+        ("aesthetics", self.requests.aesthetics.revision()),
+      ])
     }
   }
 
@@ -594,6 +634,51 @@ impl VisionAnalyzer {
     }
 
     D::Aesthetics::new(overall_score, unsafe { obs.isUtility() })
+  }
+}
+
+/// The eight named getters [`VisionAnalyzer::revisions`] returns, one
+/// per request, in the same order [`Display`](std::fmt::Display) and
+/// [`IntoIterator`] walk.
+impl Revisions<8> {
+  /// The pinned revision of the classification request.
+  pub const fn classify(&self) -> usize {
+    self.entries[0].1
+  }
+
+  /// The pinned revision of the human-rectangles request.
+  pub const fn human_rectangles(&self) -> usize {
+    self.entries[1].1
+  }
+
+  /// The pinned revision of the animal-recognition request.
+  pub const fn animals(&self) -> usize {
+    self.entries[2].1
+  }
+
+  /// The pinned revision of the attention-based saliency request.
+  pub const fn attention_saliency(&self) -> usize {
+    self.entries[3].1
+  }
+
+  /// The pinned revision of the objectness-based saliency request.
+  pub const fn objectness_saliency(&self) -> usize {
+    self.entries[4].1
+  }
+
+  /// The pinned revision of the horizon-detection request.
+  pub const fn horizon(&self) -> usize {
+    self.entries[5].1
+  }
+
+  /// The pinned revision of the document-segmentation request.
+  pub const fn document_segments(&self) -> usize {
+    self.entries[6].1
+  }
+
+  /// The pinned revision of the aesthetics request.
+  pub const fn aesthetics(&self) -> usize {
+    self.entries[7].1
   }
 }
 

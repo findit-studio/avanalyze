@@ -15,7 +15,7 @@ use objc2_vision::*;
 #[cfg(target_vendor = "apple")]
 use smol_str::SmolStr;
 
-use crate::{AnalyzeError, AppleVisionFaceOptions, BoundingBox, PixelPlane};
+use crate::{AnalyzeError, AppleVisionFaceOptions, BoundingBox, PixelPlane, Revisions};
 #[cfg(target_vendor = "apple")]
 use crate::{
   face_landmarks::{
@@ -299,15 +299,43 @@ impl FaceDetector {
   ///
   /// A revision drift changes which faces are found and how they are
   /// scored **silently** — same API, different numbers.
+  /// [`revisions`](Self::revisions) is the reader this renders — the two
+  /// never fall out of step because there is only one spelling of the
+  /// revisions themselves.
   #[cfg(feature = "tracing")]
   pub fn log_request_revisions(&self) {
+    tracing::info!(
+      revisions = %self.revisions(),
+      "initialized pinned Apple Vision request revisions"
+    );
+  }
+
+  /// The three Vision request revisions this detector pinned at
+  /// construction — rectangles, capture quality, landmarks, in that
+  /// order.
+  ///
+  /// Every value is read back from the request object itself — never
+  /// from a second constant kept beside the `setRevision` call it
+  /// pinned — so it can never disagree with what
+  /// [`log_request_revisions`](Self::log_request_revisions) would log.
+  ///
+  /// ```ignore
+  /// let detector = FaceDetector::new(&AppleVisionFaceOptions::new())?;
+  /// let revisions = detector.revisions();
+  /// assert_eq!(revisions.face_rectangles(), 3);
+  /// assert_eq!(
+  ///   revisions.to_string(),
+  ///   "face_rectangles@3,face_quality@3,face_landmarks@3"
+  /// );
+  /// # Ok::<(), avanalyze::AnalyzeError>(())
+  /// ```
+  pub fn revisions(&self) -> Revisions<3> {
     unsafe {
-      tracing::info!(
-        face_rectangles_rev = self.rectangles.revision(),
-        face_quality_rev = self.quality.revision(),
-        face_landmarks_rev = self.landmarks.revision(),
-        "initialized pinned Apple Vision request revisions"
-      );
+      Revisions::new([
+        ("face_rectangles", self.rectangles.revision()),
+        ("face_quality", self.quality.revision()),
+        ("face_landmarks", self.landmarks.revision()),
+      ])
     }
   }
 
@@ -751,6 +779,25 @@ impl FaceDetector {
       });
     }
     readings
+  }
+}
+
+/// The three named getters [`FaceDetector::revisions`] returns, in the
+/// same order [`Display`](std::fmt::Display) and [`IntoIterator`] walk.
+impl Revisions<3> {
+  /// The pinned revision of the face-rectangles request.
+  pub const fn face_rectangles(&self) -> usize {
+    self.entries[0].1
+  }
+
+  /// The pinned revision of the face capture-quality request.
+  pub const fn face_quality(&self) -> usize {
+    self.entries[1].1
+  }
+
+  /// The pinned revision of the face-landmarks request.
+  pub const fn face_landmarks(&self) -> usize {
+    self.entries[2].1
   }
 }
 

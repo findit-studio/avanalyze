@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.7.0 — 2026-09-18
+
+Every Vision request this crate builds pins a revision with `setRevision`, and
+until now that number went nowhere a caller could read: the only door was
+`log_request_revisions`, a `tracing`-gated diagnostic that wrote it to a log
+line rather than returning it. A consumer that stamps a detection with the
+engine that produced it — mediagraph's provenance column, most immediately —
+had a capability and a kit but no way to name which revision of it ran.
+
+### Added
+
+- **`Revisions<const N: usize>`, and a reader on every multi-request entry
+  point.** `VisionAnalyzer::revisions() -> Revisions<8>`,
+  `FaceDetector::revisions() -> Revisions<3>` and
+  `BodyPoser::revisions() -> Revisions<2>` each return the revisions they
+  pinned at construction, one entry per request, in construction order.
+  `Revisions` is one type shared by all three rather than a bespoke struct
+  per entry point: it renders through `Display` as
+  `<request>@<revision>,<request>@<revision>,…`, walks the same list through
+  `IntoIterator<Item = (&'static str, usize)>`, and — because `N` differs per
+  producer — each entry point also gets its requests back by name as an
+  inherent method (`revisions.classify()`, `revisions.face_landmarks()`,
+  `revisions.body_pose_3d()`, and so on).
+
+  `BarcodeDetector` owns exactly one request, so it gets no wrapper:
+  `BarcodeDetector::revision() -> usize` is the whole answer.
+
+  Every value is read back from the request object's own `revision()` after
+  `setRevision` pinned it — never from a second constant kept beside that
+  call — so a reader can never drift from what the request itself would
+  answer, and `log_request_revisions` on all four entry points now renders
+  through the same reader instead of spelling the fields out a second time.
+
+### Behaviour
+
+- **No detection changes.** This is a read door on state every affected entry
+  point already held; no request, revision, option or output type moved.
+
 ## 0.6.0 — 2026-09-04
 
 Three arrivals. The engine grows a second door — pixels a caller has already
