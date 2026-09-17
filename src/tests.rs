@@ -15,6 +15,8 @@ mod mask;
 mod native_barrier;
 #[cfg(target_vendor = "apple")]
 mod pixel_door;
+#[cfg(target_vendor = "apple")]
+mod revisions;
 
 use mediaschema::domain::aggregates::video as ms;
 

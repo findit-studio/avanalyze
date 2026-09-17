@@ -200,7 +200,7 @@ static void avanalyze_guard_message(char *message, size_t capacity, const char *
  * exception safety load-bearing rather than tidy. While a handler
  * executes, the sibling clauses of the `try` it belongs to are no
  * longer active: an exception raised here does not fall to the next
- * clause, it leaves `avanalyze_0_6_guard` entirely and unwinds into
+ * clause, it leaves `avanalyze_0_7_guard` entirely and unwinds into
  * Rust — the exact outcome this file exists to prevent, reached from
  * inside the code that was reporting one.
  *
@@ -222,7 +222,7 @@ static void avanalyze_guard_message(char *message, size_t capacity, const char *
  * `-name` is nonnull by contract and `-reason` is not, so both are
  * checked; `-UTF8String` on a nil receiver is nil, which `%s` may not
  * be handed. Its result points into autoreleased storage, valid until
- * the pool in `avanalyze_0_6_guard` drains — which is after this
+ * the pool in `avanalyze_0_7_guard` drains — which is after this
  * returns and after the message has been copied.
  */
 static void avanalyze_guard_render_nsexception(NSException *exception, char *message,
@@ -252,7 +252,7 @@ extern "C" {
  * anything it calls has to be able to unwind out of it and into the
  * `try` below, which is the whole point.
  */
-typedef void (*Avanalyze_0_6_GuardBody)(void *context);
+typedef void (*Avanalyze_0_7_GuardBody)(void *context);
 
 /*
  * Run `body(context)` under a barrier no Apple framework exception can
@@ -267,7 +267,7 @@ typedef void (*Avanalyze_0_6_GuardBody)(void *context);
  * C++ throw of an unrelated type — is not caught and does not return
  * here at all: it keeps unwinding. See the header of this file.
  */
-int32_t avanalyze_0_6_guard(Avanalyze_0_6_GuardBody body, void *context, char *message,
+int32_t avanalyze_0_7_guard(Avanalyze_0_7_GuardBody body, void *context, char *message,
                             size_t message_capacity) {
   if (message != NULL && message_capacity > 0) {
     message[0] = '\0';

@@ -15,7 +15,7 @@ use crate::ffi::{
   read_pose_joints, run_requests, sanitize_confidence, vision_point_to_normalized,
   vn_point3d_position,
 };
-use crate::{AnalyzeError, AppleVisionBodyPoserOptions, BoundingBox, PixelPlane};
+use crate::{AnalyzeError, AppleVisionBodyPoserOptions, BoundingBox, PixelPlane, Revisions};
 
 /// One 2-D pose joint — the shape body, hand, and animal joints share.
 ///
@@ -207,15 +207,38 @@ impl BodyPoser {
   /// Logs the pinned revision of both body-pose requests.
   ///
   /// A revision drift changes the joint roster **silently** — same
-  /// API, different skeleton.
+  /// API, different skeleton. [`revisions`](Self::revisions) is the
+  /// reader this renders — the two never fall out of step because there
+  /// is only one spelling of the revisions themselves.
   #[cfg(feature = "tracing")]
   pub fn log_request_revisions(&self) {
+    tracing::info!(
+      revisions = %self.revisions(),
+      "initialized pinned Apple Vision request revisions"
+    );
+  }
+
+  /// The two Vision request revisions this poser pinned at construction
+  /// — 2-D, then 3-D.
+  ///
+  /// Every value is read back from the request object itself — never
+  /// from a second constant kept beside the `setRevision` call it
+  /// pinned — so it can never disagree with what
+  /// [`log_request_revisions`](Self::log_request_revisions) would log.
+  ///
+  /// ```ignore
+  /// let poser = BodyPoser::new(&AppleVisionBodyPoserOptions::new())?;
+  /// let revisions = poser.revisions();
+  /// assert_eq!(revisions.body_pose(), 1);
+  /// assert_eq!(revisions.to_string(), "body_pose@1,body_pose_3d@1");
+  /// # Ok::<(), avanalyze::AnalyzeError>(())
+  /// ```
+  pub fn revisions(&self) -> Revisions<2> {
     unsafe {
-      tracing::info!(
-        body_pose_rev = self.pose_2d.revision(),
-        body_pose_3d_rev = self.pose_3d.revision(),
-        "initialized pinned Apple Vision request revisions"
-      );
+      Revisions::new([
+        ("body_pose", self.pose_2d.revision()),
+        ("body_pose_3d", self.pose_3d.revision()),
+      ])
     }
   }
 
@@ -518,6 +541,20 @@ impl BodyPoser {
       tracing::warn!("caught panic while extracting human body pose 3D; returning empty result");
       Vec::new()
     })
+  }
+}
+
+/// The two named getters [`BodyPoser::revisions`] returns, in the same
+/// order [`Display`](std::fmt::Display) and [`IntoIterator`] walk.
+impl Revisions<2> {
+  /// The pinned revision of the 2-D body-pose request.
+  pub const fn body_pose(&self) -> usize {
+    self.entries[0].1
+  }
+
+  /// The pinned revision of the 3-D body-pose request.
+  pub const fn body_pose_3d(&self) -> usize {
+    self.entries[1].1
   }
 }
 
