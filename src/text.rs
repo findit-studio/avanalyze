@@ -120,15 +120,35 @@ impl TextRecognizer {
   /// Logs the pinned revision of the text request.
   ///
   /// A revision drift changes recognition semantics **silently** —
-  /// same API, different strings.
+  /// same API, different strings. [`revision`](Self::revision) is the
+  /// reader this renders — the two never fall out of step because there
+  /// is only one spelling of the revision itself.
   #[cfg(feature = "tracing")]
   pub fn log_request_revisions(&self) {
-    unsafe {
-      tracing::info!(
-        text_rev = self.request.revision(),
-        "initialized pinned Apple Vision request revisions"
-      );
-    }
+    tracing::info!(
+      text_rev = self.revision(),
+      "initialized pinned Apple Vision request revisions"
+    );
+  }
+
+  /// The pinned revision of the text request, read back from the
+  /// request object [`new`](Self::new) called `setRevision` on — never
+  /// from a second constant kept beside that call, so this can never
+  /// disagree with what [`log_request_revisions`](Self::log_request_revisions)
+  /// would log.
+  ///
+  /// A single recognizer owns a single request, so there is no roster
+  /// to name: unlike [`VisionAnalyzer::revisions`](crate::VisionAnalyzer::revisions)
+  /// or [`FaceDetector::revisions`](crate::FaceDetector::revisions), one
+  /// `usize` is the whole answer.
+  ///
+  /// ```ignore
+  /// let recognizer = TextRecognizer::new(&AppleVisionTextOptions::new())?;
+  /// assert_eq!(recognizer.revision(), 3);
+  /// # Ok::<(), avanalyze::AnalyzeError>(())
+  /// ```
+  pub fn revision(&self) -> usize {
+    unsafe { self.request.revision() }
   }
 
   /// Recognises text in `jpeg_data`, best candidate first within each

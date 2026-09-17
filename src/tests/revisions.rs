@@ -3,7 +3,7 @@
 
 use crate::{
   AnalyzeOptions, AppleVisionBarcodeOptions, AppleVisionBodyPoserOptions, AppleVisionFaceOptions,
-  BarcodeDetector, BodyPoser, FaceDetector, VisionAnalyzer,
+  AppleVisionTextOptions, BarcodeDetector, BodyPoser, FaceDetector, TextRecognizer, VisionAnalyzer,
 };
 
 /// [`VisionAnalyzer::revisions`]'s eight named getters and its
@@ -43,6 +43,15 @@ fn barcode_detector_revision_matches_the_pinned_constant() {
   let detector = BarcodeDetector::new(&AppleVisionBarcodeOptions::new())
     .expect("BarcodeDetector::new builds its Vision requests on this host");
   assert_eq!(detector.revision(), 4);
+}
+
+/// A single recognizer, a single request: [`TextRecognizer::revision`]
+/// is the one `usize` `log_request_revisions` logs.
+#[test]
+fn text_recognizer_revision_matches_the_pinned_constant() {
+  let recognizer = TextRecognizer::new(&AppleVisionTextOptions::new())
+    .expect("TextRecognizer::new builds its Vision requests on this host");
+  assert_eq!(recognizer.revision(), 3);
 }
 
 /// [`FaceDetector::revisions`]'s three named getters and its `Display`

@@ -24,13 +24,14 @@ had a capability and a kit but no way to name which revision of it ran.
   inherent method (`revisions.classify()`, `revisions.face_landmarks()`,
   `revisions.body_pose_3d()`, and so on).
 
-  `BarcodeDetector` owns exactly one request, so it gets no wrapper:
-  `BarcodeDetector::revision() -> usize` is the whole answer.
+  `BarcodeDetector` and `TextRecognizer` each own exactly one request, so
+  they get no wrapper: `BarcodeDetector::revision() -> usize` and
+  `TextRecognizer::revision() -> usize` are the whole answer.
 
   Every value is read back from the request object's own `revision()` after
   `setRevision` pinned it — never from a second constant kept beside that
   call — so a reader can never drift from what the request itself would
-  answer, and `log_request_revisions` on all four entry points now renders
+  answer, and `log_request_revisions` on all five entry points now renders
   through the same reader instead of spelling the fields out a second time.
 
 ### Behaviour
