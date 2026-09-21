@@ -16,6 +16,10 @@ use crate::ffi::{
   vn_point3d_position,
 };
 use crate::{AnalyzeError, AppleVisionBodyPoserOptions, BoundingBox, PixelPlane};
+// The revision roster is an Apple-only surface: this crate does not
+// support non-Apple targets, it only keeps compiling there.
+#[cfg(target_vendor = "apple")]
+use crate::{BodyPoserRevisions, Revisions};
 
 /// One 2-D pose joint — the shape body, hand, and animal joints share.
 ///
@@ -167,6 +171,10 @@ pub enum HeightEstimation {
 pub struct BodyPoser {
   pose_2d: Retained<VNDetectHumanBodyPoseRequest>,
   pose_3d: Retained<VNDetectHumanBodyPose3DRequest>,
+  /// Read back from the two requests above inside the same guarded
+  /// closure that pinned them, so the public reader sends no message
+  /// of its own.
+  revisions: Revisions<BodyPoserRevisions, 2>,
 }
 
 #[cfg(target_vendor = "apple")]
@@ -200,23 +208,56 @@ impl BodyPoser {
       let pose_3d = VNDetectHumanBodyPose3DRequest::new();
       pose_3d.setRevision(VNDetectHumanBodyPose3DRequestRevision1);
 
-      Self { pose_2d, pose_3d }
+      // Read back here, inside the barrier that already spans every
+      // send this constructor makes, so no public reader has to send
+      // a message — and so the numbers still come from the request
+      // objects rather than from a second copy of the constants above.
+      let revisions = Revisions::new([
+        ("body_pose", pose_2d.revision()),
+        ("body_pose_3d", pose_3d.revision()),
+      ]);
+
+      Self {
+        pose_2d,
+        pose_3d,
+        revisions,
+      }
     })
   }
 
   /// Logs the pinned revision of both body-pose requests.
   ///
   /// A revision drift changes the joint roster **silently** — same
-  /// API, different skeleton.
+  /// API, different skeleton. [`revisions`](Self::revisions) is the
+  /// reader this renders — the two never fall out of step because there
+  /// is only one spelling of the revisions themselves.
   #[cfg(feature = "tracing")]
   pub fn log_request_revisions(&self) {
-    unsafe {
-      tracing::info!(
-        body_pose_rev = self.pose_2d.revision(),
-        body_pose_3d_rev = self.pose_3d.revision(),
-        "initialized pinned Apple Vision request revisions"
-      );
-    }
+    tracing::info!(
+      revisions = %self.revisions,
+      "initialized pinned Apple Vision request revisions"
+    );
+  }
+
+  /// The two Vision request revisions this poser pinned at construction
+  /// — 2-D, then 3-D.
+  ///
+  /// Every value was read back from the request object itself — never
+  /// from a second constant kept beside the `setRevision` call it
+  /// pinned — so it can never disagree with what
+  /// [`log_request_revisions`](Self::log_request_revisions) would log.
+  /// The read happened once, inside the constructor's own exception
+  /// barrier; this returns the cached answer and sends no message.
+  ///
+  /// ```ignore
+  /// let poser = BodyPoser::new(&AppleVisionBodyPoserOptions::new())?;
+  /// let revisions = poser.revisions();
+  /// assert_eq!(revisions.body_pose(), 1);
+  /// assert_eq!(revisions.to_string(), "body_pose@1,body_pose_3d@1");
+  /// # Ok::<(), avanalyze::AnalyzeError>(())
+  /// ```
+  pub fn revisions(&self) -> Revisions<BodyPoserRevisions, 2> {
+    self.revisions
   }
 
   /// Detects 2-D human body poses in `jpeg_data`.
@@ -518,6 +559,26 @@ impl BodyPoser {
       tracing::warn!("caught panic while extracting human body pose 3D; returning empty result");
       Vec::new()
     })
+  }
+}
+
+/// The two named getters [`BodyPoser::revisions`] returns, in the same
+/// order [`Display`](std::fmt::Display) and [`IntoIterator`] walk.
+///
+/// They are reachable only through
+/// [`BodyPoserRevisions`](crate::BodyPoserRevisions).
+/// [`PersonMasker`](crate::PersonMasker) owns two requests as well and
+/// does not inherit them — that is what the producer marker buys.
+#[cfg(target_vendor = "apple")]
+impl Revisions<BodyPoserRevisions, 2> {
+  /// The pinned revision of the 2-D body-pose request.
+  pub const fn body_pose(&self) -> usize {
+    self.entries[0].1
+  }
+
+  /// The pinned revision of the 3-D body-pose request.
+  pub const fn body_pose_3d(&self) -> usize {
+    self.entries[1].1
   }
 }
 

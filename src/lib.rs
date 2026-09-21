@@ -55,6 +55,7 @@ pub use hand_pose::*;
 pub use options::*;
 pub use person_mask::*;
 pub use plane::*;
+pub use revisions::*;
 pub use text::*;
 
 mod analysis;
@@ -71,6 +72,7 @@ mod hand_pose;
 mod options;
 mod person_mask;
 mod plane;
+mod revisions;
 mod text;
 
 #[cfg(target_vendor = "apple")]

@@ -40,7 +40,7 @@ fn use_feature(feature: &str) {
 /// archives below and the `links` key in `Cargo.toml` are all scoped by
 /// this tag — the reasoning is on `src/objc_simd_shim.m`.
 /// [`assert_shim_abi_tag_matches_package_version`] keeps it honest.
-const SHIM_ABI_TAG: &str = "0_6";
+const SHIM_ABI_TAG: &str = "0_7";
 
 /// Fails the build when [`SHIM_ABI_TAG`] and the package version drift.
 ///
