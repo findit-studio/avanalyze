@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.7.0 — 2026-09-18
+## 0.7.0 — 2026-09-21
 
 Every Vision request this crate builds pins a revision with `setRevision`, and
 until now that number went nowhere a caller could read: the only door was
@@ -52,6 +52,18 @@ had a capability and a kit but no way to name which revision of it ran.
 
 - **No detection changes.** This is a read door on state every affected entry
   point already held; no request, revision, option or output type moved.
+
+### Internal
+
+- **The native shim's version-scoped names move to `0_7`.** `SHIM_ABI_TAG` in
+  `build.rs`, the `links` key in `Cargo.toml`, and every hand-written copy
+  `assert_versioned_names_are_consistent` cross-checks — the exported
+  functions and `@interface`/`@implementation` pairs in `objc_simd_shim.m`,
+  `objc_simd_shim_test.m`, `objc_cxx_barrier.mm` and `objc_cxx_barrier_test.mm`,
+  the Rust `extern`s in `ffi.rs`, and both test archives' `#[link]` attributes
+  in `tests/ffi.rs` and `tests/native_barrier.rs` — move from `0_6` to `0_7`
+  together, the same discipline every version bump has followed since the tag
+  existed. `build.rs` still fails the build on every host if any copy drifts.
 
 ## 0.6.0 — 2026-09-04
 
