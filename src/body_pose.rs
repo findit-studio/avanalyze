@@ -15,7 +15,11 @@ use crate::ffi::{
   read_pose_joints, run_requests, sanitize_confidence, vision_point_to_normalized,
   vn_point3d_position,
 };
-use crate::{AnalyzeError, AppleVisionBodyPoserOptions, BoundingBox, PixelPlane, Revisions};
+use crate::{AnalyzeError, AppleVisionBodyPoserOptions, BoundingBox, PixelPlane};
+// The revision roster is an Apple-only surface: this crate does not
+// support non-Apple targets, it only keeps compiling there.
+#[cfg(target_vendor = "apple")]
+use crate::{BodyPoserRevisions, Revisions};
 
 /// One 2-D pose joint — the shape body, hand, and animal joints share.
 ///
@@ -167,6 +171,10 @@ pub enum HeightEstimation {
 pub struct BodyPoser {
   pose_2d: Retained<VNDetectHumanBodyPoseRequest>,
   pose_3d: Retained<VNDetectHumanBodyPose3DRequest>,
+  /// Read back from the two requests above inside the same guarded
+  /// closure that pinned them, so the public reader sends no message
+  /// of its own.
+  revisions: Revisions<BodyPoserRevisions, 2>,
 }
 
 #[cfg(target_vendor = "apple")]
@@ -200,7 +208,20 @@ impl BodyPoser {
       let pose_3d = VNDetectHumanBodyPose3DRequest::new();
       pose_3d.setRevision(VNDetectHumanBodyPose3DRequestRevision1);
 
-      Self { pose_2d, pose_3d }
+      // Read back here, inside the barrier that already spans every
+      // send this constructor makes, so no public reader has to send
+      // a message — and so the numbers still come from the request
+      // objects rather than from a second copy of the constants above.
+      let revisions = Revisions::new([
+        ("body_pose", pose_2d.revision()),
+        ("body_pose_3d", pose_3d.revision()),
+      ]);
+
+      Self {
+        pose_2d,
+        pose_3d,
+        revisions,
+      }
     })
   }
 
@@ -213,7 +234,7 @@ impl BodyPoser {
   #[cfg(feature = "tracing")]
   pub fn log_request_revisions(&self) {
     tracing::info!(
-      revisions = %self.revisions(),
+      revisions = %self.revisions,
       "initialized pinned Apple Vision request revisions"
     );
   }
@@ -221,10 +242,12 @@ impl BodyPoser {
   /// The two Vision request revisions this poser pinned at construction
   /// — 2-D, then 3-D.
   ///
-  /// Every value is read back from the request object itself — never
+  /// Every value was read back from the request object itself — never
   /// from a second constant kept beside the `setRevision` call it
   /// pinned — so it can never disagree with what
   /// [`log_request_revisions`](Self::log_request_revisions) would log.
+  /// The read happened once, inside the constructor's own exception
+  /// barrier; this returns the cached answer and sends no message.
   ///
   /// ```ignore
   /// let poser = BodyPoser::new(&AppleVisionBodyPoserOptions::new())?;
@@ -233,13 +256,8 @@ impl BodyPoser {
   /// assert_eq!(revisions.to_string(), "body_pose@1,body_pose_3d@1");
   /// # Ok::<(), avanalyze::AnalyzeError>(())
   /// ```
-  pub fn revisions(&self) -> Revisions<2> {
-    unsafe {
-      Revisions::new([
-        ("body_pose", self.pose_2d.revision()),
-        ("body_pose_3d", self.pose_3d.revision()),
-      ])
-    }
+  pub fn revisions(&self) -> Revisions<BodyPoserRevisions, 2> {
+    self.revisions
   }
 
   /// Detects 2-D human body poses in `jpeg_data`.
@@ -546,7 +564,13 @@ impl BodyPoser {
 
 /// The two named getters [`BodyPoser::revisions`] returns, in the same
 /// order [`Display`](std::fmt::Display) and [`IntoIterator`] walk.
-impl Revisions<2> {
+///
+/// They are reachable only through
+/// [`BodyPoserRevisions`](crate::BodyPoserRevisions).
+/// [`PersonMasker`](crate::PersonMasker) owns two requests as well and
+/// does not inherit them — that is what the producer marker buys.
+#[cfg(target_vendor = "apple")]
+impl Revisions<BodyPoserRevisions, 2> {
   /// The pinned revision of the 2-D body-pose request.
   pub const fn body_pose(&self) -> usize {
     self.entries[0].1

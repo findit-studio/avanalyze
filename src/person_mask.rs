@@ -21,6 +21,10 @@ use crate::ffi::{
   sanitize_confidence,
 };
 use crate::{AnalyzeError, AppleVisionPersonMaskerOptions, BoundingBox, PixelPlane};
+// The revision roster is an Apple-only surface: this crate does not
+// support non-Apple targets, it only keeps compiling there.
+#[cfg(target_vendor = "apple")]
+use crate::{PersonMaskerRevisions, Revisions};
 
 /// Upper bound on a single mask payload (post-packing, 8 bits per
 /// pixel) before we refuse to allocate. 64 MiB covers any sane image
@@ -140,6 +144,10 @@ pub trait PersonSegmentationMask: Sized {
 pub struct PersonMasker {
   instances: Retained<VNGeneratePersonInstanceMaskRequest>,
   segmentation: Retained<VNGeneratePersonSegmentationRequest>,
+  /// Read back from the two requests above inside the same guarded
+  /// closure that pinned them, so the public reader sends no message
+  /// of its own.
+  revisions: Revisions<PersonMaskerRevisions, 2>,
 }
 
 #[cfg(target_vendor = "apple")]
@@ -168,9 +176,19 @@ impl PersonMasker {
       let segmentation = VNGeneratePersonSegmentationRequest::new();
       segmentation.setRevision(VNGeneratePersonSegmentationRequestRevision1);
 
+      // Read back here, inside the barrier that already spans every
+      // send this constructor makes, so no public reader has to send
+      // a message — and so the numbers still come from the request
+      // objects rather than from a second copy of the constants above.
+      let revisions = Revisions::new([
+        ("person_instance_mask", instances.revision()),
+        ("person_segmentation", segmentation.revision()),
+      ]);
+
       Self {
         instances,
         segmentation,
+        revisions,
       }
     })
   }
@@ -178,16 +196,44 @@ impl PersonMasker {
   /// Logs the pinned revision of both mask requests.
   ///
   /// A revision drift changes mask geometry **silently** — same API,
-  /// different pixels.
+  /// different pixels. [`revisions`](Self::revisions) is the reader
+  /// this renders — the two never fall out of step because there is
+  /// only one spelling of the revisions themselves.
   #[cfg(feature = "tracing")]
   pub fn log_request_revisions(&self) {
-    unsafe {
-      tracing::info!(
-        person_instance_mask_rev = self.instances.revision(),
-        person_segmentation_rev = self.segmentation.revision(),
-        "initialized pinned Apple Vision request revisions"
-      );
-    }
+    tracing::info!(
+      revisions = %self.revisions,
+      "initialized pinned Apple Vision request revisions"
+    );
+  }
+
+  /// The two Vision request revisions this masker pinned at
+  /// construction — per-instance masks, then whole-frame segmentation.
+  ///
+  /// Every value was read back from the request object itself — never
+  /// from a second constant kept beside the `setRevision` call it
+  /// pinned — so it can never disagree with what
+  /// [`log_request_revisions`](Self::log_request_revisions) would log.
+  /// The read happened once, inside the constructor's own exception
+  /// barrier; this returns the cached answer and sends no message.
+  ///
+  /// This masker owns two requests, exactly as
+  /// [`BodyPoser`](crate::BodyPoser) does, and the two rosters share no
+  /// getter: the producer is a type parameter on
+  /// [`Revisions`](crate::Revisions), not a request count.
+  ///
+  /// ```ignore
+  /// let masker = PersonMasker::new(&AppleVisionPersonMaskerOptions::new())?;
+  /// let revisions = masker.revisions();
+  /// assert_eq!(revisions.person_instance_mask(), 1);
+  /// assert_eq!(
+  ///   revisions.to_string(),
+  ///   "person_instance_mask@1,person_segmentation@1"
+  /// );
+  /// # Ok::<(), avanalyze::AnalyzeError>(())
+  /// ```
+  pub fn revisions(&self) -> Revisions<PersonMaskerRevisions, 2> {
+    self.revisions
   }
 
   /// Generates one mask per detected person instance in `jpeg_data`.
@@ -965,6 +1011,27 @@ pub(crate) fn normalized_bbox_from_pixel_bounds<B: BoundingBox>(
     return None;
   }
   B::try_new(left, top, w, h).ok()
+}
+
+/// The two named getters [`PersonMasker::revisions`] returns, in the
+/// same order [`Display`](std::fmt::Display) and [`IntoIterator`] walk.
+///
+/// They are reachable only through
+/// [`PersonMaskerRevisions`](crate::PersonMaskerRevisions).
+/// [`BodyPoser`](crate::BodyPoser) owns two requests as well and does
+/// not inherit them — that is what the producer marker buys.
+#[cfg(target_vendor = "apple")]
+impl Revisions<PersonMaskerRevisions, 2> {
+  /// The pinned revision of the per-person instance-mask request.
+  pub const fn person_instance_mask(&self) -> usize {
+    self.entries[0].1
+  }
+
+  /// The pinned revision of the whole-frame person-segmentation
+  /// request.
+  pub const fn person_segmentation(&self) -> usize {
+    self.entries[1].1
+  }
 }
 
 /// Non-macOS stub for [`PersonMasker`].

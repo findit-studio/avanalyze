@@ -3,7 +3,8 @@
 
 use crate::{
   AnalyzeOptions, AppleVisionBarcodeOptions, AppleVisionBodyPoserOptions, AppleVisionFaceOptions,
-  AppleVisionTextOptions, BarcodeDetector, BodyPoser, FaceDetector, TextRecognizer, VisionAnalyzer,
+  AppleVisionPersonMaskerOptions, AppleVisionTextOptions, BarcodeDetector, BodyPoser, FaceDetector,
+  PersonMasker, TextRecognizer, VisionAnalyzer,
 };
 
 /// [`VisionAnalyzer::revisions`]'s eight named getters and its
@@ -82,4 +83,29 @@ fn body_poser_revisions_match_the_pinned_constants() {
   assert_eq!(revisions.body_pose(), 1);
   assert_eq!(revisions.body_pose_3d(), 1);
   assert_eq!(revisions.to_string(), "body_pose@1,body_pose_3d@1");
+}
+
+/// [`PersonMasker::revisions`]'s two named getters and its `Display`
+/// both read back [`PersonMasker::new`]'s own `setRevision` calls.
+///
+/// This masker owns two requests, exactly as [`BodyPoser`] does. The
+/// getters asserted here are its own and the test above asserts a
+/// disjoint pair on the same arity, which is the property the producer
+/// marker exists to hold: were `Revisions` keyed by request count
+/// alone, one of these two rosters would answer to the other's names.
+/// A build of this file is the proof — `person_instance_mask` does not
+/// resolve on a `BodyPoser` roster, and `body_pose` does not resolve
+/// here.
+#[test]
+fn person_masker_revisions_match_the_pinned_constants() {
+  let masker = PersonMasker::new(&AppleVisionPersonMaskerOptions::new())
+    .expect("PersonMasker::new builds its Vision requests on this host");
+  let revisions = masker.revisions();
+
+  assert_eq!(revisions.person_instance_mask(), 1);
+  assert_eq!(revisions.person_segmentation(), 1);
+  assert_eq!(
+    revisions.to_string(),
+    "person_instance_mask@1,person_segmentation@1"
+  );
 }

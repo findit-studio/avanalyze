@@ -22,9 +22,13 @@ use crate::{
   },
 };
 
+use crate::AnalyzeError;
 #[cfg(not(target_vendor = "apple"))]
 use crate::{Analysis, AnalyzeOptions};
-use crate::{AnalyzeError, Revisions};
+// The revision roster is an Apple-only surface: this crate does not
+// support non-Apple targets, it only keeps compiling there.
+#[cfg(target_vendor = "apple")]
+use crate::{Revisions, VisionAnalyzerRevisions};
 
 /// Hard ceiling on labels per recognised-animal observation.
 #[cfg(target_vendor = "apple")]
@@ -75,6 +79,10 @@ struct VisionRequests {
   horizon: Retained<VNDetectHorizonRequest>,
   document_segments: Retained<VNDetectDocumentSegmentationRequest>,
   aesthetics: Retained<VNCalculateImageAestheticsScoresRequest>,
+  /// Read back from the eight requests above inside the same guarded
+  /// closure that pinned them, so the public reader sends no message
+  /// of its own.
+  revisions: Revisions<VisionAnalyzerRevisions, 8>,
 }
 
 #[cfg(target_vendor = "apple")]
@@ -113,6 +121,21 @@ impl VisionRequests {
       let aesthetics = VNCalculateImageAestheticsScoresRequest::new();
       aesthetics.setRevision(VNCalculateImageAestheticsScoresRequestRevision1);
 
+      // Read back here, inside the barrier that already spans every
+      // send this constructor makes, so no public reader has to send
+      // a message — and so the numbers still come from the request
+      // objects rather than from a second copy of the constants above.
+      let revisions = Revisions::new([
+        ("classify", classify.revision()),
+        ("human_rectangles", human_rectangles.revision()),
+        ("animals", animals.revision()),
+        ("attention_saliency", attention_saliency.revision()),
+        ("objectness_saliency", objectness_saliency.revision()),
+        ("horizon", horizon.revision()),
+        ("document_segments", document_segments.revision()),
+        ("aesthetics", aesthetics.revision()),
+      ]);
+
       Self {
         classify,
         human_rectangles,
@@ -122,6 +145,7 @@ impl VisionRequests {
         horizon,
         document_segments,
         aesthetics,
+        revisions,
       }
     })
   }
@@ -180,7 +204,7 @@ impl VisionAnalyzer {
   #[cfg(feature = "tracing")]
   pub fn log_request_revisions(&self) {
     tracing::info!(
-      revisions = %self.revisions(),
+      revisions = %self.requests.revisions,
       "initialized pinned Apple Vision request revisions"
     );
   }
@@ -189,10 +213,12 @@ impl VisionAnalyzer {
   /// construction, one entry per request, in the order the constructor
   /// set them.
   ///
-  /// Every value is read back from the request object itself — never
+  /// Every value was read back from the request object itself — never
   /// from a second constant kept beside the `setRevision` call it
   /// pinned — so it can never disagree with what
   /// [`log_request_revisions`](Self::log_request_revisions) would log.
+  /// The read happened once, inside the constructor's own exception
+  /// barrier; this returns the cached answer and sends no message.
   ///
   /// ```ignore
   /// let analyzer = VisionAnalyzer::new(&AnalyzeOptions::new())?;
@@ -205,31 +231,8 @@ impl VisionAnalyzer {
   /// );
   /// # Ok::<(), avanalyze::AnalyzeError>(())
   /// ```
-  pub fn revisions(&self) -> Revisions<8> {
-    unsafe {
-      Revisions::new([
-        ("classify", self.requests.classify.revision()),
-        (
-          "human_rectangles",
-          self.requests.human_rectangles.revision(),
-        ),
-        ("animals", self.requests.animals.revision()),
-        (
-          "attention_saliency",
-          self.requests.attention_saliency.revision(),
-        ),
-        (
-          "objectness_saliency",
-          self.requests.objectness_saliency.revision(),
-        ),
-        ("horizon", self.requests.horizon.revision()),
-        (
-          "document_segments",
-          self.requests.document_segments.revision(),
-        ),
-        ("aesthetics", self.requests.aesthetics.revision()),
-      ])
-    }
+  pub fn revisions(&self) -> Revisions<VisionAnalyzerRevisions, 8> {
+    self.requests.revisions
   }
 
   /// Runs the eight core Vision requests against `jpeg_data` and
@@ -640,7 +643,12 @@ impl VisionAnalyzer {
 /// The eight named getters [`VisionAnalyzer::revisions`] returns, one
 /// per request, in the same order [`Display`](std::fmt::Display) and
 /// [`IntoIterator`] walk.
-impl Revisions<8> {
+///
+/// They are reachable only through
+/// [`VisionAnalyzerRevisions`](crate::VisionAnalyzerRevisions), so no
+/// other producer that happens to own eight requests can inherit them.
+#[cfg(target_vendor = "apple")]
+impl Revisions<VisionAnalyzerRevisions, 8> {
   /// The pinned revision of the classification request.
   pub const fn classify(&self) -> usize {
     self.entries[0].1

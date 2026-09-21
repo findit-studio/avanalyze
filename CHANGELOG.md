@@ -11,18 +11,26 @@ had a capability and a kit but no way to name which revision of it ran.
 
 ### Added
 
-- **`Revisions<const N: usize>`, and a reader on every multi-request entry
-  point.** `VisionAnalyzer::revisions() -> Revisions<8>`,
-  `FaceDetector::revisions() -> Revisions<3>` and
-  `BodyPoser::revisions() -> Revisions<2>` each return the revisions they
-  pinned at construction, one entry per request, in construction order.
-  `Revisions` is one type shared by all three rather than a bespoke struct
-  per entry point: it renders through `Display` as
+- **`Revisions<P, const N: usize>`, and a reader on every multi-request entry
+  point.** `VisionAnalyzer::revisions() -> Revisions<VisionAnalyzerRevisions, 8>`,
+  `FaceDetector::revisions() -> Revisions<FaceDetectorRevisions, 3>`,
+  `BodyPoser::revisions() -> Revisions<BodyPoserRevisions, 2>` and
+  `PersonMasker::revisions() -> Revisions<PersonMaskerRevisions, 2>` each
+  return the revisions they pinned at construction, one entry per request, in
+  construction order. `Revisions` is one type shared by all four rather than a
+  bespoke struct per entry point: it renders through `Display` as
   `<request>@<revision>,<request>@<revision>,…`, walks the same list through
-  `IntoIterator<Item = (&'static str, usize)>`, and — because `N` differs per
-  producer — each entry point also gets its requests back by name as an
-  inherent method (`revisions.classify()`, `revisions.face_landmarks()`,
-  `revisions.body_pose_3d()`, and so on).
+  `IntoIterator<Item = (&'static str, usize)>`, and each entry point also gets
+  its requests back by name as an inherent method (`revisions.classify()`,
+  `revisions.face_landmarks()`, `revisions.body_pose_3d()`, and so on).
+
+  **The producer is a type parameter, not a request count.** `P` is a
+  zero-size marker — `VisionAnalyzerRevisions`, `FaceDetectorRevisions`,
+  `BodyPoserRevisions`, `PersonMaskerRevisions` — so the named getters belong
+  to the entry point that pinned the roster. `BodyPoser` and `PersonMasker`
+  both own exactly two requests; keyed by count alone they would have shared
+  one set of getters, and a mask roster would have answered `body_pose()` with
+  a person-segmentation revision.
 
   `BarcodeDetector` and `TextRecognizer` each own exactly one request, so
   they get no wrapper: `BarcodeDetector::revision() -> usize` and
@@ -31,8 +39,14 @@ had a capability and a kit but no way to name which revision of it ran.
   Every value is read back from the request object's own `revision()` after
   `setRevision` pinned it — never from a second constant kept beside that
   call — so a reader can never drift from what the request itself would
-  answer, and `log_request_revisions` on all five entry points now renders
-  through the same reader instead of spelling the fields out a second time.
+  answer. The read happens **once, inside the constructor's own exception
+  barrier**, and every reader returns that cached answer, so none of them
+  sends an Objective-C message of its own or can let a Vision raise cross into
+  Rust. `log_request_revisions` on all six entry points now renders the same
+  cached roster instead of spelling the fields out a second time.
+
+  The readers are `cfg(target_vendor = "apple")`, like the requests they
+  report on: this crate targets Apple and merely keeps compiling elsewhere.
 
 ### Behaviour
 

@@ -47,6 +47,9 @@ pub trait BarcodeDetection: Sized {
 #[derive(Debug)]
 pub struct BarcodeDetector {
   request: Retained<VNDetectBarcodesRequest>,
+  /// Read back from the request above inside the same guarded closure
+  /// that pinned it, so the public reader sends no message of its own.
+  revision: usize,
 }
 
 #[cfg(target_vendor = "apple")]
@@ -68,12 +71,17 @@ impl BarcodeDetector {
   /// be declined, before any frame has been handed to it.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn new(_options: &AppleVisionBarcodeOptions) -> Result<Self, AnalyzeError> {
-    let request = guard_native("BarcodeDetector::new", || unsafe {
+    let (request, revision) = guard_native("BarcodeDetector::new", || unsafe {
       let request = VNDetectBarcodesRequest::new();
       request.setRevision(VNDetectBarcodesRequestRevision4);
-      request
+      // Read back here, inside the barrier that already spans every
+      // send this constructor makes, so the public reader has to send
+      // none — and so the number still comes from the request object
+      // rather than from a second copy of the constant above.
+      let revision = request.revision();
+      (request, revision)
     })?;
-    Ok(Self { request })
+    Ok(Self { request, revision })
   }
 
   /// Logs the pinned revision of the barcode request.
@@ -85,7 +93,7 @@ impl BarcodeDetector {
   #[cfg(feature = "tracing")]
   pub fn log_request_revisions(&self) {
     tracing::info!(
-      barcodes_rev = self.revision(),
+      barcodes_rev = self.revision,
       "initialized pinned Apple Vision request revisions"
     );
   }
@@ -94,7 +102,9 @@ impl BarcodeDetector {
   /// request object [`new`](Self::new) called `setRevision` on — never
   /// from a second constant kept beside that call, so this can never
   /// disagree with what [`log_request_revisions`](Self::log_request_revisions)
-  /// would log.
+  /// would log. The read happened once, inside the constructor's own
+  /// exception barrier; this returns the cached answer and sends no
+  /// message.
   ///
   /// A single detector owns a single request, so there is no roster to
   /// name: unlike [`VisionAnalyzer::revisions`](crate::VisionAnalyzer::revisions)
@@ -106,8 +116,8 @@ impl BarcodeDetector {
   /// assert_eq!(detector.revision(), 4);
   /// # Ok::<(), avanalyze::AnalyzeError>(())
   /// ```
-  pub fn revision(&self) -> usize {
-    unsafe { self.request.revision() }
+  pub const fn revision(&self) -> usize {
+    self.revision
   }
 
   /// Decodes every barcode in `jpeg_data`.

@@ -15,7 +15,11 @@ use objc2_vision::*;
 #[cfg(target_vendor = "apple")]
 use smol_str::SmolStr;
 
-use crate::{AnalyzeError, AppleVisionFaceOptions, BoundingBox, PixelPlane, Revisions};
+use crate::{AnalyzeError, AppleVisionFaceOptions, BoundingBox, PixelPlane};
+// The revision roster is an Apple-only surface: this crate does not
+// support non-Apple targets, it only keeps compiling there.
+#[cfg(target_vendor = "apple")]
+use crate::{FaceDetectorRevisions, Revisions};
 #[cfg(target_vendor = "apple")]
 use crate::{
   face_landmarks::{
@@ -256,6 +260,10 @@ pub struct FaceDetector {
   rectangles: Retained<VNDetectFaceRectanglesRequest>,
   quality: Retained<VNDetectFaceCaptureQualityRequest>,
   landmarks: Retained<VNDetectFaceLandmarksRequest>,
+  /// Read back from the three requests above inside the same guarded
+  /// closure that pinned them, so the public reader sends no message
+  /// of its own.
+  revisions: Revisions<FaceDetectorRevisions, 3>,
 }
 
 #[cfg(target_vendor = "apple")]
@@ -287,10 +295,21 @@ impl FaceDetector {
       let landmarks = VNDetectFaceLandmarksRequest::new();
       landmarks.setRevision(VNDetectFaceLandmarksRequestRevision3);
 
+      // Read back here, inside the barrier that already spans every
+      // send this constructor makes, so no public reader has to send
+      // a message — and so the numbers still come from the request
+      // objects rather than from a second copy of the constants above.
+      let revisions = Revisions::new([
+        ("face_rectangles", rectangles.revision()),
+        ("face_quality", quality.revision()),
+        ("face_landmarks", landmarks.revision()),
+      ]);
+
       Self {
         rectangles,
         quality,
         landmarks,
+        revisions,
       }
     })
   }
@@ -305,7 +324,7 @@ impl FaceDetector {
   #[cfg(feature = "tracing")]
   pub fn log_request_revisions(&self) {
     tracing::info!(
-      revisions = %self.revisions(),
+      revisions = %self.revisions,
       "initialized pinned Apple Vision request revisions"
     );
   }
@@ -314,10 +333,12 @@ impl FaceDetector {
   /// construction — rectangles, capture quality, landmarks, in that
   /// order.
   ///
-  /// Every value is read back from the request object itself — never
+  /// Every value was read back from the request object itself — never
   /// from a second constant kept beside the `setRevision` call it
   /// pinned — so it can never disagree with what
   /// [`log_request_revisions`](Self::log_request_revisions) would log.
+  /// The read happened once, inside the constructor's own exception
+  /// barrier; this returns the cached answer and sends no message.
   ///
   /// ```ignore
   /// let detector = FaceDetector::new(&AppleVisionFaceOptions::new())?;
@@ -329,14 +350,8 @@ impl FaceDetector {
   /// );
   /// # Ok::<(), avanalyze::AnalyzeError>(())
   /// ```
-  pub fn revisions(&self) -> Revisions<3> {
-    unsafe {
-      Revisions::new([
-        ("face_rectangles", self.rectangles.revision()),
-        ("face_quality", self.quality.revision()),
-        ("face_landmarks", self.landmarks.revision()),
-      ])
-    }
+  pub fn revisions(&self) -> Revisions<FaceDetectorRevisions, 3> {
+    self.revisions
   }
 
   /// Detects every face in `jpeg_data`, one record per face.
@@ -784,7 +799,12 @@ impl FaceDetector {
 
 /// The three named getters [`FaceDetector::revisions`] returns, in the
 /// same order [`Display`](std::fmt::Display) and [`IntoIterator`] walk.
-impl Revisions<3> {
+///
+/// They are reachable only through
+/// [`FaceDetectorRevisions`](crate::FaceDetectorRevisions), so no other
+/// producer that happens to own three requests can inherit them.
+#[cfg(target_vendor = "apple")]
+impl Revisions<FaceDetectorRevisions, 3> {
   /// The pinned revision of the face-rectangles request.
   pub const fn face_rectangles(&self) -> usize {
     self.entries[0].1
