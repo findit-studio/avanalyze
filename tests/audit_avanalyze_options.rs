@@ -75,23 +75,80 @@ fn text_defaults() {
   let o = AppleVisionTextOptions::new();
   assert_eq!(o.min_text_len(), 1);
   assert_eq!(o.max_candidates_per_observation(), 1);
+  assert!(o.languages().is_empty());
+  assert!(o.detect_language());
+  assert_eq!(o.recognition_level(), TextRecognitionLevel::Accurate);
+  assert!(o.language_correction());
+  assert!(o.custom_words().is_empty());
+  assert_eq!(o.min_text_height(), 0.0);
+  assert_eq!(o.min_confidence(), 0.0);
+  assert_eq!(o.revision(), 3);
+  assert_eq!(
+    TextRecognitionLevel::default(),
+    TextRecognitionLevel::Accurate
+  );
 }
 
 #[test]
 fn text_builder() {
   let o = AppleVisionTextOptions::new()
     .with_min_text_len(3)
-    .with_max_candidates_per_observation(5);
+    .with_max_candidates_per_observation(5)
+    .with_languages(["zh-Hans", "ja-JP"])
+    .with_detect_language(false)
+    .with_recognition_level(TextRecognitionLevel::Fast)
+    .with_language_correction(false)
+    .with_custom_words(vec!["avanalyze".to_owned()])
+    .with_min_text_height(0.1)
+    .with_min_confidence(0.6)
+    .with_revision(2);
   assert_eq!(o.min_text_len(), 3);
   assert_eq!(o.max_candidates_per_observation(), 5);
+  assert_eq!(o.languages(), ["zh-Hans", "ja-JP"]);
+  assert!(!o.detect_language());
+  assert_eq!(o.recognition_level(), TextRecognitionLevel::Fast);
+  assert!(!o.language_correction());
+  assert_eq!(o.custom_words(), ["avanalyze"]);
+  assert_eq!(o.min_text_height(), 0.1);
+  assert_eq!(o.min_confidence(), 0.6);
+  assert_eq!(o.revision(), 2);
 }
 
 #[test]
 fn text_setter() {
   let mut o = AppleVisionTextOptions::new();
-  o.set_min_text_len(10).set_max_candidates_per_observation(3);
+  o.set_min_text_len(10)
+    .set_max_candidates_per_observation(3)
+    .set_languages(["ko-KR"])
+    .set_detect_language(false)
+    .set_recognition_level(TextRecognitionLevel::Fast)
+    .set_language_correction(false)
+    .set_custom_words(["avanalyze", "findit"])
+    .set_min_text_height(0.2)
+    .set_min_confidence(0.3)
+    .set_revision(1);
   assert_eq!(o.min_text_len(), 10);
   assert_eq!(o.max_candidates_per_observation(), 3);
+  assert_eq!(o.languages(), ["ko-KR"]);
+  assert!(!o.detect_language());
+  assert_eq!(o.recognition_level(), TextRecognitionLevel::Fast);
+  assert!(!o.language_correction());
+  assert_eq!(o.custom_words(), ["avanalyze", "findit"]);
+  assert_eq!(o.min_text_height(), 0.2);
+  assert_eq!(o.min_confidence(), 0.3);
+  assert_eq!(o.revision(), 1);
+
+  // A list set again replaces the one before; it does not append.
+  o.set_languages(Vec::<String>::new());
+  assert!(o.languages().is_empty());
+}
+
+#[test]
+fn text_default_trait_and_clone() {
+  let o = AppleVisionTextOptions::default().with_languages(["zh-Hant"]);
+  let cloned = o.clone();
+  assert_eq!(cloned.languages(), o.languages());
+  assert_eq!(format!("{cloned:?}"), format!("{o:?}"));
 }
 
 // ===== R26: BodyPose =====

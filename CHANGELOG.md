@@ -1,5 +1,106 @@
 # Changelog
 
+## Unreleased
+
+Text recognition reads the language the text is written in. `TextRecognizer`
+built its request at revision 3 and set nothing else, so Vision's defaults
+applied — an English-only roster, language detection off — and a Chinese banner
+came back as Latin letters, or not at all (avanalyze#40). The request's own
+properties are now options, set on the request when the recognizer is built,
+and the default turns language detection on.
+
+### Added
+
+- **`AppleVisionTextOptions` carries the text request's own properties.** Eight
+  fields join `min_text_len` and `max_candidates_per_observation`, each with a
+  `with_…` / `set_…` / getter triad, a serde default, and — the two lists
+  aside, which default to empty — a public `DEFAULT_…` constant:
+
+  | option | default | what it does |
+  |---|---|---|
+  | `languages: Vec<String>` | empty: Vision's own roster, English | `recognitionLanguages`, best first |
+  | `detect_language: bool` | `true` | `automaticallyDetectsLanguage`, revision 3 and later |
+  | `recognition_level: TextRecognitionLevel` | `Accurate` | `recognitionLevel` |
+  | `language_correction: bool` | `true` | `usesLanguageCorrection` |
+  | `custom_words: Vec<String>` | empty | `customWords` |
+  | `min_text_height: f32` | `0.0` | `minimumTextHeight`, a fraction of the image height |
+  | `revision: usize` | `3` | the request revision |
+  | `min_confidence: f32` | `0.0` | drops a reading Vision scored below it |
+
+  `TextRecognizer::new` sets the first seven on the request, once: they follow
+  the recognizer, not the call, as `HandPoser`'s `maximum_hand_count` already
+  did. `min_confidence` is a gate on what comes back and is read per call,
+  like the two gates before it. The names are the words mediagraph's text node
+  already uses for its engine tier — recognition level, language roster,
+  language correction, custom words, minimum text height, minimum confidence,
+  request revision — so that node can forward them as they are.
+
+  Every default on the request is Apple's own but one: `detect_language` is
+  `true` where Vision's is `false`. An empty roster or custom-word list is
+  never sent, so the request keeps what Vision built it with.
+
+- **`TextRecognitionLevel`** — `Accurate`, the default, or `Fast`, spelled
+  `"accurate"` and `"fast"` in a config. The fast level reads Latin-script
+  languages only. `#[non_exhaustive]`.
+
+- **`AnalyzeErrorKind::InvalidOptions`, and refusals by name.** Vision refuses
+  none of these itself, or not where anyone looks: handed a language it does
+  not list, or detection it cannot honour, it reads on its default roster and
+  reports success, and handed a revision it does not implement it fails every
+  frame, one at a time. `TextRecognizer::new` now refuses, naming the value:
+  - a `revision` the text request class does not list in its
+    `supportedRevisions` on this host — and names the ones it does;
+  - `detect_language = true` at revision 1 or 2, where Apple documents
+    detection as a no-op — and names what would be taken,
+    `detect_language = false`, or revision 3 where the host implements it;
+  - a tag in `languages` the request does not list in
+    `supportedRecognitionLanguages` for that revision and recognition level —
+    and names the ones it does. The match is exact. Vision lists `ja-JP`, so a
+    bare `ja` is refused: Vision does read some spellings it does not list,
+    but that is not something it promises, and a tag it silently ignores is
+    the very failure avanalyze#40 reported;
+  - a `min_confidence` or `min_text_height` outside `0..=1`, or not a number.
+
+  `recognize` and `recognize_pixels` refuse a per-call `min_confidence` outside
+  `0..=1` the same way, before the input is looked at. A Vision error in place
+  of the language list is `AnalyzeErrorKind::RequestFailed`.
+
+### Changed
+
+- **Language detection is on by default.** A recognizer built from
+  `AppleVisionTextOptions::new()` reads Chinese and Japanese where 0.7 read
+  Latin letters or nothing, and still reads English. A caller that wants 0.7's
+  request exactly sets `with_detect_language(false)`: every other default
+  leaves the request as Vision builds it.
+- **Breaking: `AppleVisionTextOptions` is no longer `Copy`.** The roster and the
+  custom words are lists. It is still `Clone`, and every entry point already
+  takes it by reference.
+- **Breaking: `AnalyzeErrorKind` has a fourth variant**, `InvalidOptions`. A
+  `match` with no wildcard arm needs one more.
+- **Breaking: `TextRecognizer` has one floor — macOS 13, iOS 16, tvOS 16,
+  visionOS 1 — checked once, first.** Its default revision 3 and its language
+  detection arrive there, and everything else its constructor sends predates
+  it: the request class is macOS 10.15, the language query macOS 12. Below the
+  floor `TextRecognizer::new` refuses with `AnalyzeErrorKind::Unsupported`,
+  naming it, before the request class is resolved — where 0.7 built a
+  revision-3 request that failed every call, and on a system without the class
+  panicked looking it up. `Unsupported` now means Vision is not available here,
+  or not in the version an entry point needs. Above the floor, revision 2 or 1
+  is still a choice, with `detect_language = false`.
+
+### Internal
+
+- **Core Text renders the text laws' page.** `src/tests/text.rs` sets a
+  Chinese, a Japanese and an English line into a Core Graphics bitmap with
+  Core Text and reads it through the pixel door, so no CJK fixture is vendored.
+  `objc2-core-text` joins the Apple-only dev-dependencies for it, with the
+  `objc2-core-foundation` features its attributed string needs.
+- **The class's revisions are asked of the class.** `supportedRevisions` is a
+  class property the objc2-vision binding declares once, on `VNRequest`; called
+  through it, the question reaches the base class, whose answer is not the text
+  request's. The constructor sends the message to `VNRecognizeTextRequest`
+  itself.
+
 ## 0.7.0 — 2026-09-21
 
 Every Vision request this crate builds pins a revision with `setRevision`, and

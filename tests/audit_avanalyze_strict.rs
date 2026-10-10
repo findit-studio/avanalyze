@@ -114,10 +114,31 @@ mod serde_coercion_tests {
       serde_json::from_str(r#"{"min_confidence": 0.2, "min_region_count": 3}"#).unwrap();
     assert_eq!(landmarks.min_region_count(), 3);
 
-    let text: AppleVisionTextOptions =
-      serde_json::from_str(r#"{"min_text_len": 5, "max_candidates_per_observation": 3}"#).unwrap();
+    let text: AppleVisionTextOptions = serde_json::from_str(
+      r#"{
+        "min_text_len": 5,
+        "max_candidates_per_observation": 3,
+        "languages": ["zh-Hans", "zh-Hant", "ja-JP", "en-US"],
+        "detect_language": false,
+        "recognition_level": "accurate",
+        "language_correction": false,
+        "custom_words": ["avanalyze"],
+        "min_text_height": 0.05,
+        "min_confidence": 0.5,
+        "revision": 3
+      }"#,
+    )
+    .unwrap();
     assert_eq!(text.min_text_len(), 5);
     assert_eq!(text.max_candidates_per_observation(), 3);
+    assert_eq!(text.languages(), ["zh-Hans", "zh-Hant", "ja-JP", "en-US"]);
+    assert!(!text.detect_language());
+    assert_eq!(text.recognition_level(), TextRecognitionLevel::Accurate);
+    assert!(!text.language_correction());
+    assert_eq!(text.custom_words(), ["avanalyze"]);
+    assert_eq!(text.min_text_height(), 0.05);
+    assert_eq!(text.min_confidence(), 0.5);
+    assert_eq!(text.revision(), 3);
 
     let barcodes: AppleVisionBarcodeOptions =
       serde_json::from_str(r#"{"min_confidence": 0.5, "min_payload_len": 5}"#).unwrap();

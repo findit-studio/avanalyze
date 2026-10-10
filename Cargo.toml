@@ -133,6 +133,13 @@ mediaschema = { version = "0.2", default-features = false, features = ["std", "v
 # `[dependencies]` so a consumer's build does not pull it.
 [target.'cfg(target_vendor = "apple")'.dev-dependencies]
 objc2-core-graphics = { version = "0.3", features = ["CGContext", "CGBitmapContext", "CGGeometry"] }
+# The text-language laws need a picture with Chinese and Japanese on it,
+# and the honest source of one is the system's own type engine: Core
+# Text sets the lines into the same Core Graphics bitmap context the
+# pixel-door tests already draw into, so no CJK fixture has to be
+# vendored, licensed, or trusted to say what it contains.
+objc2-core-foundation = { version = "0.3", features = ["CFAttributedString", "CFDictionary", "CFString"] }
+objc2-core-text = { version = "0.3", default-features = false, features = ["std", "CTFont", "CTLine", "CTStringAttributes", "objc2-core-graphics"] }
 
 [profile.bench]
 opt-level = 3
