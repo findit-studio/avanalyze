@@ -236,7 +236,7 @@ pub enum TextRecognitionLevel {
 /// | [`revision`](Self::revision) | `3` | `revision` — refused unless this host implements it |
 /// | [`recognition_level`](Self::recognition_level) | [`Accurate`](TextRecognitionLevel::Accurate) | `recognitionLevel` |
 /// | [`languages`](Self::languages) | empty: Vision's own roster | `recognitionLanguages` — refused unless the request lists every tag |
-/// | [`detect_language`](Self::detect_language) | `true` | `automaticallyDetectsLanguage` — refused where it cannot act: before macOS 13, or below revision 3 |
+/// | [`detect_language`](Self::detect_language) | `true` | `automaticallyDetectsLanguage` — refused below revision 3, where it cannot act |
 /// | [`language_correction`](Self::language_correction) | `true` | `usesLanguageCorrection` |
 /// | [`custom_words`](Self::custom_words) | empty | `customWords` |
 /// | [`min_text_height`](Self::min_text_height) | `0.0` | `minimumTextHeight` — refused outside `0..=1` |
@@ -420,12 +420,10 @@ impl AppleVisionTextOptions {
   ///
   /// It is what reads a picture whose language nobody named: with it on,
   /// the default English roster still reads Chinese and Japanese. Apple
-  /// added it in macOS 13 (iOS 16, tvOS 16) and documents it as a no-op
-  /// before revision 3. Asked for where it cannot act — on an older
-  /// system, or with revision 1 or 2 — it is refused by name when the
-  /// recognizer is built, rather than built and left to read English;
-  /// such a recognizer takes `false` and a roster that names its
-  /// languages.
+  /// documents it as a no-op before revision 3, so with revision 1 or 2
+  /// it is refused by name when the recognizer is built, rather than
+  /// built and left to read English; such a recognizer takes `false` and
+  /// a roster that names its languages.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn detect_language(&self) -> bool {
     self.detect_language
@@ -568,10 +566,9 @@ impl AppleVisionTextOptions {
   /// [`TextRecognizer::revision`](crate::TextRecognizer::revision) reports
   /// the one a recognizer runs. A revision this host's Vision does not
   /// implement (`supportedRevisions`) is refused by name when the
-  /// recognizer is built, rather than by every call after it. Revision 3
-  /// needs macOS 13; revisions 1 and 2 are deprecated since macOS 15, and
-  /// cannot detect a language, so below 3
-  /// [`detect_language`](Self::detect_language) must be `false`.
+  /// recognizer is built, rather than by every call after it. Revisions 1
+  /// and 2 are deprecated since macOS 15 and cannot detect a language, so
+  /// below 3 [`detect_language`](Self::detect_language) must be `false`.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn revision(&self) -> usize {
     self.revision

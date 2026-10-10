@@ -7,6 +7,13 @@
 //! The picture is set by Core Text, in the test, into the same kind of
 //! Core Graphics bitmap the pixel-door tests draw into: no fixture to
 //! vendor, and no doubt about what it says.
+//!
+//! One refusal has no law here. Below the recognizer's floor — macOS 13,
+//! iOS 16, tvOS 16, visionOS 1 — `TextRecognizer::new` refuses with
+//! `AnalyzeErrorKind::Unsupported` before anything is sent, and that
+//! branch cannot run on a system this suite runs on: every one of them
+//! is at or above the floor, as the laws below need it to be. It is not
+//! faked.
 
 use core::{convert::Infallible, ffi::c_void};
 
@@ -21,7 +28,7 @@ use objc2_vision::{
 
 use crate::{
   AnalyzeErrorKind, AppleVisionTextOptions, BoundingBox, PixelFormat, PixelPlane, TextDetection,
-  TextRecognitionLevel, TextRecognizer, text::languages_listed_by_class,
+  TextRecognitionLevel, TextRecognizer,
 };
 
 /// The Chinese line: "hello, world".
@@ -435,13 +442,8 @@ fn an_unimplemented_revision_is_refused_by_name() {
 ///
 /// Below revision 3 Apple documents detection as a no-op, so Vision
 /// would build the request and read on its English-only default roster:
-/// the reading this option exists to end, returned as a success. This
-/// arm runs here and in CI's lane, because both implement revision 2.
-///
-/// The other arm is a system without the property at all, before
-/// macOS 13. It cannot run on a host that has the property, and is not
-/// faked here: it is the same refusal, reached through
-/// `objc2::available!` instead of through the revision.
+/// the reading this option exists to end, returned as a success. It runs
+/// here and in CI's lane, because both implement revision 2.
 #[test]
 fn language_detection_where_it_cannot_act_is_refused_by_name() {
   let implemented = implemented_revisions();
@@ -503,45 +505,6 @@ fn revision_2_without_detection_and_with_a_roster_is_taken_and_reads_english() {
     read.contains(ENGLISH),
     "revision 2 reads the English line: {read}"
   );
-}
-
-/// The class method the roster check asks below macOS 12 lists what the
-/// instance method lists, at every revision and level this host
-/// implements.
-///
-/// The branch that asks it cannot run here: `objc2::available!` is true
-/// on every system this suite runs on, so the instance method answers in
-/// production and the branch is not faked. What can be checked is that
-/// the class method — Apple's source of the same list from macOS 10.15
-/// to 11 — gives the same answer wherever both exist. A host that no
-/// longer answers the deprecated method says so and stops: the branch
-/// never reaches such a host.
-#[test]
-fn the_class_method_lists_what_the_instance_method_lists() {
-  let class = VNRecognizeTextRequest::class();
-  if !class.metaclass().responds_to(objc2::sel!(
-    supportedRecognitionLanguagesForTextRecognitionLevel:revision:error:
-  )) {
-    eprintln!("this host's text request class no longer answers the pre-macOS-12 roster method");
-    return;
-  }
-  for revision in implemented_revisions() {
-    for level in [
-      VNRequestTextRecognitionLevel::Accurate,
-      VNRequestTextRecognitionLevel::Fast,
-    ] {
-      let by_class: Vec<String> = languages_listed_by_class(level, revision)
-        .expect("the class lists the languages its requests read")
-        .iter()
-        .map(|tag| tag.to_string())
-        .collect();
-      assert_eq!(
-        by_class,
-        listed_languages(revision, level),
-        "revision {revision}, {level:?}"
-      );
-    }
-  }
 }
 
 /// A language the request does not list, for its revision and its

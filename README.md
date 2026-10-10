@@ -78,7 +78,7 @@ Chinese or Japanese sign as Latin letters, or as nothing at all.
 | Option | Default | What it does |
 |---|---|---|
 | `languages` | empty: Vision's own roster, English | `recognitionLanguages`, best first |
-| `detect_language` | `true` | `automaticallyDetectsLanguage`; refused where it cannot act: before macOS 13, or below revision 3 |
+| `detect_language` | `true` | `automaticallyDetectsLanguage`; refused below revision 3, where it cannot act |
 | `recognition_level` | `"accurate"` | `recognitionLevel`; `"fast"` reads Latin-script languages only |
 | `language_correction` | `true` | `usesLanguageCorrection` |
 | `custom_words` | empty | `customWords` |
@@ -220,10 +220,10 @@ existed: nothing is newly broken, and nothing is quietly weakened.
 
 ## Requirements
 
-- macOS (Vision.framework is Apple-only). The text request's default revision 3
-  and its language detection need macOS 13; on an older host
-  `TextRecognizer::new` refuses both by name, and a recognizer there asks for
-  revision 2 or 1 with `detect_language = false` and a language roster.
+- macOS (Vision.framework is Apple-only). `TextRecognizer` needs macOS 13 (iOS
+  16, tvOS 16, visionOS 1): its default revision 3 and its language detection
+  start there, and below that floor `TextRecognizer::new` refuses with
+  `AnalyzeErrorKind::Unsupported`, naming it.
 - A working `objc2` toolchain (Xcode command-line tools).
 - Rust **1.95** or newer (edition 2024).
 

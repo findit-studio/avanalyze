@@ -1,5 +1,10 @@
 //! Text recognition: its own entry point, its own request, its own
 //! trait.
+//!
+//! The recognizer has one floor, checked once, before anything else:
+//! macOS 13, iOS 16, tvOS 16, visionOS 1 ([`TEXT_RECOGNIZER_FLOOR`]).
+//! Every message its constructor sends exists there, so nothing past
+//! that check is guarded again.
 
 #[cfg(target_vendor = "apple")]
 use objc2::{ClassType, msg_send, rc::Retained};
@@ -47,6 +52,30 @@ const MAX_LISTED_LANGUAGES: usize = 256;
 /// `supportedRevisions` index set, which names three on macOS 27.
 #[cfg(target_vendor = "apple")]
 const MAX_LISTED_REVISIONS: usize = 64;
+
+/// The oldest systems a [`TextRecognizer`] is built on: macOS 13, iOS 16,
+/// tvOS 16, visionOS 1. Below them, [`TextRecognizer::new`] refuses with
+/// [`AnalyzeErrorKind::Unsupported`], naming them.
+///
+/// The floor is where the recognizer's reason to exist arrives:
+/// `VNRecognizeTextRequestRevision3` — the default revision, and the
+/// only one that can detect a language — and `automaticallyDetectsLanguage`
+/// itself are both `API_AVAILABLE(macos(13.0), ios(16.0), tvos(16.0))` in
+/// `VNRecognizeTextRequest.h`, and visionOS has had both from its first
+/// release. Everything else the constructor sends predates it: the
+/// request class (macOS 10.15) and `supportedRecognitionLanguagesAndReturnError:`
+/// (macOS 12). One check at the floor therefore covers every message, and
+/// it runs before the class is resolved — below macOS 10.15 the class
+/// does not exist, and resolving it would panic.
+#[cfg(target_vendor = "apple")]
+const TEXT_RECOGNIZER_FLOOR: &str = "macOS 13, iOS 16, tvOS 16 or visionOS 1";
+
+/// Whether this system is at or above [`TEXT_RECOGNIZER_FLOOR`] — the same
+/// versions, written as the literals `available!` takes.
+#[cfg(target_vendor = "apple")]
+fn at_text_recognizer_floor() -> bool {
+  objc2::available!(macos = 13.0, ios = 16.0, tvos = 16.0, visionos = 1.0)
+}
 
 /// One recognised text run.
 ///
@@ -140,13 +169,12 @@ impl TextRecognizer {
   /// - a [`revision`](AppleVisionTextOptions::revision) the text
   ///   request class does not list in its `supportedRevisions` on this
   ///   host — the message names the ones it does;
-  /// - [`detect_language`](AppleVisionTextOptions::detect_language)
-  ///   where detection cannot act: on a system without it (before
-  ///   macOS 13, iOS 16, tvOS 16), or at a revision below 3, where Apple
-  ///   documents it as a no-op. Vision would build either request and
-  ///   read on its English-only default roster. The message names what
-  ///   would be taken: `detect_language = false`, or revision 3 where
-  ///   this host implements it;
+  /// - [`detect_language`](AppleVisionTextOptions::detect_language) at a
+  ///   revision below 3, where Apple documents detection as a no-op and
+  ///   Vision would build the request and read on its English-only
+  ///   default roster. The message names what would be taken:
+  ///   `detect_language = false`, or revision 3 where this host
+  ///   implements it;
   /// - a tag in [`languages`](AppleVisionTextOptions::languages) the
   ///   request does not list in `supportedRecognitionLanguages` for that
   ///   revision and recognition level — the message names the ones it
@@ -155,6 +183,10 @@ impl TextRecognizer {
   /// - a [`min_confidence`](AppleVisionTextOptions::min_confidence) or
   ///   [`min_text_height`](AppleVisionTextOptions::min_text_height)
   ///   outside `0..=1`, or not a number.
+  ///
+  /// [`AnalyzeErrorKind::Unsupported`] on a system older than the
+  /// recognizer's floor — macOS 13, iOS 16, tvOS 16, visionOS 1 — checked
+  /// first, before anything is sent: the message names the floor.
   ///
   /// [`AnalyzeErrorKind::RequestFailed`] when Vision answers an error
   /// instead of the language list a non-empty roster is checked against.
@@ -169,6 +201,15 @@ impl TextRecognizer {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn new(options: &AppleVisionTextOptions) -> Result<Self, AnalyzeError> {
     const SITE: &str = "TextRecognizer::new";
+    if !at_text_recognizer_floor() {
+      return Err(AnalyzeError::new(
+        AnalyzeErrorKind::Unsupported,
+        format!(
+          "{SITE}: this system is older than {TEXT_RECOGNIZER_FLOOR}, the oldest a text \
+           recognizer is built on"
+        ),
+      ));
+    }
     check_fraction(SITE, "min_confidence", options.min_confidence())?;
     check_fraction(SITE, "min_text_height", options.min_text_height())?;
     // Every send the request's configuration makes — the class's
@@ -386,26 +427,17 @@ fn configure(
   // build the request either way and read on its English-only default
   // roster — the very reading this option exists to end, returned as a
   // success.
-  if options.detect_language() {
+  if options.detect_language() && wanted < VNRecognizeTextRequestRevision3 {
     let instead = if implements(VNRecognizeTextRequestRevision3) {
       "set detect_language = false, or ask for revision 3, which this host implements"
     } else {
       "set detect_language = false and name the languages instead"
     };
-    if !detection_available() {
-      return Err(refusal(format!(
-        "TextRecognizer::new: detect_language is true, and this system's text request cannot \
-         detect a language — Apple added automatic language detection in macOS 13, iOS 16 and \
-         tvOS 16; {instead}"
-      )));
-    }
-    if wanted < VNRecognizeTextRequestRevision3 {
-      return Err(refusal(format!(
-        "TextRecognizer::new: detect_language is true, and revision {wanted} cannot detect a \
-         language — Apple documents automatic language detection as a no-op before revision 3; \
-         {instead}"
-      )));
-    }
+    return Err(refusal(format!(
+      "TextRecognizer::new: detect_language is true, and revision {wanted} cannot detect a \
+       language — Apple documents automatic language detection as a no-op before revision 3; \
+       {instead}"
+    )));
   }
 
   let request = VNRecognizeTextRequest::new();
@@ -414,7 +446,7 @@ fn configure(
   request.setRecognitionLevel(vision_level(level));
 
   if !options.languages().is_empty() {
-    let listed = listed_languages(&request, vision_level(level), wanted).map_err(|error| {
+    let listed = listed_languages(&request).map_err(|error| {
       // Through the bounded FFI-string helper, as `perform` reports an
       // NSError, so a pathological description cannot drive the
       // allocator into the abort path.
@@ -455,12 +487,7 @@ fn configure(
     request.setCustomWords(&ns_strings(options.custom_words()));
   }
   request.setMinimumTextHeight(options.min_text_height());
-  // Sent only where the property exists. Where it does not, a request
-  // asking for detection was refused above, and `false` is what a fresh
-  // request already holds.
-  if detection_available() {
-    request.setAutomaticallyDetectsLanguage(options.detect_language());
-  }
+  request.setAutomaticallyDetectsLanguage(options.detect_language());
 
   // Read back here, inside the barrier that already spans every send
   // this constructor makes, so the public reader has to send none —
@@ -470,57 +497,17 @@ fn configure(
   Ok((request, revision))
 }
 
-/// Whether this system's text request has `automaticallyDetectsLanguage`.
+/// The tags `request` lists for its revision and recognition level —
+/// `supportedRecognitionLanguagesAndReturnError:`, which answers for the
+/// request's configuration at the time it is asked.
 ///
-/// The versions are the header's own `API_AVAILABLE` for the property —
-/// macOS 13, iOS 16, tvOS 16 — and visionOS, which has had it from its
-/// first release. Below them the selector does not exist: sending it
-/// would raise.
-#[cfg(target_vendor = "apple")]
-fn detection_available() -> bool {
-  objc2::available!(macos = 13.0, ios = 16.0, tvos = 16.0, visionos = 1.0)
-}
-
-/// The tags `request` lists for its `level` and `revision` —
-/// `supportedRecognitionLanguages` — asked the way this system can be
-/// asked.
-///
-/// The instance method is macOS 12, iOS 15 and tvOS 15. Below that, the
-/// same question goes to the class method it replaced, which Apple
-/// shipped from macOS 10.15 and deprecated at 12, so the roster check
-/// runs on every system this crate builds for. No deployment target is
-/// set for this crate, so its floor is the toolchain's: macOS 11 on
-/// Apple silicon, 10.12 on Intel — both below the instance method.
+/// The method is macOS 12, iOS 15 and tvOS 15, below
+/// [`TEXT_RECOGNIZER_FLOOR`], so every recognizer's system has it.
 #[cfg(target_vendor = "apple")]
 fn listed_languages(
   request: &VNRecognizeTextRequest,
-  level: VNRequestTextRecognitionLevel,
-  revision: usize,
 ) -> Result<Retained<NSArray<NSString>>, Retained<NSError>> {
-  if objc2::available!(macos = 12.0, ios = 15.0, tvos = 15.0, visionos = 1.0) {
-    unsafe { request.supportedRecognitionLanguagesAndReturnError() }
-  } else {
-    languages_listed_by_class(level, revision)
-  }
-}
-
-/// The class method's answer to which tags a text request at `level`
-/// and `revision` lists — the source [`listed_languages`] asks below
-/// macOS 12.
-///
-/// Declared by the binding on the text request class itself, so the
-/// question reaches that class and not a superclass.
-#[cfg(target_vendor = "apple")]
-#[allow(deprecated)]
-pub(crate) fn languages_listed_by_class(
-  level: VNRequestTextRecognitionLevel,
-  revision: usize,
-) -> Result<Retained<NSArray<NSString>>, Retained<NSError>> {
-  unsafe {
-    VNRecognizeTextRequest::supportedRecognitionLanguagesForTextRecognitionLevel_revision_error(
-      level, revision,
-    )
-  }
+  unsafe { request.supportedRecognitionLanguagesAndReturnError() }
 }
 
 /// Vision's spelling of a recognition level.
