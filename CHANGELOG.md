@@ -19,7 +19,7 @@ and the default turns language detection on.
   | option | default | what it does |
   |---|---|---|
   | `languages: Vec<String>` | empty: Vision's own roster, English | `recognitionLanguages`, best first |
-  | `detect_language: bool` | `true` | `automaticallyDetectsLanguage`, macOS 13 and later |
+  | `detect_language: bool` | `true` | `automaticallyDetectsLanguage`, macOS 13 and later, revision 3 and later |
   | `recognition_level: TextRecognitionLevel` | `Accurate` | `recognitionLevel` |
   | `language_correction: bool` | `true` | `usesLanguageCorrection` |
   | `custom_words: Vec<String>` | empty | `customWords` |
@@ -45,11 +45,15 @@ and the default turns language detection on.
 
 - **`AnalyzeErrorKind::InvalidOptions`, and refusals by name.** Vision refuses
   none of these itself, or not where anyone looks: handed a language it does
-  not list it reads as though the tag were not there and reports success, and
-  handed a revision it does not implement it fails every frame, one at a time.
-  `TextRecognizer::new` now refuses, naming the value:
+  not list, or detection it cannot honour, it reads on its default roster and
+  reports success, and handed a revision it does not implement it fails every
+  frame, one at a time. `TextRecognizer::new` now refuses, naming the value:
   - a `revision` the text request class does not list in its
     `supportedRevisions` on this host — and names the ones it does;
+  - `detect_language = true` where detection cannot act: on a system without
+    it (before macOS 13, iOS 16, tvOS 16), or at revision 1 or 2, where Apple
+    documents it as a no-op — and names what would be taken,
+    `detect_language = false`, or revision 3 where the host implements it;
   - a tag in `languages` the request does not list in
     `supportedRecognitionLanguages` for that revision and recognition level —
     and names the ones it does. The match is exact. Vision lists `ja-JP`, so a
@@ -77,12 +81,8 @@ and the default turns language detection on.
 - **The text revision is checked when the recognizer is built.** On a host
   whose Vision does not implement revision 3 — before macOS 13 —
   `TextRecognizer::new` with the defaults refuses by name, where 0.7 built a
-  request whose every call failed.
-- **On a system without language detection** — before macOS 13, iOS 16,
-  tvOS 16 — the request is built without it, and with the `tracing` feature
-  that is said once per process. Apple documents the property as a no-op before
-  revision 3, and a recognizer asking for detection at revision 1 or 2 says
-  that once too.
+  request whose every call failed. A recognizer there asks for revision 2 or 1
+  with `detect_language = false` and a language roster.
 
 ### Internal
 
@@ -96,6 +96,14 @@ and the default turns language detection on.
   through it, the question reaches the base class, whose answer is not the text
   request's. The constructor sends the message to `VNRecognizeTextRequest`
   itself.
+- **The roster check runs on every system the crate builds for.** No
+  deployment target is set, so the floor is the toolchain's: macOS 11 on Apple
+  silicon, 10.12 on Intel. `supportedRecognitionLanguagesAndReturnError:` is
+  macOS 12, so below it the check asks the class method it replaced,
+  `+supportedRecognitionLanguagesForTextRecognitionLevel:revision:error:`
+  (macOS 10.15, deprecated at 12). That branch cannot run on a host the suite
+  runs on; a law checks that the class method lists exactly what the instance
+  method lists at every revision and level the host implements.
 
 ## 0.7.0 — 2026-09-21
 

@@ -21,7 +21,7 @@ use objc2_vision::{
 
 use crate::{
   AnalyzeErrorKind, AppleVisionTextOptions, BoundingBox, PixelFormat, PixelPlane, TextDetection,
-  TextRecognitionLevel, TextRecognizer,
+  TextRecognitionLevel, TextRecognizer, text::languages_listed_by_class,
 };
 
 /// The Chinese line: "hello, world".
@@ -386,6 +386,9 @@ fn the_request_carries_what_the_options_say() {
 
 /// Every revision the host implements is taken, and is the revision the
 /// request then runs — read off the request, not off the options.
+///
+/// Below revision 3 the options also turn detection off, which those
+/// revisions cannot do; that refusal has its own law.
 #[test]
 fn every_implemented_revision_is_the_one_the_request_runs() {
   let revisions = implemented_revisions();
@@ -394,7 +397,10 @@ fn every_implemented_revision_is_the_one_the_request_runs() {
     "the default revision is implemented on any host this suite runs on: {revisions:?}"
   );
   for revision in revisions {
-    let recognizer = TextRecognizer::new(&AppleVisionTextOptions::new().with_revision(revision))
+    let options = AppleVisionTextOptions::new()
+      .with_revision(revision)
+      .with_detect_language(revision >= VNRecognizeTextRequestRevision3);
+    let recognizer = TextRecognizer::new(&options)
       .unwrap_or_else(|error| panic!("revision {revision} is implemented and must build: {error}"));
     assert_eq!(recognizer.revision(), revision);
     // SAFETY: a plain property read on a live request.
@@ -421,6 +427,120 @@ fn an_unimplemented_revision_is_refused_by_name() {
       message.ends_with(&format!("it implements {implemented}")),
       "and the ones the host implements: {message}"
     );
+  }
+}
+
+/// Language detection asked for where it cannot act is refused by name,
+/// with what would be taken instead.
+///
+/// Below revision 3 Apple documents detection as a no-op, so Vision
+/// would build the request and read on its English-only default roster:
+/// the reading this option exists to end, returned as a success. This
+/// arm runs here and in CI's lane, because both implement revision 2.
+///
+/// The other arm is a system without the property at all, before
+/// macOS 13. It cannot run on a host that has the property, and is not
+/// faked here: it is the same refusal, reached through
+/// `objc2::available!` instead of through the revision.
+#[test]
+fn language_detection_where_it_cannot_act_is_refused_by_name() {
+  let implemented = implemented_revisions();
+  let below: Vec<usize> = implemented
+    .iter()
+    .copied()
+    .filter(|revision| *revision < VNRecognizeTextRequestRevision3)
+    .collect();
+  assert!(
+    below.contains(&2),
+    "revision 2 is implemented on any host this suite runs on: {implemented:?}"
+  );
+  for revision in below {
+    for options in [
+      AppleVisionTextOptions::new().with_revision(revision),
+      AppleVisionTextOptions::new()
+        .with_revision(revision)
+        .with_languages(["en-US"]),
+    ] {
+      let message = refused(&options);
+      assert!(
+        message.contains(&format!(
+          "detect_language is true, and revision {revision} cannot detect a language"
+        )),
+        "the refusal names the option and the revision: {message}"
+      );
+      assert!(
+        message.ends_with(
+          "set detect_language = false, or ask for revision 3, which this host implements"
+        ),
+        "and what would be taken: {message}"
+      );
+    }
+  }
+}
+
+/// The other side of that refusal: without detection, revision 2 and a
+/// roster it lists are taken, and the request runs at revision 2 and
+/// reads the English line.
+#[test]
+fn revision_2_without_detection_and_with_a_roster_is_taken_and_reads_english() {
+  let options = AppleVisionTextOptions::new()
+    .with_revision(2)
+    .with_detect_language(false)
+    .with_languages(["en-US"]);
+  let recognizer =
+    TextRecognizer::new(&options).expect("revision 2, without detection, with a listed roster");
+  assert_eq!(recognizer.revision(), 2);
+  assert_eq!(roster(recognizer.request()), ["en-US"]);
+  assert!(!recognizer.request().automaticallyDetectsLanguage());
+
+  let pixels = page();
+  let read = joined(
+    &recognizer
+      .recognize_pixels::<Reading>(&plane(&pixels), &options)
+      .expect("the pixel door must return Ok"),
+  );
+  assert!(
+    read.contains(ENGLISH),
+    "revision 2 reads the English line: {read}"
+  );
+}
+
+/// The class method the roster check asks below macOS 12 lists what the
+/// instance method lists, at every revision and level this host
+/// implements.
+///
+/// The branch that asks it cannot run here: `objc2::available!` is true
+/// on every system this suite runs on, so the instance method answers in
+/// production and the branch is not faked. What can be checked is that
+/// the class method — Apple's source of the same list from macOS 10.15
+/// to 11 — gives the same answer wherever both exist. A host that no
+/// longer answers the deprecated method says so and stops: the branch
+/// never reaches such a host.
+#[test]
+fn the_class_method_lists_what_the_instance_method_lists() {
+  let class = VNRecognizeTextRequest::class();
+  if !class.metaclass().responds_to(objc2::sel!(
+    supportedRecognitionLanguagesForTextRecognitionLevel:revision:error:
+  )) {
+    eprintln!("this host's text request class no longer answers the pre-macOS-12 roster method");
+    return;
+  }
+  for revision in implemented_revisions() {
+    for level in [
+      VNRequestTextRecognitionLevel::Accurate,
+      VNRequestTextRecognitionLevel::Fast,
+    ] {
+      let by_class: Vec<String> = languages_listed_by_class(level, revision)
+        .expect("the class lists the languages its requests read")
+        .iter()
+        .map(|tag| tag.to_string())
+        .collect();
+      assert_eq!(
+        by_class,
+        listed_languages(revision, level),
+        "revision {revision}, {level:?}"
+      );
+    }
   }
 }
 

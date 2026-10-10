@@ -78,7 +78,7 @@ Chinese or Japanese sign as Latin letters, or as nothing at all.
 | Option | Default | What it does |
 |---|---|---|
 | `languages` | empty: Vision's own roster, English | `recognitionLanguages`, best first |
-| `detect_language` | `true` | `automaticallyDetectsLanguage` (macOS 13 and later) |
+| `detect_language` | `true` | `automaticallyDetectsLanguage`; refused where it cannot act: before macOS 13, or below revision 3 |
 | `recognition_level` | `"accurate"` | `recognitionLevel`; `"fast"` reads Latin-script languages only |
 | `language_correction` | `true` | `usesLanguageCorrection` |
 | `custom_words` | empty | `customWords` |
@@ -93,9 +93,10 @@ the recognizer; the last three are read on every call. What the request cannot
 be is refused by name, as `AnalyzeErrorKind::InvalidOptions`, when the
 recognizer is built — not discovered later as a request that reads nothing: a
 language tag the request does not list for its revision and level, a revision
-this host does not implement, a confidence or text height outside `0..=1`. The
-match on a language tag is exact: Vision lists `ja-JP`, so a bare `ja` is
-refused, and the refusal names the tags it would take.
+this host does not implement, language detection where it cannot act, a
+confidence or text height outside `0..=1`. The match on a language tag is
+exact: Vision lists `ja-JP`, so a bare `ja` is refused, and the refusal names
+the tags it would take.
 
 ```rust,ignore
 use avanalyze::{AppleVisionTextOptions, TextRecognizer};
@@ -221,8 +222,8 @@ existed: nothing is newly broken, and nothing is quietly weakened.
 
 - macOS (Vision.framework is Apple-only). The text request's default revision 3
   and its language detection need macOS 13; on an older host
-  `TextRecognizer::new` refuses revision 3 by name, and names the revisions that
-  host implements.
+  `TextRecognizer::new` refuses both by name, and a recognizer there asks for
+  revision 2 or 1 with `detect_language = false` and a language roster.
 - A working `objc2` toolchain (Xcode command-line tools).
 - Rust **1.95** or newer (edition 2024).
 

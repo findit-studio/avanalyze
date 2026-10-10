@@ -49,16 +49,17 @@ pub enum AnalyzeErrorKind {
   ///
   /// A refusal of the CONFIGURATION, not of the frame and not of the
   /// host's health: a text-request revision this host's Vision does not
-  /// implement, a recognition language the request does not list for
-  /// its revision and recognition level, a confidence or text-height
-  /// fraction outside `0..=1`. The same options refuse again on every
-  /// call on this host; the message names the value refused and, where
-  /// Vision lists them, the values it would have taken.
+  /// implement, language detection asked for where it cannot act, a
+  /// recognition language the request does not list for its revision
+  /// and recognition level, a confidence or text-height fraction outside
+  /// `0..=1`. The same options refuse again on every call on this host;
+  /// the message names the value refused and what would have been taken.
   ///
   /// It exists because Vision does not refuse these itself — or not
-  /// where anyone is looking. Handed a language it does not read, the
-  /// text request ignores it and reports success; handed a revision it
-  /// does not implement, it fails every frame, one at a time.
+  /// where anyone is looking. Handed a language it does not read, or a
+  /// detection request it cannot honour, the text request reads on its
+  /// default roster and reports success; handed a revision it does not
+  /// implement, it fails every frame, one at a time.
   InvalidOptions,
 }
 
