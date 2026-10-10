@@ -166,7 +166,98 @@ const fn default_text_max_candidates_per_observation() -> usize {
   1
 }
 
-#[derive(Debug, Clone, Copy)]
+#[cfg_attr(not(tarpaulin), inline(always))]
+const fn default_text_detect_language() -> bool {
+  true
+}
+
+#[cfg_attr(not(tarpaulin), inline(always))]
+const fn default_text_recognition_level() -> TextRecognitionLevel {
+  TextRecognitionLevel::Accurate
+}
+
+#[cfg_attr(not(tarpaulin), inline(always))]
+const fn default_text_language_correction() -> bool {
+  true
+}
+
+#[cfg_attr(not(tarpaulin), inline(always))]
+const fn default_text_min_text_height() -> f32 {
+  0.0
+}
+
+#[cfg_attr(not(tarpaulin), inline(always))]
+const fn default_text_min_confidence() -> f32 {
+  0.0
+}
+
+#[cfg_attr(not(tarpaulin), inline(always))]
+const fn default_text_revision() -> usize {
+  3
+}
+
+/// How hard Vision works to read text — Apple's
+/// `VNRequestTextRecognitionLevel`.
+///
+/// The level also decides which languages the request reads at all.
+/// [`Accurate`](Self::Accurate) reads every language its revision lists;
+/// [`Fast`](Self::Fast) reads only Latin-script ones (at revision 3:
+/// English, French, Italian, German, Spanish and Portuguese), so a
+/// Chinese or Japanese roster at `Fast` is refused by name rather than
+/// left to read nothing.
+///
+/// In a config it is spelled `"accurate"` or `"fast"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[non_exhaustive]
+pub enum TextRecognitionLevel {
+  /// Slower, and reads every language the request's revision lists.
+  /// Apple's default.
+  #[default]
+  Accurate,
+  /// Faster, and reads Latin-script languages only.
+  Fast,
+}
+
+/// Everything [`TextRecognizer`](crate::TextRecognizer) reads.
+///
+/// Two kinds of option live here, and what separates them is when they
+/// act.
+///
+/// **The request's own, set once by
+/// [`TextRecognizer::new`](crate::TextRecognizer::new).** These are
+/// `VNRecognizeTextRequest` properties. They follow the recognizer, not
+/// the call: the options handed to a later
+/// [`recognize`](crate::TextRecognizer::recognize) cannot move them.
+///
+/// | option | default | Vision property |
+/// |---|---|---|
+/// | [`revision`](Self::revision) | `3` | `revision` — refused unless this host implements it |
+/// | [`recognition_level`](Self::recognition_level) | [`Accurate`](TextRecognitionLevel::Accurate) | `recognitionLevel` |
+/// | [`languages`](Self::languages) | empty: Vision's own roster | `recognitionLanguages` — refused unless the request lists every tag |
+/// | [`detect_language`](Self::detect_language) | `true` | `automaticallyDetectsLanguage` (macOS 13 and later) |
+/// | [`language_correction`](Self::language_correction) | `true` | `usesLanguageCorrection` |
+/// | [`custom_words`](Self::custom_words) | empty | `customWords` |
+/// | [`min_text_height`](Self::min_text_height) | `0.0` | `minimumTextHeight` — refused outside `0..=1` |
+///
+/// **Gates on what comes back, read per call.**
+///
+/// | option | default | what it drops |
+/// |---|---|---|
+/// | [`min_text_len`](Self::min_text_len) | `1` | a reading shorter than this many UTF-8 bytes |
+/// | [`max_candidates_per_observation`](Self::max_candidates_per_observation) | `1` | every candidate past this many per region (Apple caps the list at 10) |
+/// | [`min_confidence`](Self::min_confidence) | `0.0` | a reading Vision scored below this — refused outside `0..=1` |
+///
+/// Every default on the request is Apple's own except one:
+/// [`detect_language`](Self::detect_language) is `true` where Vision's is
+/// `false`. Vision's default roster is English alone, and a request left
+/// there reads a Chinese or Japanese picture as Latin letters or as
+/// nothing at all.
+///
+/// It is `Clone` and not `Copy`: the language roster and the custom
+/// words are lists.
+#[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct AppleVisionTextOptions {
   #[cfg_attr(feature = "serde", serde(default = "default_text_min_len"))]
@@ -176,6 +267,22 @@ pub struct AppleVisionTextOptions {
     serde(default = "default_text_max_candidates_per_observation")
   )]
   max_candidates_per_observation: usize,
+  #[cfg_attr(feature = "serde", serde(default))]
+  languages: Vec<String>,
+  #[cfg_attr(feature = "serde", serde(default = "default_text_detect_language"))]
+  detect_language: bool,
+  #[cfg_attr(feature = "serde", serde(default = "default_text_recognition_level"))]
+  recognition_level: TextRecognitionLevel,
+  #[cfg_attr(feature = "serde", serde(default = "default_text_language_correction"))]
+  language_correction: bool,
+  #[cfg_attr(feature = "serde", serde(default))]
+  custom_words: Vec<String>,
+  #[cfg_attr(feature = "serde", serde(default = "default_text_min_text_height"))]
+  min_text_height: f32,
+  #[cfg_attr(feature = "serde", serde(default = "default_text_min_confidence"))]
+  min_confidence: f32,
+  #[cfg_attr(feature = "serde", serde(default = "default_text_revision"))]
+  revision: usize,
 }
 
 impl AppleVisionTextOptions {
@@ -184,12 +291,34 @@ impl AppleVisionTextOptions {
   /// Default [`max_candidates_per_observation`](Self::max_candidates_per_observation).
   pub const DEFAULT_MAX_CANDIDATES_PER_OBSERVATION: usize =
     default_text_max_candidates_per_observation();
+  /// Default [`detect_language`](Self::detect_language).
+  pub const DEFAULT_DETECT_LANGUAGE: bool = default_text_detect_language();
+  /// Default [`recognition_level`](Self::recognition_level).
+  pub const DEFAULT_RECOGNITION_LEVEL: TextRecognitionLevel = default_text_recognition_level();
+  /// Default [`language_correction`](Self::language_correction).
+  pub const DEFAULT_LANGUAGE_CORRECTION: bool = default_text_language_correction();
+  /// Default [`min_text_height`](Self::min_text_height).
+  pub const DEFAULT_MIN_TEXT_HEIGHT: f32 = default_text_min_text_height();
+  /// Default [`min_confidence`](Self::min_confidence).
+  pub const DEFAULT_MIN_CONFIDENCE: f32 = default_text_min_confidence();
+  /// Default [`revision`](Self::revision): Apple's
+  /// `VNRecognizeTextRequestRevision3`, the newest text revision the SDK
+  /// names.
+  pub const DEFAULT_REVISION: usize = default_text_revision();
 
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new() -> Self {
     Self {
       min_text_len: Self::DEFAULT_MIN_TEXT_LEN,
       max_candidates_per_observation: Self::DEFAULT_MAX_CANDIDATES_PER_OBSERVATION,
+      languages: Vec::new(),
+      detect_language: Self::DEFAULT_DETECT_LANGUAGE,
+      recognition_level: Self::DEFAULT_RECOGNITION_LEVEL,
+      language_correction: Self::DEFAULT_LANGUAGE_CORRECTION,
+      custom_words: Vec::new(),
+      min_text_height: Self::DEFAULT_MIN_TEXT_HEIGHT,
+      min_confidence: Self::DEFAULT_MIN_CONFIDENCE,
+      revision: Self::DEFAULT_REVISION,
     }
   }
 
@@ -231,6 +360,216 @@ impl AppleVisionTextOptions {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn max_candidates_per_observation(&self) -> usize {
     self.max_candidates_per_observation
+  }
+
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn with_languages<I, S>(mut self, languages: I) -> Self
+  where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+  {
+    self.set_languages(languages);
+    self
+  }
+
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn set_languages<I, S>(&mut self, languages: I) -> &mut Self
+  where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+  {
+    self.languages = languages.into_iter().map(Into::into).collect();
+    self
+  }
+
+  /// The recognition language roster, in priority order — Vision's
+  /// `recognitionLanguages`.
+  ///
+  /// Each tag is passed to Vision exactly as written, and each must be
+  /// one the request itself lists for its
+  /// [`revision`](Self::revision) and
+  /// [`recognition_level`](Self::recognition_level)
+  /// (`supportedRecognitionLanguages`): `zh-Hans`, `zh-Hant`, `ja-JP`,
+  /// `ko-KR`, `en-US` and so on at revision 3. Anything else is refused
+  /// by name when the recognizer is built — including a spelling Vision
+  /// would quietly take, such as a bare `ja`, because what Vision does
+  /// with a tag it does not list is not something it promises.
+  ///
+  /// Empty, the default, is never sent, so the request keeps the roster
+  /// Vision built it with: English alone.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn languages(&self) -> &[String] {
+    self.languages.as_slice()
+  }
+
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn with_detect_language(mut self, detect_language: bool) -> Self {
+    self.set_detect_language(detect_language);
+    self
+  }
+
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn set_detect_language(&mut self, detect_language: bool) -> &mut Self {
+    self.detect_language = detect_language;
+    self
+  }
+
+  /// Whether Vision works out the script and language of each region
+  /// for itself — `automaticallyDetectsLanguage`. Default `true`; Apple's
+  /// own default is `false`.
+  ///
+  /// It is what reads a picture whose language nobody named: with it on,
+  /// the default English roster still reads Chinese and Japanese. Apple
+  /// added it in macOS 13 (iOS 16, tvOS 16); on an older system the
+  /// recognizer is built without it and, with the `tracing` feature,
+  /// says so once. Apple documents it as a no-op before revision 3.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn detect_language(&self) -> bool {
+    self.detect_language
+  }
+
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn with_recognition_level(mut self, recognition_level: TextRecognitionLevel) -> Self {
+    self.set_recognition_level(recognition_level);
+    self
+  }
+
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn set_recognition_level(
+    &mut self,
+    recognition_level: TextRecognitionLevel,
+  ) -> &mut Self {
+    self.recognition_level = recognition_level;
+    self
+  }
+
+  /// Accurate or fast — `recognitionLevel`. See [`TextRecognitionLevel`]
+  /// for what the fast level does not read.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn recognition_level(&self) -> TextRecognitionLevel {
+    self.recognition_level
+  }
+
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn with_language_correction(mut self, language_correction: bool) -> Self {
+    self.set_language_correction(language_correction);
+    self
+  }
+
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn set_language_correction(&mut self, language_correction: bool) -> &mut Self {
+    self.language_correction = language_correction;
+    self
+  }
+
+  /// Whether Vision corrects its readings against a lexicon —
+  /// `usesLanguageCorrection`. Default `true`, as Apple's is; off returns
+  /// the raw readings, faster and less accurate.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn language_correction(&self) -> bool {
+    self.language_correction
+  }
+
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn with_custom_words<I, S>(mut self, custom_words: I) -> Self
+  where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+  {
+    self.set_custom_words(custom_words);
+    self
+  }
+
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn set_custom_words<I, S>(&mut self, custom_words: I) -> &mut Self
+  where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+  {
+    self.custom_words = custom_words.into_iter().map(Into::into).collect();
+    self
+  }
+
+  /// Words Vision should prefer over its standard lexicon when it reads
+  /// — `customWords`: names, brands, terms of art. Empty by default, and
+  /// an empty list is never sent.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn custom_words(&self) -> &[String] {
+    self.custom_words.as_slice()
+  }
+
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn with_min_text_height(mut self, min_text_height: f32) -> Self {
+    self.set_min_text_height(min_text_height);
+    self
+  }
+
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn set_min_text_height(&mut self, min_text_height: f32) -> &mut Self {
+    self.min_text_height = min_text_height;
+    self
+  }
+
+  /// The smallest text Vision should look for, as a fraction of the
+  /// image height — `minimumTextHeight`. `0.0`, the default and Apple's,
+  /// reads the image at full resolution; larger is faster and misses
+  /// smaller text. A value outside `0..=1`, or not a number, is refused
+  /// by name when the recognizer is built.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn min_text_height(&self) -> f32 {
+    self.min_text_height
+  }
+
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn with_min_confidence(mut self, min_confidence: f32) -> Self {
+    self.set_min_confidence(min_confidence);
+    self
+  }
+
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn set_min_confidence(&mut self, min_confidence: f32) -> &mut Self {
+    self.min_confidence = min_confidence;
+    self
+  }
+
+  /// The lowest confidence a reading may carry and still be emitted.
+  /// Default `0.0`, which drops nothing.
+  ///
+  /// Read per call: Vision scores every candidate it returns, and a
+  /// candidate scored below this is dropped after the request ran. A
+  /// value outside `0..=1`, or not a number, is refused by name — by
+  /// [`TextRecognizer::new`](crate::TextRecognizer::new) and by every
+  /// call that is handed it.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn min_confidence(&self) -> f32 {
+    self.min_confidence
+  }
+
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn with_revision(mut self, revision: usize) -> Self {
+    self.set_revision(revision);
+    self
+  }
+
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn set_revision(&mut self, revision: usize) -> &mut Self {
+    self.revision = revision;
+    self
+  }
+
+  /// The text request revision — `revision`, Apple's
+  /// `VNRecognizeTextRequestRevision*`. Default `3`.
+  ///
+  /// A revision is a different engine behind the same API, so it changes
+  /// what is read without changing any signature;
+  /// [`TextRecognizer::revision`](crate::TextRecognizer::revision) reports
+  /// the one a recognizer runs. A revision this host's Vision does not
+  /// implement (`supportedRevisions`) is refused by name when the
+  /// recognizer is built, rather than by every call after it. Revision 3
+  /// needs macOS 13; revisions 1 and 2 are deprecated since macOS 15.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn revision(&self) -> usize {
+    self.revision
   }
 }
 

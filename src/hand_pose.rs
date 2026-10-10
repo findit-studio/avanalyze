@@ -65,8 +65,9 @@ pub trait HandPoseDetection: Sized {
 
 /// Apple Vision hand pose — one per worker thread.
 ///
-/// Owns exactly one Vision request. Alone among this crate's entry
-/// points it bakes a knob into the request object:
+/// Owns exactly one Vision request, and — like
+/// [`TextRecognizer`](crate::TextRecognizer) — sets an option on the
+/// request object itself:
 /// [`maximum_hand_count`](AppleVisionHandPoseOptions::maximum_hand_count)
 /// follows the poser, not the call, and is clamped at construction to
 /// Apple's revision-1 maximum.

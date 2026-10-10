@@ -2,16 +2,23 @@
 //! trait.
 
 #[cfg(target_vendor = "apple")]
-use objc2::rc::Retained;
+use objc2::{ClassType, msg_send, rc::Retained};
+#[cfg(target_vendor = "apple")]
+use objc2_foundation::{NSArray, NSIndexSet, NSNotFound, NSString};
 #[cfg(target_vendor = "apple")]
 use objc2_vision::*;
-
 #[cfg(target_vendor = "apple")]
-use crate::ffi::{
-  ImageSource, MAX_VISION_RESULTS_PER_FRAME, ffi_nsstring_to_smolstr, guard_native,
-  guard_vision_ffi, run_requests, sanitize_confidence, vision_rect_to_bbox,
-};
+use smol_str::SmolStr;
+
 use crate::{AnalyzeError, AppleVisionTextOptions, BoundingBox, PixelPlane};
+#[cfg(target_vendor = "apple")]
+use crate::{
+  AnalyzeErrorKind, TextRecognitionLevel,
+  ffi::{
+    ImageSource, MAX_VISION_RESULTS_PER_FRAME, ffi_nsstring_to_smolstr, guard_native,
+    guard_vision_ffi, run_requests, sanitize_confidence, vision_rect_to_bbox,
+  },
+};
 
 /// Hard ceiling on candidate strings per text-recognition
 /// observation. Apple's
@@ -28,6 +35,18 @@ const MAX_TEXT_CANDIDATES_PER_OBSERVATION: usize = 10;
 /// product without restricting real text-rich-document workloads.
 #[cfg(target_vendor = "apple")]
 const MAX_TOTAL_TEXT_DETECTIONS_PER_FRAME: usize = 256;
+
+/// Hard ceiling on the language tags read off the request's own
+/// `supportedRecognitionLanguages` answer. Vision lists 33 at revision 3
+/// on macOS 27; the bound is there because the array's length is
+/// reported across the FFI, like every other array this crate walks.
+#[cfg(target_vendor = "apple")]
+const MAX_LISTED_LANGUAGES: usize = 256;
+
+/// Hard ceiling on the revisions read off the text request class's own
+/// `supportedRevisions` index set, which names three on macOS 27.
+#[cfg(target_vendor = "apple")]
+const MAX_LISTED_REVISIONS: usize = 64;
 
 /// One recognised text run.
 ///
@@ -79,6 +98,13 @@ pub trait TextDetection: Sized {
 /// model, and [`recognize`](TextRecognizer::recognize) performs only
 /// the text request.
 ///
+/// The request is configured once, by the options handed to
+/// [`new`](TextRecognizer::new): its revision, recognition level,
+/// language roster, language detection, language correction, custom
+/// words and minimum text height follow the recognizer, not the call.
+/// Each call reads only the three gates on what comes back — see
+/// [`AppleVisionTextOptions`] for which option is which.
+///
 /// The retained `VNRequest` carries per-call state across
 /// `performRequests` / `results()`, so a recognizer is not safe to
 /// share across threads; build one per worker.
@@ -93,39 +119,69 @@ pub struct TextRecognizer {
 
 #[cfg(target_vendor = "apple")]
 impl TextRecognizer {
-  /// Creates a recognizer holding the text request at its pinned
-  /// revision.
+  /// Creates a recognizer holding the text request `options` describe.
   ///
-  /// `_options` is unused: Apple bakes no knob this crate exposes into
-  /// the request object, so every gate is read per call. The parameter
-  /// stays so the constructor keeps the shape every other entry point
-  /// uses, and so a future baked knob does not move the signature.
+  /// Seven options are the request's own and are set on it here, once:
+  /// [`revision`](AppleVisionTextOptions::revision),
+  /// [`recognition_level`](AppleVisionTextOptions::recognition_level),
+  /// [`languages`](AppleVisionTextOptions::languages),
+  /// [`language_correction`](AppleVisionTextOptions::language_correction),
+  /// [`custom_words`](AppleVisionTextOptions::custom_words),
+  /// [`min_text_height`](AppleVisionTextOptions::min_text_height) and
+  /// [`detect_language`](AppleVisionTextOptions::detect_language). The
+  /// `options` a later [`recognize`](Self::recognize) is handed cannot
+  /// move them; only the per-call gates are read there.
+  ///
+  /// Language detection is Apple's from macOS 13 (iOS 16, tvOS 16). On
+  /// an older system the request is built without it, which with the
+  /// `tracing` feature is said once per process, not refused: the rest
+  /// of the request still reads what its roster names.
   ///
   /// # Errors
   ///
+  /// [`AnalyzeErrorKind::InvalidOptions`] when `options` ask for what
+  /// the request cannot be, each refusal naming the value refused:
+  ///
+  /// - a [`revision`](AppleVisionTextOptions::revision) the text
+  ///   request class does not list in its `supportedRevisions` on this
+  ///   host — the message names the ones it does;
+  /// - a tag in [`languages`](AppleVisionTextOptions::languages) the
+  ///   request does not list in `supportedRecognitionLanguages` for that
+  ///   revision and recognition level — the message names the ones it
+  ///   does. The match is exact: Vision lists `ja-JP`, so `ja` is
+  ///   refused;
+  /// - a [`min_confidence`](AppleVisionTextOptions::min_confidence) or
+  ///   [`min_text_height`](AppleVisionTextOptions::min_text_height)
+  ///   outside `0..=1`, or not a number.
+  ///
+  /// [`AnalyzeErrorKind::RequestFailed`] when Vision answers an error
+  /// instead of the language list a non-empty roster is checked against.
+  ///
+  /// [`AnalyzeErrorKind::Environment`] when Apple's stack raises.
   /// Building a Vision request loads a model, and a model load is where
   /// Apple's stack raises instead of returning: on a host whose Neural
   /// Engine is denied it throws, and a throw that crosses into Rust
-  /// unguarded takes the process down. This refuses with
-  /// [`AnalyzeErrorKind::Environment`](crate::AnalyzeErrorKind::Environment)
-  /// instead — the constructor is where a whole entry point can still
-  /// be declined, before any frame has been handed to it.
+  /// unguarded takes the process down. The constructor is where a whole
+  /// entry point can still be declined, before any frame has been handed
+  /// to it.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn new(_options: &AppleVisionTextOptions) -> Result<Self, AnalyzeError> {
-    let (request, revision) = guard_native("TextRecognizer::new", || unsafe {
-      let request = VNRecognizeTextRequest::new();
-      request.setRevision(VNRecognizeTextRequestRevision3);
-      // Read back here, inside the barrier that already spans every
-      // send this constructor makes, so the public reader has to send
-      // none — and so the number still comes from the request object
-      // rather than from a second copy of the constant above.
-      let revision = request.revision();
-      (request, revision)
-    })?;
+  pub fn new(options: &AppleVisionTextOptions) -> Result<Self, AnalyzeError> {
+    const SITE: &str = "TextRecognizer::new";
+    check_fraction(SITE, "min_confidence", options.min_confidence())?;
+    check_fraction(SITE, "min_text_height", options.min_text_height())?;
+    // Every send the request's configuration makes — the class's
+    // revision list, the language list, each setter, the read-back —
+    // happens inside the one barrier, so a raise anywhere in it refuses
+    // the constructor instead of crossing into Rust. The pool inside it
+    // drains what those answers autoreleased, here rather than whenever
+    // the calling thread's own pool does, if it has one: a caller that
+    // builds a recognizer per picture would otherwise accumulate them.
+    let (request, revision) =
+      guard_native(SITE, || objc2::rc::autoreleasepool(|_| configure(options)))??;
     Ok(Self { request, revision })
   }
 
-  /// Logs the pinned revision of the text request.
+  /// Logs the revision of the text request.
   ///
   /// A revision drift changes recognition semantics **silently** —
   /// same API, different strings. [`revision`](Self::revision) is the
@@ -139,13 +195,13 @@ impl TextRecognizer {
     );
   }
 
-  /// The pinned revision of the text request, read back from the
-  /// request object [`new`](Self::new) called `setRevision` on — never
-  /// from a second constant kept beside that call, so this can never
-  /// disagree with what [`log_request_revisions`](Self::log_request_revisions)
-  /// would log. The read happened once, inside the constructor's own
-  /// exception barrier; this returns the cached answer and sends no
-  /// message.
+  /// The revision of the text request, read back from the request
+  /// object [`new`](Self::new) called `setRevision` on — never from the
+  /// options it was handed, so this can never disagree with what
+  /// [`log_request_revisions`](Self::log_request_revisions) would log
+  /// or with what Vision runs. The read happened once, inside the
+  /// constructor's own exception barrier; this returns the cached answer
+  /// and sends no message.
   ///
   /// A single recognizer owns a single request, so there is no roster
   /// to name: unlike [`VisionAnalyzer::revisions`](crate::VisionAnalyzer::revisions)
@@ -161,14 +217,39 @@ impl TextRecognizer {
     self.revision
   }
 
+  /// The request [`new`](Self::new) configured, for the laws that read
+  /// its properties back.
+  #[cfg(test)]
+  pub(crate) fn request(&self) -> &VNRecognizeTextRequest {
+    &self.request
+  }
+
   /// Recognises text in `jpeg_data`, best candidate first within each
   /// observation.
   ///
   /// Returns one `T` per surviving candidate. A candidate is dropped
   /// when its string exceeds the FFI string ceiling, falls below
   /// [`min_text_len`](AppleVisionTextOptions::min_text_len), carries a
-  /// non-finite confidence, or sits on a box the unit square rejects.
-  /// An `Err` means no recognition happened at all.
+  /// confidence outside `0..=1` or below
+  /// [`min_confidence`](AppleVisionTextOptions::min_confidence), or
+  /// sits on a box the unit square rejects. An `Err` means no
+  /// recognition happened at all.
+  ///
+  /// `options` is read per call for those gates and for
+  /// [`max_candidates_per_observation`](AppleVisionTextOptions::max_candidates_per_observation);
+  /// everything else in it was set on the request by
+  /// [`new`](Self::new) and follows the recognizer.
+  ///
+  /// # Errors
+  ///
+  /// [`AnalyzeErrorKind::InvalidOptions`] when `options` carry a
+  /// [`min_confidence`](AppleVisionTextOptions::min_confidence) outside
+  /// `0..=1`, or not a number, before the picture is looked at: a gate
+  /// outside the range Vision scores in is refused rather than run.
+  /// Otherwise the refusals every entry point shares: an input past the
+  /// engine's ceilings, or an error from Vision, as
+  /// [`AnalyzeErrorKind::RequestFailed`]; a raise, as
+  /// [`AnalyzeErrorKind::Environment`].
   pub fn recognize<T: TextDetection>(
     &self,
     jpeg_data: &[u8],
@@ -195,6 +276,11 @@ impl TextRecognizer {
     source: ImageSource<'_>,
     options: &AppleVisionTextOptions,
   ) -> Result<Vec<T>, AnalyzeError> {
+    check_fraction(
+      "TextRecognizer::recognize",
+      "min_confidence",
+      options.min_confidence(),
+    )?;
     let requests = unsafe { [Retained::cast_unchecked::<VNRequest>(self.request.clone())] };
     run_requests(source, &requests, Vec::new(), || {
       guard_vision_ffi("text", Vec::new(), || self.extract::<T>(options))
@@ -238,7 +324,9 @@ impl TextRecognizer {
         if text.len() < options.min_text_len() {
           continue;
         }
-        let Some(confidence) = sanitize_confidence(candidate.confidence(), 0.0) else {
+        let Some(confidence) =
+          sanitize_confidence(candidate.confidence(), options.min_confidence())
+        else {
           continue;
         };
         if let Some(bbox) = vision_rect_to_bbox(unsafe { obs.boundingBox() }.standardize())
@@ -250,6 +338,210 @@ impl TextRecognizer {
     }
     text_detections
   }
+}
+
+/// Builds the text request `options` describe, or names what in them it
+/// cannot be.
+///
+/// The order is load-bearing. The revision is checked and set first,
+/// and the recognition level after it, because the language list the
+/// roster is checked against is the request's answer for its
+/// configuration at the time it is asked — and both levels and every
+/// revision list different languages.
+///
+/// Every message it sends can raise, so it runs inside
+/// [`guard_native`]: [`TextRecognizer::new`] is its only caller.
+#[cfg(target_vendor = "apple")]
+fn configure(
+  options: &AppleVisionTextOptions,
+) -> Result<(Retained<VNRecognizeTextRequest>, usize), AnalyzeError> {
+  let wanted = options.revision();
+  // `supportedRevisions` is a class property, and the binding declares
+  // it once, on `VNRequest`: called through it, the question goes to the
+  // base class, whose answer is not the text request's. The message is
+  // sent to the text request's own class instead.
+  let implemented: Option<Retained<NSIndexSet>> =
+    unsafe { msg_send![VNRecognizeTextRequest::class(), supportedRevisions] };
+  if !implemented
+    .as_deref()
+    .is_some_and(|revisions| revisions.containsIndex(wanted))
+  {
+    let listed = implemented
+      .as_deref()
+      .map(listed_revisions)
+      .unwrap_or_default();
+    return Err(refusal(format!(
+      "TextRecognizer::new: revision {wanted} is not one this host's text request implements; \
+       it implements {}",
+      listed.join(", ")
+    )));
+  }
+
+  let request = VNRecognizeTextRequest::new();
+  unsafe { request.setRevision(wanted) };
+  let level = options.recognition_level();
+  request.setRecognitionLevel(vision_level(level));
+
+  if !options.languages().is_empty() {
+    let listed =
+      unsafe { request.supportedRecognitionLanguagesAndReturnError() }.map_err(|error| {
+        // Through the bounded FFI-string helper, as `perform` reports an
+        // NSError, so a pathological description cannot drive the
+        // allocator into the abort path.
+        let description = ffi_nsstring_to_smolstr(&error.localizedDescription())
+          .unwrap_or_else(|| SmolStr::new_static("description elided"));
+        AnalyzeError::new(
+          AnalyzeErrorKind::RequestFailed,
+          format!(
+            "TextRecognizer::new: Vision could not list the languages its text request reads: \
+             {description}"
+          ),
+        )
+      })?;
+    let readable: Vec<SmolStr> = listed
+      .iter()
+      .take(MAX_LISTED_LANGUAGES)
+      .filter_map(|tag| ffi_nsstring_to_smolstr(&tag))
+      .collect();
+    if let Some(unread) = options
+      .languages()
+      .iter()
+      .find(|language| !readable.iter().any(|tag| tag.as_str() == language.as_str()))
+    {
+      return Err(refusal(format!(
+        "TextRecognizer::new: at revision {wanted} and the {} recognition level, the text \
+         request does not read {unread:?}; it reads {}",
+        level_name(level),
+        readable.join(", ")
+      )));
+    }
+    request.setRecognitionLanguages(&ns_strings(options.languages()));
+  }
+
+  request.setUsesLanguageCorrection(options.language_correction());
+  // Never an empty list: a fresh request's `customWords` is nil, and the
+  // default keeps it that way.
+  if !options.custom_words().is_empty() {
+    request.setCustomWords(&ns_strings(options.custom_words()));
+  }
+  request.setMinimumTextHeight(options.min_text_height());
+  set_language_detection(&request, options.detect_language(), wanted);
+
+  // Read back here, inside the barrier that already spans every send
+  // this constructor makes, so the public reader has to send none —
+  // and so the number comes from the request object rather than from
+  // the options that asked for it.
+  let revision = unsafe { request.revision() };
+  Ok((request, revision))
+}
+
+/// Sets `automaticallyDetectsLanguage` where the property exists.
+///
+/// The versions are the header's own `API_AVAILABLE` for the property —
+/// macOS 13, iOS 16, tvOS 16 — and visionOS, which has had it from its
+/// first release. Below them the selector does not exist, and sending it
+/// would raise; the request is built without it instead.
+#[cfg(target_vendor = "apple")]
+fn set_language_detection(request: &VNRecognizeTextRequest, detect: bool, revision: usize) {
+  let available = objc2::available!(macos = 13.0, ios = 16.0, tvos = 16.0, visionos = 1.0);
+  if available {
+    request.setAutomaticallyDetectsLanguage(detect);
+  }
+  #[cfg(feature = "tracing")]
+  note_language_detection(available, detect, revision);
+  #[cfg(not(feature = "tracing"))]
+  let _ = revision;
+}
+
+/// Says, once per process for each reason, that language detection was
+/// asked for and will not act.
+#[cfg(all(target_vendor = "apple", feature = "tracing"))]
+fn note_language_detection(available: bool, detect: bool, revision: usize) {
+  use std::sync::Once;
+
+  static UNAVAILABLE: Once = Once::new();
+  static BEFORE_REVISION_3: Once = Once::new();
+
+  if !detect {
+    return;
+  }
+  if !available {
+    UNAVAILABLE.call_once(|| {
+      tracing::warn!(
+        "automatic language detection needs macOS 13, iOS 16 or tvOS 16; text requests on this \
+         system are built without it and read only the languages their roster names"
+      );
+    });
+  } else if revision < VNRecognizeTextRequestRevision3 {
+    BEFORE_REVISION_3.call_once(|| {
+      tracing::warn!(
+        revision,
+        "automatic language detection is a no-op before text request revision 3, Apple's own \
+         note; this request carries it and it will not act"
+      );
+    });
+  }
+}
+
+/// Vision's spelling of a recognition level.
+#[cfg(target_vendor = "apple")]
+const fn vision_level(level: TextRecognitionLevel) -> VNRequestTextRecognitionLevel {
+  match level {
+    TextRecognitionLevel::Accurate => VNRequestTextRecognitionLevel::Accurate,
+    TextRecognitionLevel::Fast => VNRequestTextRecognitionLevel::Fast,
+  }
+}
+
+/// A recognition level as a refusal names it — the spelling a config
+/// uses.
+#[cfg(target_vendor = "apple")]
+const fn level_name(level: TextRecognitionLevel) -> &'static str {
+  match level {
+    TextRecognitionLevel::Accurate => "accurate",
+    TextRecognitionLevel::Fast => "fast",
+  }
+}
+
+/// The revisions an index set names, in order, bounded.
+#[cfg(target_vendor = "apple")]
+fn listed_revisions(revisions: &NSIndexSet) -> Vec<String> {
+  // `NSNotFound` is `NSIntegerMax`; the index set answers it, as an
+  // unsigned index, once there is no next member.
+  let not_found = NSNotFound as usize;
+  let mut listed = Vec::new();
+  let mut index = revisions.firstIndex();
+  while index != not_found && listed.len() < MAX_LISTED_REVISIONS {
+    listed.push(index.to_string());
+    index = revisions.indexGreaterThanIndex(index);
+  }
+  listed
+}
+
+/// `strings` as the `NSArray<NSString>` a request property takes.
+#[cfg(target_vendor = "apple")]
+fn ns_strings(strings: &[String]) -> Retained<NSArray<NSString>> {
+  let strings: Vec<Retained<NSString>> = strings
+    .iter()
+    .map(|string| NSString::from_str(string))
+    .collect();
+  NSArray::from_retained_slice(&strings)
+}
+
+/// Refuses `value` unless it is a fraction: inside `0..=1`, and a
+/// number at all.
+#[cfg(target_vendor = "apple")]
+fn check_fraction(site: &str, name: &str, value: f32) -> Result<(), AnalyzeError> {
+  if (0.0..=1.0).contains(&value) {
+    Ok(())
+  } else {
+    Err(refusal(format!("{site}: {name} {value} is outside 0..=1")))
+  }
+}
+
+/// An [`AnalyzeErrorKind::InvalidOptions`] refusal carrying `message`.
+#[cfg(target_vendor = "apple")]
+fn refusal(message: String) -> AnalyzeError {
+  AnalyzeError::new(AnalyzeErrorKind::InvalidOptions, message)
 }
 
 /// Non-macOS stub for [`TextRecognizer`].

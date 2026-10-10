@@ -11,7 +11,10 @@ use std::borrow::Cow;
 pub enum AnalyzeErrorKind {
   /// The frame was refused before or during the Vision pass: the input
   /// exceeded the engine's byte ceiling, or Apple's batched
-  /// `performRequests` reported an error.
+  /// `performRequests` reported an error. Also what
+  /// [`TextRecognizer::new`](crate::TextRecognizer::new) returns when
+  /// Vision answers an error to its question of which languages the
+  /// text request reads.
   RequestFailed,
   /// Apple's Vision framework is not available on this platform.
   Unsupported,
@@ -41,6 +44,22 @@ pub enum AnalyzeErrorKind {
   /// documents itself as unable to catch there. Under that setting a
   /// consumer gets what they had before this variant existed.
   Environment,
+  /// The options asked for something the entry point cannot do, and the
+  /// call refused before any picture reached Vision.
+  ///
+  /// A refusal of the CONFIGURATION, not of the frame and not of the
+  /// host's health: a text-request revision this host's Vision does not
+  /// implement, a recognition language the request does not list for
+  /// its revision and recognition level, a confidence or text-height
+  /// fraction outside `0..=1`. The same options refuse again on every
+  /// call on this host; the message names the value refused and, where
+  /// Vision lists them, the values it would have taken.
+  ///
+  /// It exists because Vision does not refuse these itself — or not
+  /// where anyone is looking. Handed a language it does not read, the
+  /// text request ignores it and reports success; handed a revision it
+  /// does not implement, it fails every frame, one at a time.
+  InvalidOptions,
 }
 
 impl fmt::Display for AnalyzeErrorKind {
@@ -49,6 +68,7 @@ impl fmt::Display for AnalyzeErrorKind {
       Self::RequestFailed => f.write_str("apple-vision request failed"),
       Self::Unsupported => f.write_str("apple-vision unavailable"),
       Self::Environment => f.write_str("apple-vision raised a native exception"),
+      Self::InvalidOptions => f.write_str("apple-vision options refused"),
     }
   }
 }

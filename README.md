@@ -16,7 +16,8 @@ vocabulary you name.
 
 `avanalyze` wraps Apple's Vision.framework in a synchronous Rust API as **nine
 entry points**, each owning exactly the Vision requests its own capability
-needs, at fixed, pinned revisions:
+needs, at pinned revisions — fixed, except the text request's, which its options
+choose:
 
 | Entry point | Requests | Produces |
 |---|---|---|
@@ -66,6 +67,44 @@ nothing else — same requests, same options, same ceilings, same degradation,
 same output — because an entry point's two methods are one body reached two
 ways. Detections agree across them to within the two decode paths' own
 difference (a few thousandths of a normalized coordinate), not bit for bit.
+
+## Text in the language it is written in
+
+`TextRecognizer` builds its one request from `AppleVisionTextOptions`, and the
+defaults read text in whatever language it is written in. Language detection is
+on; Apple's own default — an English-only roster with detection off — reads a
+Chinese or Japanese sign as Latin letters, or as nothing at all.
+
+| Option | Default | What it does |
+|---|---|---|
+| `languages` | empty: Vision's own roster, English | `recognitionLanguages`, best first |
+| `detect_language` | `true` | `automaticallyDetectsLanguage` (macOS 13 and later) |
+| `recognition_level` | `"accurate"` | `recognitionLevel`; `"fast"` reads Latin-script languages only |
+| `language_correction` | `true` | `usesLanguageCorrection` |
+| `custom_words` | empty | `customWords` |
+| `min_text_height` | `0.0` | `minimumTextHeight`, a fraction of the image height |
+| `revision` | `3` | the request revision |
+| `min_confidence` | `0.0` | per call: drops a reading Vision scored below it |
+| `min_text_len` | `1` | per call: drops a reading shorter than this many UTF-8 bytes |
+| `max_candidates_per_observation` | `1` | per call: readings kept per text region, at most 10 |
+
+The first seven are set on the request when the recognizer is built, and follow
+the recognizer; the last three are read on every call. What the request cannot
+be is refused by name, as `AnalyzeErrorKind::InvalidOptions`, when the
+recognizer is built — not discovered later as a request that reads nothing: a
+language tag the request does not list for its revision and level, a revision
+this host does not implement, a confidence or text height outside `0..=1`. The
+match on a language tag is exact: Vision lists `ja-JP`, so a bare `ja` is
+refused, and the refusal names the tags it would take.
+
+```rust,ignore
+use avanalyze::{AppleVisionTextOptions, TextRecognizer};
+
+// The languages a library is in, best first.
+let options =
+  AppleVisionTextOptions::new().with_languages(["zh-Hans", "zh-Hant", "ja-JP", "en-US"]);
+let runs = TextRecognizer::new(&options)?.recognize_pixels::<MyTextRun>(&plane, &options)?;
+```
 
 ## What it does not do
 
@@ -144,7 +183,7 @@ empty slot inside `Analysis`, an empty `Vec` from an entry point of its own.
 Individual detections are filtered before construction — non-finite geometry,
 out-of-range confidences, degenerate boxes — and a refused detection is silently
 absent; there is no "dropped" counter. An `Err` means no analysis happened at
-all, which is a surface of exactly three kinds.
+all, which is a surface of exactly four kinds.
 
 ## Nothing Apple raises kills the process (with `panic = "unwind"`)
 
@@ -180,7 +219,10 @@ existed: nothing is newly broken, and nothing is quietly weakened.
 
 ## Requirements
 
-- macOS (Vision.framework is Apple-only).
+- macOS (Vision.framework is Apple-only). The text request's default revision 3
+  and its language detection need macOS 13; on an older host
+  `TextRecognizer::new` refuses revision 3 by name, and names the revisions that
+  host implements.
 - A working `objc2` toolchain (Xcode command-line tools).
 - Rust **1.95** or newer (edition 2024).
 
@@ -216,7 +258,7 @@ and the traits it builds:
 - `src/conformance.rs` — runnable assertions, per entry point.
 - `src/options.rs` — per-entry configuration knobs
   (`AppleVisionTextOptions`, `AppleVisionFaceOptions`, …) and `AnalyzeOptions`.
-- `src/error.rs` — `AnalyzeError` and its three kinds.
+- `src/error.rs` — `AnalyzeError` and its four kinds.
 
 ## License
 

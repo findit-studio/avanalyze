@@ -161,6 +161,85 @@ mod serde_default_tests {
     restable(&o);
   }
 
+  // ── Text ────────────────────────────────────────────────────
+
+  /// Every text option defaults on its own absence, to the constant
+  /// `new()` reads, and the two lists to empty — which is what keeps a
+  /// 0.7 config, naming only the two gates it had, parsing unchanged.
+  #[test]
+  fn text_from_empty_json() {
+    let o: AppleVisionTextOptions = serde_json::from_str("{}").expect("empty json");
+    assert_eq!(
+      o.min_text_len(),
+      AppleVisionTextOptions::DEFAULT_MIN_TEXT_LEN
+    );
+    assert_eq!(
+      o.max_candidates_per_observation(),
+      AppleVisionTextOptions::DEFAULT_MAX_CANDIDATES_PER_OBSERVATION
+    );
+    assert!(o.languages().is_empty());
+    assert_eq!(
+      o.detect_language(),
+      AppleVisionTextOptions::DEFAULT_DETECT_LANGUAGE
+    );
+    assert_eq!(
+      o.recognition_level(),
+      AppleVisionTextOptions::DEFAULT_RECOGNITION_LEVEL
+    );
+    assert_eq!(
+      o.language_correction(),
+      AppleVisionTextOptions::DEFAULT_LANGUAGE_CORRECTION
+    );
+    assert!(o.custom_words().is_empty());
+    assert_eq!(
+      o.min_text_height(),
+      AppleVisionTextOptions::DEFAULT_MIN_TEXT_HEIGHT
+    );
+    assert_eq!(
+      o.min_confidence(),
+      AppleVisionTextOptions::DEFAULT_MIN_CONFIDENCE
+    );
+    assert_eq!(o.revision(), AppleVisionTextOptions::DEFAULT_REVISION);
+    restable(&o);
+  }
+
+  #[test]
+  fn text_from_partial_json() {
+    let o: AppleVisionTextOptions = serde_json::from_str(
+      r#"{"languages": ["zh-Hans", "ja-JP"], "recognition_level": "fast", "min_confidence": 0.4}"#,
+    )
+    .expect("partial json");
+    assert_eq!(o.languages(), ["zh-Hans", "ja-JP"]);
+    assert_eq!(o.recognition_level(), TextRecognitionLevel::Fast);
+    assert_eq!(o.min_confidence(), 0.4);
+    assert_eq!(
+      o.detect_language(),
+      AppleVisionTextOptions::DEFAULT_DETECT_LANGUAGE
+    );
+    assert_eq!(o.revision(), AppleVisionTextOptions::DEFAULT_REVISION);
+    assert_eq!(
+      o.min_text_len(),
+      AppleVisionTextOptions::DEFAULT_MIN_TEXT_LEN
+    );
+    restable(&o);
+  }
+
+  /// The level is spelled as a config spells it, and nothing else is.
+  #[test]
+  fn text_recognition_level_is_spelled_in_snake_case() {
+    for (level, spelled) in [
+      (TextRecognitionLevel::Accurate, "\"accurate\""),
+      (TextRecognitionLevel::Fast, "\"fast\""),
+    ] {
+      assert_eq!(serde_json::to_string(&level).expect("serialize"), spelled);
+      assert_eq!(
+        serde_json::from_str::<TextRecognitionLevel>(spelled).expect("deserialize"),
+        level
+      );
+    }
+    assert!(serde_json::from_str::<TextRecognitionLevel>("\"Accurate\"").is_err());
+  }
+
   // ── The composed per-entry sections ─────────────────────────
 
   #[test]

@@ -30,6 +30,17 @@ mod serde_tests {
   #[test]
   fn serde_text_options() {
     roundtrip(&AppleVisionTextOptions::new());
+    roundtrip(
+      &AppleVisionTextOptions::new()
+        .with_languages(["zh-Hans", "ja-JP"])
+        .with_detect_language(false)
+        .with_recognition_level(TextRecognitionLevel::Fast)
+        .with_language_correction(false)
+        .with_custom_words(["avanalyze"])
+        .with_min_text_height(0.25)
+        .with_min_confidence(0.5)
+        .with_revision(2),
+    );
   }
 
   #[test]
