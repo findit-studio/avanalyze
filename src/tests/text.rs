@@ -231,6 +231,22 @@ fn is_chinese_or_japanese(c: char) -> bool {
   )
 }
 
+/// Whether some reading is a line read in its own script: more than half
+/// of its characters, spaces aside, are kana or CJK ideographs, and it
+/// carries every one of `marks`.
+fn read_in_its_own_script(readings: &[Reading], marks: &[&str]) -> bool {
+  readings.iter().any(|reading| {
+    let (cjk, all) = reading
+      .text
+      .chars()
+      .filter(|c| !c.is_whitespace())
+      .fold((0usize, 0usize), |(cjk, all), c| {
+        (cjk + usize::from(is_chinese_or_japanese(c)), all + 1)
+      });
+    cjk * 2 > all && marks.iter().all(|mark| reading.text.contains(mark))
+  })
+}
+
 // ----- the request, read back ----------------------------------------------
 
 /// The request's language roster.
@@ -633,31 +649,56 @@ fn a_per_call_confidence_outside_the_unit_interval_is_refused_by_name() {
 ///
 /// Under the request this crate built before these options existed —
 /// revision 3 and nothing else set — Vision reads English alone: the
-/// English line comes back and the Chinese and Japanese lines come back
-/// as Latin letters or as nothing. Under language detection, now the
-/// default, and under a roster that names the two languages, the words
-/// themselves come back.
+/// English line comes back, and nothing in Chinese or Japanese does.
+/// Under language detection, now the default, each CJK line comes back
+/// in its own script; so does each line under a roster that names its
+/// language.
+///
+/// The CJK lines are compared by character class and by the characters
+/// that tell the two lines apart — 你好 and こんにちは, each with 世界 —
+/// not as exact strings. That is what Vision promises; how it transcribes
+/// a line differs from system to system, and the law has to hold on
+/// every one at or above the floor. The English line's transcription is
+/// stable, and is compared exactly.
+///
+/// Each language is named alone. A roster is processed in its order:
+/// with detection off, macOS 26.6 (a CI runner) read `["zh-Hans", "ja-JP"]`
+/// as the Chinese line and left the Japanese line unread, where macOS 27
+/// read both.
 #[test]
 fn chinese_and_japanese_are_read_under_detection_or_a_roster_and_were_not_before() {
+  const CHINESE_MARKS: [&str; 2] = ["你好", "世界"];
+  const JAPANESE_MARKS: [&str; 2] = ["こんにちは", "世界"];
+
   let pixels = page();
   assert!(ink(&pixels) > 5_000, "Core Text set the lines on the page");
 
-  let detected = joined(&read(&AppleVisionTextOptions::new(), &pixels));
+  let detected = read(&AppleVisionTextOptions::new(), &pixels);
   assert!(
-    detected.contains(CHINESE) && detected.contains(JAPANESE) && detected.contains(ENGLISH),
-    "with detection on, every line is read in its own script: {detected}"
+    read_in_its_own_script(&detected, &CHINESE_MARKS)
+      && read_in_its_own_script(&detected, &JAPANESE_MARKS),
+    "with detection on, each CJK line is read in its own script: {}",
+    joined(&detected)
+  );
+  assert!(
+    joined(&detected).contains(ENGLISH),
+    "and the English line is read: {}",
+    joined(&detected)
   );
 
-  let rostered = joined(&read(
-    &AppleVisionTextOptions::new()
-      .with_detect_language(false)
-      .with_languages(["zh-Hans", "ja-JP"]),
-    &pixels,
-  ));
-  assert!(
-    rostered.contains(CHINESE) && rostered.contains(JAPANESE),
-    "with the two languages named, both lines are read: {rostered}"
-  );
+  for (language, marks) in [("zh-Hans", CHINESE_MARKS), ("ja-JP", JAPANESE_MARKS)] {
+    let rostered = read(
+      &AppleVisionTextOptions::new()
+        .with_detect_language(false)
+        .with_languages([language]),
+      &pixels,
+    );
+    assert!(
+      read_in_its_own_script(&rostered, &marks),
+      "with {language} named, its line is read in its own script: {}",
+      joined(&rostered)
+    );
+  }
 
   let before = joined(&read(
     &AppleVisionTextOptions::new().with_detect_language(false),

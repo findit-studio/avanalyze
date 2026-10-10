@@ -395,6 +395,11 @@ impl AppleVisionTextOptions {
   /// would quietly take, such as a bare `ja`, because what Vision does
   /// with a tag it does not list is not something it promises.
   ///
+  /// The order matters. With [`detect_language`](Self::detect_language)
+  /// off, macOS 26.6 read a page under `["zh-Hans", "ja-JP"]` as its
+  /// Chinese line and left its Japanese line unread, where macOS 27 read
+  /// both; detection, the default, is what reads a page that mixes them.
+  ///
   /// Empty, the default, is never sent, so the request keeps the roster
   /// Vision built it with: English alone.
   #[cfg_attr(not(tarpaulin), inline(always))]
