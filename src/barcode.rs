@@ -62,6 +62,11 @@ impl BarcodeDetector {
   ///
   /// # Errors
   ///
+  /// [`AnalyzeErrorKind::BelowFloor`](crate::AnalyzeErrorKind::BelowFloor)
+  /// on a system older than [`SYSTEM_FLOOR`](crate::SYSTEM_FLOOR), checked
+  /// first, before anything is sent: the message names this constructor
+  /// and the floor.
+  ///
   /// Building a Vision request loads a model, and a model load is where
   /// Apple's stack raises instead of returning: on a host whose Neural
   /// Engine is denied it throws, and a throw that crosses into Rust
@@ -71,7 +76,9 @@ impl BarcodeDetector {
   /// be declined, before any frame has been handed to it.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn new(_options: &AppleVisionBarcodeOptions) -> Result<Self, AnalyzeError> {
-    let (request, revision) = guard_native("BarcodeDetector::new", || unsafe {
+    const SITE: &str = "BarcodeDetector::new";
+    crate::floor::require_floor(SITE)?;
+    let (request, revision) = guard_native(SITE, || unsafe {
       let request = VNDetectBarcodesRequest::new();
       request.setRevision(VNDetectBarcodesRequestRevision4);
       // Read back here, inside the barrier that already spans every

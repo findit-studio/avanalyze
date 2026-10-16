@@ -10,6 +10,8 @@ mod face;
 #[cfg(target_vendor = "apple")]
 mod ffi;
 #[cfg(target_vendor = "apple")]
+mod floor;
+#[cfg(target_vendor = "apple")]
 mod mask;
 #[cfg(target_vendor = "apple")]
 mod native_barrier;

@@ -187,6 +187,11 @@ impl BodyPoser {
   ///
   /// # Errors
   ///
+  /// [`AnalyzeErrorKind::BelowFloor`](crate::AnalyzeErrorKind::BelowFloor)
+  /// on a system older than [`SYSTEM_FLOOR`](crate::SYSTEM_FLOOR), checked
+  /// first, before anything is sent: the message names this constructor
+  /// and the floor.
+  ///
   /// Building a Vision request loads a model, and a model load is where
   /// Apple's stack raises instead of returning: on a host whose Neural
   /// Engine is denied it throws, and a throw that crosses into Rust
@@ -201,7 +206,9 @@ impl BodyPoser {
   /// this guard existed that raise aborted the process.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn new(_options: &AppleVisionBodyPoserOptions) -> Result<Self, AnalyzeError> {
-    guard_native("BodyPoser::new", || unsafe {
+    const SITE: &str = "BodyPoser::new";
+    crate::floor::require_floor(SITE)?;
+    guard_native(SITE, || unsafe {
       let pose_2d = VNDetectHumanBodyPoseRequest::new();
       pose_2d.setRevision(VNDetectHumanBodyPoseRequestRevision1);
 

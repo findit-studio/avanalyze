@@ -1,10 +1,12 @@
 //! Text recognition: its own entry point, its own request, its own
 //! trait.
 //!
-//! The recognizer has one floor, checked once, before anything else:
-//! macOS 13, iOS 16, tvOS 16, visionOS 1 ([`TEXT_RECOGNIZER_FLOOR`]).
-//! Every message its constructor sends exists there, so nothing past
-//! that check is guarded again.
+//! The recognizer is built on the crate's floor,
+//! [`SYSTEM_FLOOR`](crate::SYSTEM_FLOOR), checked once, before anything
+//! else. Every message its constructor sends exists there, so nothing
+//! past that check is guarded again: its default revision 3 and language
+//! detection arrive at macOS 13, iOS 16 and tvOS 16, the request class at
+//! macOS 10.15, and the language query at macOS 12.
 
 #[cfg(target_vendor = "apple")]
 use objc2::{ClassType, msg_send, rc::Retained};
@@ -52,30 +54,6 @@ const MAX_LISTED_LANGUAGES: usize = 256;
 /// `supportedRevisions` index set, which names three on macOS 27.
 #[cfg(target_vendor = "apple")]
 const MAX_LISTED_REVISIONS: usize = 64;
-
-/// The oldest systems a [`TextRecognizer`] is built on: macOS 13, iOS 16,
-/// tvOS 16, visionOS 1. Below them, [`TextRecognizer::new`] refuses with
-/// [`AnalyzeErrorKind::Unsupported`], naming them.
-///
-/// The floor is where the recognizer's reason to exist arrives:
-/// `VNRecognizeTextRequestRevision3` — the default revision, and the
-/// only one that can detect a language — and `automaticallyDetectsLanguage`
-/// itself are both `API_AVAILABLE(macos(13.0), ios(16.0), tvos(16.0))` in
-/// `VNRecognizeTextRequest.h`, and visionOS has had both from its first
-/// release. Everything else the constructor sends predates it: the
-/// request class (macOS 10.15) and `supportedRecognitionLanguagesAndReturnError:`
-/// (macOS 12). One check at the floor therefore covers every message, and
-/// it runs before the class is resolved — below macOS 10.15 the class
-/// does not exist, and resolving it would panic.
-#[cfg(target_vendor = "apple")]
-const TEXT_RECOGNIZER_FLOOR: &str = "macOS 13, iOS 16, tvOS 16 or visionOS 1";
-
-/// Whether this system is at or above [`TEXT_RECOGNIZER_FLOOR`] — the same
-/// versions, written as the literals `available!` takes.
-#[cfg(target_vendor = "apple")]
-fn at_text_recognizer_floor() -> bool {
-  objc2::available!(macos = 13.0, ios = 16.0, tvos = 16.0, visionos = 1.0)
-}
 
 /// One recognised text run.
 ///
@@ -163,6 +141,10 @@ impl TextRecognizer {
   ///
   /// # Errors
   ///
+  /// [`AnalyzeErrorKind::BelowFloor`] on a system older than
+  /// [`SYSTEM_FLOOR`](crate::SYSTEM_FLOOR), checked first, before anything
+  /// is sent: the message names this constructor and the floor.
+  ///
   /// [`AnalyzeErrorKind::InvalidOptions`] when `options` ask for what
   /// the request cannot be, each refusal naming the value refused:
   ///
@@ -184,10 +166,6 @@ impl TextRecognizer {
   ///   [`min_text_height`](AppleVisionTextOptions::min_text_height)
   ///   outside `0..=1`, or not a number.
   ///
-  /// [`AnalyzeErrorKind::Unsupported`] on a system older than the
-  /// recognizer's floor — macOS 13, iOS 16, tvOS 16, visionOS 1 — checked
-  /// first, before anything is sent: the message names the floor.
-  ///
   /// [`AnalyzeErrorKind::RequestFailed`] when Vision answers an error
   /// instead of the language list a non-empty roster is checked against.
   ///
@@ -201,15 +179,7 @@ impl TextRecognizer {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn new(options: &AppleVisionTextOptions) -> Result<Self, AnalyzeError> {
     const SITE: &str = "TextRecognizer::new";
-    if !at_text_recognizer_floor() {
-      return Err(AnalyzeError::new(
-        AnalyzeErrorKind::Unsupported,
-        format!(
-          "{SITE}: this system is older than {TEXT_RECOGNIZER_FLOOR}, the oldest a text \
-           recognizer is built on"
-        ),
-      ));
-    }
+    crate::floor::require_floor(SITE)?;
     check_fraction(SITE, "min_confidence", options.min_confidence())?;
     check_fraction(SITE, "min_text_height", options.min_text_height())?;
     // Every send the request's configuration makes — the class's
@@ -502,7 +472,8 @@ fn configure(
 /// request's configuration at the time it is asked.
 ///
 /// The method is macOS 12, iOS 15 and tvOS 15, below
-/// [`TEXT_RECOGNIZER_FLOOR`], so every recognizer's system has it.
+/// [`SYSTEM_FLOOR`](crate::SYSTEM_FLOOR), so every recognizer's system has
+/// it.
 #[cfg(target_vendor = "apple")]
 fn listed_languages(
   request: &VNRecognizeTextRequest,

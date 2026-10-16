@@ -233,6 +233,11 @@ impl FaceLandmarker {
   ///
   /// # Errors
   ///
+  /// [`AnalyzeErrorKind::BelowFloor`](crate::AnalyzeErrorKind::BelowFloor)
+  /// on a system older than [`SYSTEM_FLOOR`](crate::SYSTEM_FLOOR), checked
+  /// first, before anything is sent: the message names this constructor
+  /// and the floor.
+  ///
   /// Building a Vision request loads a model, and a model load is where
   /// Apple's stack raises instead of returning: on a host whose Neural
   /// Engine is denied it throws, and a throw that crosses into Rust
@@ -242,7 +247,9 @@ impl FaceLandmarker {
   /// be declined, before any frame has been handed to it.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn new(_options: &AppleVisionFaceLandmarkOptions) -> Result<Self, AnalyzeError> {
-    let request = guard_native("FaceLandmarker::new", || unsafe {
+    const SITE: &str = "FaceLandmarker::new";
+    crate::floor::require_floor(SITE)?;
+    let request = guard_native(SITE, || unsafe {
       let request = VNDetectFaceLandmarksRequest::new();
       request.setRevision(VNDetectFaceLandmarksRequestRevision3);
       request
