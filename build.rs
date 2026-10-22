@@ -280,6 +280,13 @@ fn build_native_half() {
     return;
   }
 
+  // The integration tests (`tests/`; Cargo's `-tests` link arguments reach
+  // no unit-test binary) link with `-dead_strip_dylibs`, which drops the
+  // load command of a framework a binary imports no symbol from — Vision,
+  // here — so their laws build requests where Vision is loaded by name
+  // alone (`ffi::vision`). Consumers' links are untouched.
+  println!("cargo:rustc-link-arg-tests=-Wl,-dead_strip_dylibs");
+
   objc_build()
     .file("src/objc_simd_shim.m")
     .compile(&format!("avanalyze_{SHIM_ABI_TAG}_objc_simd_shim"));

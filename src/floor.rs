@@ -27,11 +27,12 @@
 //! |---|---|---|
 //! | Vision, and CoreML, which `objc2-vision`'s dependencies link beside it | linked strongly, by those crates' own `#[link]`, which no library can weaken | 10.13, 11, 11 (visionOS 1): a process that links this crate starts only where both exist. rustc's own defaults deploy lower on three targets (x86_64 macOS 10.12, iOS 10, tvOS 10); a binary deployed there that must start on the systems the two predate links both weakly, `-C link-arg=-Wl,-weak_framework,Vision` and the same for `CoreML`, which ld64 and lld both honour beside the strong link |
 //! | every other framework and library linked (Foundation, CoreFoundation, CoreGraphics, CoreVideo, CoreImage, CoreMedia, AVFoundation, ImageIO, Metal, libobjc, libc++, libSystem, libiconv), and every symbol imported from them | linked and imported strongly | each older than the oldest systems rustc supports: macOS 10.12, iOS 10, tvOS 10, visionOS 1 |
+//! | Vision itself, where the linker drops it | loaded by `dlopen` from its system path once the floor is met, before any class is looked up, and kept loaded (`ffi::vision`): a binary linked with `-dead_strip_dylibs` drops the load command of a framework it imports no symbol from, which Vision is here. No CoreML class or symbol is reached; Vision loads its own | — |
 //! | every class below | by name at run time (objc2's `objc_getClass`, its default), after the floor check | 10.13 to 15.0, each at or below the floor |
 //! | every class below, where a consumer enables `objc2/unstable-static-class` | objc2 then emits each class as a static `OBJC_CLASS_$_…` reference, a strong link-time import: by its own documentation, "OS version < Class introduced version: Dynamic linker error on program startup" (objc2 0.6.5, `src/macros/mod.rs` 33–47, 509–513) | the class's own release: such a binary does not launch below it, so [`BelowFloor`](crate::AnalyzeErrorKind::BelowFloor) cannot answer there. The consumer's trade-off for opting into an unstable feature that changes linking, which this crate does not enable and no library can undo |
 //! | every selector below | by name (objc2's `sel_registerName` at run time; the native shim's selector reference, which dyld registers at load and which imports no symbol), sent to its class or an instance of it, after the floor check | 10.13 to 15.0, each at or below the floor |
 //! | the four `…JointsGroupNameAll` keys | by name, after the floor check (`ffi::vision_string`); never imported | body and hand 11.0, 14, 14; animal and 3-D body 14.0, 17, 17 |
-//! | the revisions (`VN…RequestRevisionN`) and enumerations (`VNRequestTextRecognitionLevel`, `VNChirality`, `VNHumanBodyPose3DObservationHeightEstimation`) | integers fixed at compile time | no symbol |
+//! | the revision constants and enumeration values below | integers fixed at compile time | no symbol |
 //!
 //! The classes: every Vision class the product code names, and every
 //! superclass on its chain (`objc2-vision`'s `extern_class!` definitions),
@@ -94,6 +95,22 @@
 //! | `VNImageAestheticsScoresObservation` | `VNObservation`, `NSObject` | 15.0, 18, 18 (visionOS 2): the floor |
 //! | `VNCalculateImageAestheticsScoresRequest` | `VNImageBasedRequest`, `VNRequest`, `NSObject` | 15.0, 18, 18 (visionOS 2): the floor |
 //! | the protocol `VNFaceObservationAccepting`, adopted by `VNDetectFaceCaptureQualityRequest` and `VNDetectFaceLandmarksRequest` | | 10.13, 11, 11 |
+//!
+//! The revision constants and enumeration values, compiled in as integers,
+//! each with the release its header gives it:
+//!
+//! | constant or value | introduced |
+//! |---|---|
+//! | `VNDetectHorizonRequestRevision1` | 10.14, 12, 12 |
+//! | `VNDetectFaceLandmarksRequestRevision3` | 10.15, 13, 13 |
+//! | `VNRequestTextRecognitionLevel` `Accurate`, `Fast` | no annotation of its own: the text request's, 10.15, 13, 13 |
+//! | `VNDetectHumanBodyPoseRequestRevision1`, `VNDetectHumanHandPoseRequestRevision1` | 11.0, 14, 14 |
+//! | `VNDetectDocumentSegmentationRequestRevision1`, `VNDetectFaceRectanglesRequestRevision3`, `VNDetectHumanRectanglesRequestRevision2`, `VNGeneratePersonSegmentationRequestRevision1`, `VNRecognizeAnimalsRequestRevision2` | 12.0, 15, 15 |
+//! | `VNChirality` `Left`, `Right` | 12.0, 15, 15 |
+//! | `VNRecognizeTextRequestRevision3` | 13.0, 16, 16 |
+//! | `VNClassifyImageRequestRevision2`, `VNDetectAnimalBodyPoseRequestRevision1`, `VNDetectBarcodesRequestRevision4`, `VNDetectFaceCaptureQualityRequestRevision3`, `VNDetectHumanBodyPose3DRequestRevision1`, `VNGenerateAttentionBasedSaliencyImageRequestRevision2`, `VNGenerateObjectnessBasedSaliencyImageRequestRevision2`, `VNGeneratePersonInstanceMaskRequestRevision1` | 14.0, 17, 17 |
+//! | `VNHumanBodyPose3DObservationHeightEstimation` `Reference`, `Measured` | no annotation of its own: its observation's, 14.0, 17, 17 |
+//! | `VNCalculateImageAestheticsScoresRequestRevision1` | 15.0, 18, 18 (visionOS 2): the floor |
 //!
 //! The selectors: every Objective-C message the product code sends to a
 //! Vision object or class — each generated method it calls, its one
@@ -300,20 +317,26 @@ fn system_at_floor() -> bool {
 
 /// Refuses `site` below [`SYSTEM_FLOOR`] with
 /// [`AnalyzeErrorKind::BelowFloor`], naming the entry point and the
-/// floor.
+/// floor; at or above it, loads Vision ([`crate::ffi::vision`]) and
+/// refuses with [`AnalyzeErrorKind::Unsupported`] where it cannot be.
 ///
 /// It is the first statement of every entry point's constructor, before
 /// options are checked and before any class is resolved.
 #[cfg(target_vendor = "apple")]
 pub(crate) fn require_floor(site: &'static str) -> Result<(), AnalyzeError> {
-  if system_at_floor() {
-    Ok(())
-  } else {
-    Err(AnalyzeError::new(
+  if !system_at_floor() {
+    return Err(AnalyzeError::new(
       AnalyzeErrorKind::BelowFloor,
       format!("{site}: this system is older than {SYSTEM_FLOOR}, the oldest avanalyze is built on"),
-    ))
+    ));
   }
+  if crate::ffi::vision().is_none() {
+    return Err(AnalyzeError::new(
+      AnalyzeErrorKind::Unsupported,
+      format!("{site}: Vision.framework could not be loaded"),
+    ));
+  }
+  Ok(())
 }
 
 /// The test seam: a simulated system version for the calling thread.

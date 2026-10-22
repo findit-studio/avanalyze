@@ -1459,6 +1459,9 @@ fn run_requests_extracts_only_after_a_completed_perform() {
 
   const JPEG: &[u8] = include_bytes!("../../tests/fixtures/airport_keyframe.jpg");
 
+  // Vision loaded by name, as a constructor loads it, so the law does not
+  // lean on how its binary links.
+  crate::ffi::vision().expect("Vision loads");
   let requests = unsafe {
     [Retained::cast_unchecked::<VNRequest>(
       VNDetectFaceRectanglesRequest::new(),

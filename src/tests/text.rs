@@ -271,6 +271,9 @@ fn custom_words(request: &VNRecognizeTextRequest) -> Option<Vec<String>> {
 /// The revisions the text request class implements on this host —
 /// asked of the class itself, as [`TextRecognizer::new`] asks it.
 fn implemented_revisions() -> Vec<usize> {
+  // Vision loaded by name, as a constructor loads it, so the law does not
+  // lean on how its binary links.
+  crate::ffi::vision().expect("Vision loads");
   // SAFETY: a class property getter, returning an `NSIndexSet`.
   let revisions: Retained<NSIndexSet> =
     unsafe { msg_send![VNRecognizeTextRequest::class(), supportedRevisions] };
@@ -286,6 +289,7 @@ fn implemented_revisions() -> Vec<usize> {
 
 /// The tags a text request at `revision` and `level` lists.
 fn listed_languages(revision: usize, level: VNRequestTextRecognitionLevel) -> Vec<String> {
+  crate::ffi::vision().expect("Vision loads");
   let request = VNRecognizeTextRequest::new();
   // SAFETY: plain property writes and a documented query on a live
   // request.

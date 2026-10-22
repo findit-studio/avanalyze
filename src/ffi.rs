@@ -12,6 +12,8 @@ use std::{
   borrow::Cow,
   ffi::{CStr, c_char, c_void},
   panic::AssertUnwindSafe,
+  ptr::NonNull,
+  sync::OnceLock,
 };
 
 use objc2::{Message, exception::catch as catch_objc_exception, rc::Retained};
@@ -29,29 +31,66 @@ use crate::{
   plane::MAX_DECODED_IMAGE_BYTES,
 };
 
-// ----- Vision's constants, by name ------------------------------------------
+// ----- Vision, by name ------------------------------------------------------
+
+unsafe extern "C" {
+  // `<dlfcn.h>`, in libSystem, which every Apple binary links.
+  fn dlopen(path: *const c_char, mode: i32) -> *mut c_void;
+  fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+}
+
+/// Vision.framework's binary, at its system path on every Apple platform.
+pub(crate) const VISION_PATH: &CStr = c"/System/Library/Frameworks/Vision.framework/Vision";
+
+/// `RTLD_LAZY` in `<dlfcn.h>`.
+const RTLD_LAZY: i32 = 0x1;
+
+/// A `dlopen` handle, kept for the process.
+struct Handle(NonNull<c_void>);
+
+// SAFETY: a `dlopen` handle is a process-wide token that `dlsym` takes from
+// any thread; this crate never closes it.
+unsafe impl Send for Handle {}
+// SAFETY: as above; nothing mutates through it.
+unsafe impl Sync for Handle {}
+
+/// Vision, loaded once by name and kept loaded for the life of the process.
+///
+/// The crate imports no Vision symbol (the census in the `floor` module),
+/// so a binary linked with `-dead_strip_dylibs` drops Vision's load
+/// command, and objc2's lookup of a Vision class by name would then answer
+/// nothing. [`require_floor`](crate::floor::require_floor) loads it here
+/// once the floor is met, before any class is looked up. `None` where it
+/// cannot be loaded.
+pub(crate) fn vision() -> Option<NonNull<c_void>> {
+  static VISION: OnceLock<Option<Handle>> = OnceLock::new();
+  VISION
+    .get_or_init(|| {
+      // SAFETY: `VISION_PATH` is NUL-terminated; `dlopen` only reads it,
+      // and a handle it answers stays valid while it is not closed, which
+      // it never is.
+      NonNull::new(unsafe { dlopen(VISION_PATH.as_ptr(), RTLD_LAZY) }).map(Handle)
+    })
+    .as_ref()
+    .map(|handle| handle.0)
+}
 
 /// A Vision string constant — one of the four `…JointsGroupNameAll` keys
-/// the pose extractions read — resolved by name in the running process,
-/// never imported.
+/// the pose extractions read — resolved by name from the loaded Vision
+/// ([`vision`]), never imported.
 ///
 /// A Rust `extern` static is a strong import, and the loader refuses to
 /// start a process on a system whose Vision lacks the symbol: before
 /// `main`, so before any constructor's floor check can answer
 /// [`BelowFloor`](crate::AnalyzeErrorKind::BelowFloor). Resolved here,
 /// after that check, no Vision symbol is in the binary's imports at all
-/// (the census in the `floor` module). `None` where the running Vision
-/// exports no such symbol.
+/// (the census in the `floor` module). `None` where Vision is not loaded,
+/// or exports no such symbol.
 pub(crate) fn vision_string(name: &CStr) -> Option<&'static NSString> {
-  unsafe extern "C" {
-    // `<dlfcn.h>`, in libSystem, which every Apple binary links.
-    fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
-  }
-  // `RTLD_DEFAULT`, `((void *) -2)` in `<dlfcn.h>`: every image loaded,
-  // Vision among them.
-  const RTLD_DEFAULT: *mut c_void = core::ptr::without_provenance_mut(usize::MAX - 1);
-  // SAFETY: `name` is NUL-terminated, and `dlsym` only reads it.
-  let address = unsafe { dlsym(RTLD_DEFAULT, name.as_ptr()) };
+  let handle = vision()?;
+  // SAFETY: `handle` is a live `dlopen` handle; `name` is NUL-terminated,
+  // and `dlsym` only reads it.
+  let address = unsafe { dlsym(handle.as_ptr(), name.as_ptr()) };
   if address.is_null() {
     return None;
   }
