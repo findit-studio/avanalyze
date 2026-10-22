@@ -34,7 +34,11 @@ still links strongly is Vision itself and CoreML, through `objc2-vision`'s
 dependencies, which arrive at macOS 10.13, iOS 11 and tvOS 11. A binary
 deployed below those, as rustc's defaults for x86_64 macOS, iOS and tvOS are,
 starts on the systems they predate only if it links both weakly
-(`-C link-arg=-Wl,-weak_framework,Vision`, and the same for `CoreML`).
+(`-C link-arg=-Wl,-weak_framework,Vision`, and the same for `CoreML`). A
+consumer that enables `objc2/unstable-static-class` makes every Vision class a
+strong link-time import, so such a binary does not launch below each class's
+release, and `BelowFloor` cannot answer there: that feature is the consumer's
+trade-off, and the crate does not enable it.
 
 ### Added
 

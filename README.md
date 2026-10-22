@@ -249,6 +249,12 @@ the systems those two frameworks predate only if it links them weakly:
 RUSTFLAGS="-C link-arg=-Wl,-weak_framework,Vision -C link-arg=-Wl,-weak_framework,CoreML"
 ```
 
+A consumer that enables `objc2`'s `unstable-static-class` feature makes every
+Vision class a strong link-time import (`OBJC_CLASS_$_…`), as `objc2` documents:
+dyld then refuses such a binary at launch on a system older than a class it
+references, before `BelowFloor` can answer. That is the trade-off of opting into
+an unstable feature that changes linking. This crate does not enable it.
+
 The system is asked once, through `objc2`'s availability check, which reads the
 version the way Apple's own `@available` does (Mac Catalyst and the simulators
 included), and the answer is kept for the process.

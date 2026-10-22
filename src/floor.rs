@@ -14,20 +14,21 @@
 //! strongly and bind every symbol it imports strongly, before `main` and
 //! so before any floor check, and a binary may be launched on any system
 //! its deployment target allows, far below the floor. So everything this
-//! crate links or imports strongly exists on every system from macOS
-//! 10.13, iOS 11 and tvOS 11 on, the first row's two frameworks being the
-//! newest: from there up to the floor a process starts, and every
-//! constructor refuses. The census, every framework the crate links and
-//! every Vision class, global, constant and selector it references, with
-//! the release that brought it (`API_AVAILABLE` in the SDK's headers;
-//! visionOS follows iOS), against the floor of macOS 15, iOS 18, tvOS 18
-//! and visionOS 2:
+//! crate links or imports strongly, as built with objc2's default features,
+//! exists on every system from macOS 10.13, iOS 11 and tvOS 11 on, the
+//! first row's two frameworks being the newest: from there up to the floor
+//! a process starts, and every constructor refuses. The census, every
+//! framework the crate links and every Vision class, global, constant and
+//! selector it references, with the release that brought it
+//! (`API_AVAILABLE` in the SDK's headers; visionOS follows iOS), against
+//! the floor of macOS 15, iOS 18, tvOS 18 and visionOS 2:
 //!
 //! | what | how it is reached | introduced (macOS, iOS, tvOS) |
 //! |---|---|---|
 //! | Vision, and CoreML, which `objc2-vision`'s dependencies link beside it | linked strongly, by those crates' own `#[link]`, which no library can weaken | 10.13, 11, 11 (visionOS 1): a process that links this crate starts only where both exist. rustc's own defaults deploy lower on three targets (x86_64 macOS 10.12, iOS 10, tvOS 10); a binary deployed there that must start on the systems the two predate links both weakly, `-C link-arg=-Wl,-weak_framework,Vision` and the same for `CoreML`, which ld64 and lld both honour beside the strong link |
 //! | every other framework and library linked (Foundation, CoreFoundation, CoreGraphics, CoreVideo, CoreImage, CoreMedia, AVFoundation, ImageIO, Metal, libobjc, libc++, libSystem, libiconv), and every symbol imported from them | linked and imported strongly | each older than the oldest systems rustc supports: macOS 10.12, iOS 10, tvOS 10, visionOS 1 |
-//! | every class below | by name at run time (objc2's `objc_getClass`), after the floor check | 10.13 to 15.0, each at or below the floor |
+//! | every class below | by name at run time (objc2's `objc_getClass`, its default), after the floor check | 10.13 to 15.0, each at or below the floor |
+//! | every class below, where a consumer enables `objc2/unstable-static-class` | objc2 then emits each class as a static `OBJC_CLASS_$_…` reference, a strong link-time import: by its own documentation, "OS version < Class introduced version: Dynamic linker error on program startup" (objc2 0.6.5, `src/macros/mod.rs` 33–47, 509–513) | the class's own release: such a binary does not launch below it, so [`BelowFloor`](crate::AnalyzeErrorKind::BelowFloor) cannot answer there. The consumer's trade-off for opting into an unstable feature that changes linking, which this crate does not enable and no library can undo |
 //! | every selector below | by name at run time (`sel_registerName`), sent to an instance of its class, after the floor check | 10.13 to 15.0, each at or below the floor |
 //! | the four `…JointsGroupNameAll` keys | by name, after the floor check (`ffi::vision_string`); never imported | body and hand 11.0, 14, 14; animal and 3-D body 14.0, 17, 17 |
 //! | the revisions (`VN…RequestRevisionN`) and enumerations (`VNRequestTextRecognitionLevel`, `VNChirality`, `VNHumanBodyPose3DObservationHeightEstimation`) | integers fixed at compile time | no symbol |
