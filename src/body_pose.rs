@@ -12,7 +12,7 @@ use objc2_vision::*;
 use crate::ffi::{
   ImageSource, MAX_POSE_JOINTS, MAX_VISION_RESULTS_PER_FRAME, PoseBudget, PoseJoints,
   ffi_nsstring_to_smolstr, finite_f32, guard_native, guard_vision_ffi, pose_bbox_from_joint_bounds,
-  read_pose_joints, run_requests, sanitize_confidence, vision_point_to_normalized,
+  read_pose_joints, run_requests, sanitize_confidence, vision_point_to_normalized, vision_string,
   vn_point3d_position,
 };
 use crate::{AnalyzeError, AppleVisionBodyPoserOptions, BoundingBox, PixelPlane};
@@ -358,12 +358,16 @@ impl BodyPoser {
       return Vec::new();
     };
 
+    let Some(group_name) = vision_string(c"VNHumanBodyPoseObservationJointsGroupNameAll") else {
+      return Vec::new();
+    };
+
     let mut budget = PoseBudget::new();
     let mut body_poses = Vec::with_capacity(results.len().min(MAX_VISION_RESULTS_PER_FRAME));
     for obs in results.iter().take(MAX_VISION_RESULTS_PER_FRAME) {
-      let Ok(points_by_joint) = (unsafe {
-        obs.recognizedPointsForJointsGroupName_error(VNHumanBodyPoseObservationJointsGroupNameAll)
-      }) else {
+      let Ok(points_by_joint) =
+        (unsafe { obs.recognizedPointsForJointsGroupName_error(group_name) })
+      else {
         continue;
       };
 
@@ -482,7 +486,8 @@ impl BodyPoser {
         let Some(results) = (unsafe { self.pose_3d.results() }) else {
           return Vec::new();
         };
-        let Some(group_name) = (unsafe { VNHumanBodyPose3DObservationJointsGroupNameAll }) else {
+        let Some(group_name) = vision_string(c"VNHumanBodyPose3DObservationJointsGroupNameAll")
+        else {
           return Vec::new();
         };
 

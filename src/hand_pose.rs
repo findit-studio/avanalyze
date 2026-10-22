@@ -9,7 +9,7 @@ use objc2_vision::*;
 use crate::ffi::{
   ImageSource, MAX_POSE_JOINTS, MAX_VISION_RESULTS_PER_FRAME, PoseBudget, PoseJoints,
   ffi_nsstring_to_smolstr, guard_native, guard_vision_ffi, pose_bbox_from_joint_bounds,
-  read_pose_joints, run_requests, sanitize_confidence, vision_point_to_normalized,
+  read_pose_joints, run_requests, sanitize_confidence, vision_point_to_normalized, vision_string,
 };
 use crate::{AnalyzeError, AppleVisionHandPoseOptions, BodyPoseJoint, BoundingBox, PixelPlane};
 
@@ -183,12 +183,16 @@ impl HandPoser {
       return Vec::new();
     };
 
+    let Some(group_name) = vision_string(c"VNHumanHandPoseObservationJointsGroupNameAll") else {
+      return Vec::new();
+    };
+
     let mut budget = PoseBudget::new();
     let mut hand_poses = Vec::with_capacity(results.len().min(MAX_VISION_RESULTS_PER_FRAME));
     for obs in results.iter().take(MAX_VISION_RESULTS_PER_FRAME) {
-      let Ok(points_by_joint) = (unsafe {
-        obs.recognizedPointsForJointsGroupName_error(VNHumanHandPoseObservationJointsGroupNameAll)
-      }) else {
+      let Ok(points_by_joint) =
+        (unsafe { obs.recognizedPointsForJointsGroupName_error(group_name) })
+      else {
         continue;
       };
 

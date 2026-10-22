@@ -22,6 +22,20 @@ that panics:
 The barcode detector pinned revision 4, which arrives at macOS 14. Below the
 floor every constructor now refuses with `AnalyzeErrorKind::BelowFloor` instead.
 
+For that refusal to be reachable a process must start below the floor, so the
+crate imports no Vision symbol at all. The four `…JointsGroupNameAll` keys the
+pose extractors read — macOS 11 and 14, iOS and tvOS 14 and 17 — were Rust
+`extern` statics, which are strong imports, and the loader refused to start a
+binary holding them on a system without them, before `main`. They are now
+resolved by name, after the floor check. Every class and selector is resolved
+by name at run time, after it too, and each is at or below the floor; the
+`floor` module's census lists them all with their releases. What a binary
+still links strongly is Vision itself and CoreML, through `objc2-vision`'s
+dependencies, which arrive at macOS 10.13, iOS 11 and tvOS 11. A binary
+deployed below those, as rustc's defaults for x86_64 macOS, iOS and tvOS are,
+starts on the systems they predate only if it links both weakly
+(`-C link-arg=-Wl,-weak_framework,Vision`, and the same for `CoreML`).
+
 ### Added
 
 - **`SYSTEM_FLOOR` and `AnalyzeErrorKind::BelowFloor`.** `SYSTEM_FLOOR` names

@@ -234,6 +234,21 @@ Vision class below its own floor panics. `AnalyzeErrorKind::Unsupported` keeps
 its other meaning, a platform with no Vision at all, so a caller tells an old
 system from a wrong one by the kind.
 
+A refusal needs a process to refuse in, and the loader refuses to start a
+binary whose strong imports its system lacks, before `main`. So the crate
+imports no Vision symbol: every class, selector and constant it reads is
+resolved by name, after the floor check (the census is in `src/floor.rs`).
+What it still links strongly is Vision itself and CoreML, through
+`objc2-vision`'s dependencies, which arrive at macOS 10.13, iOS 11 and tvOS 11.
+Every other framework and symbol it imports is older than the oldest systems
+rustc supports. A binary deployed below macOS 10.13, iOS 11 or tvOS 11, as
+rustc's defaults for x86_64 macOS (10.12), iOS and tvOS (10) are, starts on
+the systems those two frameworks predate only if it links them weakly:
+
+```sh
+RUSTFLAGS="-C link-arg=-Wl,-weak_framework,Vision -C link-arg=-Wl,-weak_framework,CoreML"
+```
+
 The system is asked once, through `objc2`'s availability check, which reads the
 version the way Apple's own `@available` does (Mac Catalyst and the simulators
 included), and the answer is kept for the process.

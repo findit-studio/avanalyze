@@ -148,3 +148,63 @@ fn the_person_masker_refuses_below_the_floor() {
     PersonMasker::new(&AppleVisionPersonMaskerOptions::new())
   });
 }
+
+/// No Vision symbol is imported, strong or weak: the loader refuses to
+/// start a process whose strong imports its system lacks, before `main`
+/// and so before any floor check could refuse, and every Vision constant
+/// the crate reads is resolved by name instead (`ffi::vision_string`).
+/// Read from this test binary's own symbol table, which holds every entry
+/// point's extraction.
+#[cfg(target_os = "macos")]
+#[test]
+fn no_vision_symbol_is_imported() {
+  let binary = std::env::current_exe().expect("the test binary");
+  let listed = std::process::Command::new("nm")
+    .arg("-m")
+    .arg(&binary)
+    .output()
+    .expect("nm, from the developer tools");
+  assert!(
+    listed.status.success(),
+    "nm -m {}: {}",
+    binary.display(),
+    String::from_utf8_lossy(&listed.stderr)
+  );
+  let symbols = String::from_utf8_lossy(&listed.stdout);
+  let imported: Vec<&str> = symbols
+    .lines()
+    .filter(|line| line.contains("(undefined)") && line.contains("(from Vision)"))
+    .collect();
+  assert!(
+    imported.is_empty(),
+    "Vision symbols imported: {imported:#?}"
+  );
+  // The binary does hold the extraction that reads the keys: the four
+  // pose extractors are named in it.
+  for extractor in ["animal_pose", "body_pose", "hand_pose"] {
+    assert!(
+      symbols
+        .lines()
+        .any(|line| line.contains(extractor) && line.contains("extract")),
+      "no {extractor} extraction in {}",
+      binary.display()
+    );
+  }
+}
+
+/// Each joints-group key the pose extractions read resolves by name on
+/// this system, which is at the floor, to the key Vision exports; a name
+/// Vision does not export resolves to nothing.
+#[test]
+fn every_joints_group_key_resolves_by_name() {
+  for name in [
+    c"VNHumanBodyPoseObservationJointsGroupNameAll",
+    c"VNHumanHandPoseObservationJointsGroupNameAll",
+    c"VNAnimalBodyPoseObservationJointsGroupNameAll",
+    c"VNHumanBodyPose3DObservationJointsGroupNameAll",
+  ] {
+    let key = crate::ffi::vision_string(name).unwrap_or_else(|| panic!("{name:?} is not exported"));
+    assert!(!key.to_string().is_empty(), "{name:?} is empty");
+  }
+  assert!(crate::ffi::vision_string(c"VNNoSuchJointsGroupName").is_none());
+}

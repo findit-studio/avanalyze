@@ -10,7 +10,7 @@
 
 use std::{
   borrow::Cow,
-  ffi::{c_char, c_void},
+  ffi::{CStr, c_char, c_void},
   panic::AssertUnwindSafe,
 };
 
@@ -20,7 +20,7 @@ use objc2_core_graphics::{
   CGBitmapInfo, CGColorRenderingIntent, CGColorSpace, CGDataProvider, CGImage, CGImageAlphaInfo,
   CGImageByteOrderInfo,
 };
-use objc2_foundation::{NSArray, NSData, NSDictionary};
+use objc2_foundation::{NSArray, NSData, NSDictionary, NSString};
 use objc2_vision::{VNRequest, VNSequenceRequestHandler};
 use smol_str::{SmolStr, ToSmolStr};
 
@@ -28,6 +28,43 @@ use crate::{
   AnalyzeError, AnalyzeErrorKind, BoundingBox, PixelFormat, PixelPlane,
   plane::MAX_DECODED_IMAGE_BYTES,
 };
+
+// ----- Vision's constants, by name ------------------------------------------
+
+/// A Vision string constant — one of the four `…JointsGroupNameAll` keys
+/// the pose extractions read — resolved by name in the running process,
+/// never imported.
+///
+/// A Rust `extern` static is a strong import, and the loader refuses to
+/// start a process on a system whose Vision lacks the symbol: before
+/// `main`, so before any constructor's floor check can answer
+/// [`BelowFloor`](crate::AnalyzeErrorKind::BelowFloor). Resolved here,
+/// after that check, no Vision symbol is in the binary's imports at all
+/// (the census in the `floor` module). `None` where the running Vision
+/// exports no such symbol.
+pub(crate) fn vision_string(name: &CStr) -> Option<&'static NSString> {
+  unsafe extern "C" {
+    // `<dlfcn.h>`, in libSystem, which every Apple binary links.
+    fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+  }
+  // `RTLD_DEFAULT`, `((void *) -2)` in `<dlfcn.h>`: every image loaded,
+  // Vision among them.
+  const RTLD_DEFAULT: *mut c_void = core::ptr::without_provenance_mut(usize::MAX - 1);
+  // SAFETY: `name` is NUL-terminated, and `dlsym` only reads it.
+  let address = unsafe { dlsym(RTLD_DEFAULT, name.as_ptr()) };
+  if address.is_null() {
+    return None;
+  }
+  // SAFETY: every name this is called with is a Vision
+  // `NSString *const` global (`VN_EXPORT … const …` in the SDK headers):
+  // its address holds the string's pointer, set before the image's symbols
+  // are visible, and the string lives as long as Vision, which is never
+  // unloaded.
+  let string = unsafe { address.cast::<*const NSString>().read() };
+  // SAFETY: a pointer there that is not null is a live, immutable
+  // `NSString`.
+  unsafe { string.as_ref() }
+}
 
 // ----- resource ceilings shared by more than one entry point ----------------
 

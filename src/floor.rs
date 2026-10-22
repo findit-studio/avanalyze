@@ -6,6 +6,82 @@
 //! [`SYSTEM_FLOOR`] text, the `available!` check and the version the
 //! test seam compares against each expand from that list, so the three
 //! cannot disagree.
+//!
+//! # What the floor covers
+//!
+//! A refusal below the floor needs a process to refuse in. The loader
+//! starts a process only where it can load every library the binary links
+//! strongly and bind every symbol it imports strongly, before `main` and
+//! so before any floor check, and a binary may be launched on any system
+//! its deployment target allows, far below the floor. So everything this
+//! crate links or imports strongly exists on every system from macOS
+//! 10.13, iOS 11 and tvOS 11 on, the first row's two frameworks being the
+//! newest: from there up to the floor a process starts, and every
+//! constructor refuses. The census, every framework the crate links and
+//! every Vision class, global, constant and selector it references, with
+//! the release that brought it (`API_AVAILABLE` in the SDK's headers;
+//! visionOS follows iOS), against the floor of macOS 15, iOS 18, tvOS 18
+//! and visionOS 2:
+//!
+//! | what | how it is reached | introduced (macOS, iOS, tvOS) |
+//! |---|---|---|
+//! | Vision, and CoreML, which `objc2-vision`'s dependencies link beside it | linked strongly, by those crates' own `#[link]`, which no library can weaken | 10.13, 11, 11 (visionOS 1): a process that links this crate starts only where both exist. rustc's own defaults deploy lower on three targets (x86_64 macOS 10.12, iOS 10, tvOS 10); a binary deployed there that must start on the systems the two predate links both weakly, `-C link-arg=-Wl,-weak_framework,Vision` and the same for `CoreML`, which ld64 and lld both honour beside the strong link |
+//! | every other framework and library linked (Foundation, CoreFoundation, CoreGraphics, CoreVideo, CoreImage, CoreMedia, AVFoundation, ImageIO, Metal, libobjc, libc++, libSystem, libiconv), and every symbol imported from them | linked and imported strongly | each older than the oldest systems rustc supports: macOS 10.12, iOS 10, tvOS 10, visionOS 1 |
+//! | every class below | by name at run time (objc2's `objc_getClass`), after the floor check | 10.13 to 15.0, each at or below the floor |
+//! | every selector below | by name at run time (`sel_registerName`), sent to an instance of its class, after the floor check | 10.13 to 15.0, each at or below the floor |
+//! | the four `…JointsGroupNameAll` keys | by name, after the floor check (`ffi::vision_string`); never imported | body and hand 11.0, 14, 14; animal and 3-D body 14.0, 17, 17 |
+//! | the revisions (`VN…RequestRevisionN`) and enumerations (`VNRequestTextRecognitionLevel`, `VNChirality`, `VNHumanBodyPose3DObservationHeightEstimation`) | integers fixed at compile time | no symbol |
+//!
+//! The classes:
+//!
+//! | class | introduced |
+//! |---|---|
+//! | `VNRequest`, `VNImageBasedRequest`, `VNSequenceRequestHandler`, `VNObservation`, `VNDetectedObjectObservation`, `VNFaceObservation`, `VNFaceLandmarks2D`, `VNFaceLandmarkRegion2D`, `VNClassificationObservation`, `VNBarcodeObservation`, `VNHorizonObservation`, `VNRectangleObservation`, `VNPixelBufferObservation`, `VNDetectBarcodesRequest`, `VNDetectFaceLandmarksRequest`, `VNDetectFaceRectanglesRequest`, `VNDetectHorizonRequest`; the protocol `VNFaceObservationAccepting` | 10.13, 11, 11 |
+//! | `VNRecognizedObjectObservation` | 10.14, 12, 12 |
+//! | `VNRecognizedTextObservation`, `VNRecognizedText`, `VNSaliencyImageObservation`, `VNClassifyImageRequest`, `VNDetectFaceCaptureQualityRequest`, `VNDetectHumanRectanglesRequest`, `VNGenerateAttentionBasedSaliencyImageRequest`, `VNGenerateObjectnessBasedSaliencyImageRequest`, `VNRecognizeAnimalsRequest`, `VNRecognizeTextRequest` | 10.15, 13, 13 |
+//! | `VNRecognizedPoint`, `VNDetectedPoint`, `VNPoint`, `VNRecognizedPointsObservation`, `VNHumanBodyPoseObservation`, `VNHumanHandPoseObservation`, `VNStatefulRequest`, `VNDetectHumanBodyPoseRequest`, `VNDetectHumanHandPoseRequest` | 11.0, 14, 14 |
+//! | `VNHumanObservation`, `VNDetectDocumentSegmentationRequest`, `VNGeneratePersonSegmentationRequest` | 12.0, 15, 15 |
+//! | `VNPoint3D`, `VNRecognizedPoint3D`, `VNHumanBodyRecognizedPoint3D`, `VNAnimalBodyPoseObservation`, `VNHumanBodyPose3DObservation`, `VNInstanceMaskObservation`, `VNDetectAnimalBodyPoseRequest`, `VNDetectHumanBodyPose3DRequest`, `VNGeneratePersonInstanceMaskRequest` | 14.0, 17, 17 |
+//! | `VNImageAestheticsScoresObservation`, `VNCalculateImageAestheticsScoresRequest` | 15.0, 18, 18 (visionOS 2): the floor |
+//!
+//! The selectors, each with its class's release unless it names its own:
+//!
+//! | sent to | selectors | introduced |
+//! |---|---|---|
+//! | every request class | `+new`; `results` | its class's |
+//! | `VNRequest` | `revision`, `setRevision:`, `+supportedRevisions` | 10.14, 12, 12 |
+//! | `VNSequenceRequestHandler` | `performRequests:onCGImage:error:`, `performRequests:onImageData:error:` | 10.13, 11, 11 |
+//! | `VNObservation` | `uuid`, `confidence` | 10.13, 11, 11 |
+//! | `VNDetectedObjectObservation`, `VNFaceObservation` | `boundingBox`, `landmarks` | 10.13, 11, 11 |
+//! | `VNFaceObservation` | `roll`, `yaw` | 10.14, 12, 12 |
+//! | `VNFaceObservation` | `faceCaptureQuality` | 10.15, 13, 13 |
+//! | `VNFaceObservation` | `pitch` | 12.0, 15, 15 |
+//! | `VNFaceLandmarks2D` | `allPoints`, `faceContour`, `leftEye`, `rightEye`, `leftEyebrow`, `rightEyebrow`, `nose`, `noseCrest`, `medianLine`, `outerLips`, `innerLips`, `leftPupil`, `rightPupil`, `confidence` | 10.13, 11, 11 |
+//! | `VNFaceLandmarkRegion2D` | `pointCount`, `normalizedPoints` | 10.13, 11, 11 |
+//! | `VNClassificationObservation` | `identifier` | 10.13, 11, 11 |
+//! | `VNBarcodeObservation` | `payloadStringValue`, `symbology` | 10.13, 11, 11 |
+//! | `VNHorizonObservation` | `angle` | 10.13, 11, 11 |
+//! | `VNRectangleObservation` | `topLeft`, `topRight`, `bottomLeft`, `bottomRight` | 10.13, 11, 11 |
+//! | `VNPixelBufferObservation` | `pixelBuffer` | 10.13, 11, 11 |
+//! | `VNRecognizedObjectObservation` | `labels` | 10.14, 12, 12 |
+//! | `VNRecognizedTextObservation`, `VNRecognizedText` | `topCandidates:`, `string`, `confidence` | 10.15, 13, 13 |
+//! | `VNSaliencyImageObservation` | `salientObjects` | 10.15, 13, 13 |
+//! | `VNRecognizeTextRequest` | `setRecognitionLevel:`, `setRecognitionLanguages:`, `setUsesLanguageCorrection:`, `setCustomWords:`, `setMinimumTextHeight:` | 10.15, 13, 13 |
+//! | `VNRecognizeTextRequest` | `supportedRecognitionLanguagesAndReturnError:` | 12.0, 15, 15 |
+//! | `VNRecognizeTextRequest` | `setAutomaticallyDetectsLanguage:` | 13.0, 16, 16 |
+//! | `VNPoint`, `VNRecognizedPoint` | `x`, `y`, `identifier`, `confidence` | 11.0, 14, 14 |
+//! | `VNRecognizedPointsObservation` | `recognizedPointsForJointsGroupName:error:` | 11.0, 14, 14 |
+//! | `VNDetectHumanHandPoseRequest` | `setMaximumHandCount:` | 11.0, 14, 14 |
+//! | `VNHumanHandPoseObservation` | `chirality` | 12.0, 15, 15 |
+//! | `VNDetectHumanRectanglesRequest` | `setUpperBodyOnly:` | 12.0, 15, 15 |
+//! | `VNHumanBodyPose3DObservation`, `VNAnimalBodyPoseObservation` | `recognizedPointsForJointsGroupName:error:`, `bodyHeight`, `heightEstimation` | 14.0, 17, 17 |
+//! | `VNRecognizedPoint3D` | `identifier` | 14.0, 17, 17 |
+//! | `VNInstanceMaskObservation` | `allInstances`, `generateMaskForInstances:error:` | 14.0, 17, 17 |
+//! | `VNImageAestheticsScoresObservation` | `overallScore`, `isUtility` | 15.0, 18, 18 |
+//!
+//! No Vision symbol is imported, strong or weak:
+//! `no_vision_symbol_is_imported` reads the test binary's own symbol
+//! table, which holds every entry point's extraction, with `nm -m`.
 
 #[cfg(target_vendor = "apple")]
 use core::sync::atomic::{AtomicU8, Ordering};

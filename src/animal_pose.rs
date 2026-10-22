@@ -16,7 +16,7 @@ use crate::BodyPoseJoint;
 use crate::ffi::{
   ImageSource, MAX_POSE_JOINTS, MAX_VISION_RESULTS_PER_FRAME, PoseBudget, PoseJoints,
   ffi_nsstring_to_smolstr, guard_native, guard_vision_ffi, pose_bbox_from_joint_bounds,
-  read_pose_joints, run_requests, sanitize_confidence, vision_point_to_normalized,
+  read_pose_joints, run_requests, sanitize_confidence, vision_point_to_normalized, vision_string,
 };
 use crate::{AnalyzeError, AppleVisionAnimalPoseOptions, BodyPoseDetection, PixelPlane};
 
@@ -124,7 +124,7 @@ impl AnimalPoser {
     let Some(results) = (unsafe { self.request.results() }) else {
       return Vec::new();
     };
-    let Some(group_name) = (unsafe { VNAnimalBodyPoseObservationJointsGroupNameAll }) else {
+    let Some(group_name) = vision_string(c"VNAnimalBodyPoseObservationJointsGroupNameAll") else {
       return Vec::new();
     };
 
