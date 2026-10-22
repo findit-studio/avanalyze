@@ -29,56 +29,124 @@
 //! | every other framework and library linked (Foundation, CoreFoundation, CoreGraphics, CoreVideo, CoreImage, CoreMedia, AVFoundation, ImageIO, Metal, libobjc, libc++, libSystem, libiconv), and every symbol imported from them | linked and imported strongly | each older than the oldest systems rustc supports: macOS 10.12, iOS 10, tvOS 10, visionOS 1 |
 //! | every class below | by name at run time (objc2's `objc_getClass`, its default), after the floor check | 10.13 to 15.0, each at or below the floor |
 //! | every class below, where a consumer enables `objc2/unstable-static-class` | objc2 then emits each class as a static `OBJC_CLASS_$_…` reference, a strong link-time import: by its own documentation, "OS version < Class introduced version: Dynamic linker error on program startup" (objc2 0.6.5, `src/macros/mod.rs` 33–47, 509–513) | the class's own release: such a binary does not launch below it, so [`BelowFloor`](crate::AnalyzeErrorKind::BelowFloor) cannot answer there. The consumer's trade-off for opting into an unstable feature that changes linking, which this crate does not enable and no library can undo |
-//! | every selector below | by name at run time (`sel_registerName`), sent to an instance of its class, after the floor check | 10.13 to 15.0, each at or below the floor |
+//! | every selector below | by name (objc2's `sel_registerName` at run time; the native shim's selector reference, which dyld registers at load and which imports no symbol), sent to its class or an instance of it, after the floor check | 10.13 to 15.0, each at or below the floor |
 //! | the four `…JointsGroupNameAll` keys | by name, after the floor check (`ffi::vision_string`); never imported | body and hand 11.0, 14, 14; animal and 3-D body 14.0, 17, 17 |
 //! | the revisions (`VN…RequestRevisionN`) and enumerations (`VNRequestTextRecognitionLevel`, `VNChirality`, `VNHumanBodyPose3DObservationHeightEstimation`) | integers fixed at compile time | no symbol |
 //!
-//! The classes:
+//! The classes: every Vision class the product code names, and every
+//! superclass on its chain (`objc2-vision`'s `extern_class!` definitions),
+//! with the release each header gives it:
 //!
-//! | class | introduced |
-//! |---|---|
-//! | `VNRequest`, `VNImageBasedRequest`, `VNSequenceRequestHandler`, `VNObservation`, `VNDetectedObjectObservation`, `VNFaceObservation`, `VNFaceLandmarks2D`, `VNFaceLandmarkRegion2D`, `VNClassificationObservation`, `VNBarcodeObservation`, `VNHorizonObservation`, `VNRectangleObservation`, `VNPixelBufferObservation`, `VNDetectBarcodesRequest`, `VNDetectFaceLandmarksRequest`, `VNDetectFaceRectanglesRequest`, `VNDetectHorizonRequest`; the protocol `VNFaceObservationAccepting` | 10.13, 11, 11 |
-//! | `VNRecognizedObjectObservation` | 10.14, 12, 12 |
-//! | `VNRecognizedTextObservation`, `VNRecognizedText`, `VNSaliencyImageObservation`, `VNClassifyImageRequest`, `VNDetectFaceCaptureQualityRequest`, `VNDetectHumanRectanglesRequest`, `VNGenerateAttentionBasedSaliencyImageRequest`, `VNGenerateObjectnessBasedSaliencyImageRequest`, `VNRecognizeAnimalsRequest`, `VNRecognizeTextRequest` | 10.15, 13, 13 |
-//! | `VNRecognizedPoint`, `VNDetectedPoint`, `VNPoint`, `VNRecognizedPointsObservation`, `VNHumanBodyPoseObservation`, `VNHumanHandPoseObservation`, `VNStatefulRequest`, `VNDetectHumanBodyPoseRequest`, `VNDetectHumanHandPoseRequest` | 11.0, 14, 14 |
-//! | `VNHumanObservation`, `VNDetectDocumentSegmentationRequest`, `VNGeneratePersonSegmentationRequest` | 12.0, 15, 15 |
-//! | `VNPoint3D`, `VNRecognizedPoint3D`, `VNHumanBodyRecognizedPoint3D`, `VNAnimalBodyPoseObservation`, `VNHumanBodyPose3DObservation`, `VNInstanceMaskObservation`, `VNDetectAnimalBodyPoseRequest`, `VNDetectHumanBodyPose3DRequest`, `VNGeneratePersonInstanceMaskRequest` | 14.0, 17, 17 |
-//! | `VNImageAestheticsScoresObservation`, `VNCalculateImageAestheticsScoresRequest` | 15.0, 18, 18 (visionOS 2): the floor |
-//!
-//! The selectors, each with its class's release unless it names its own:
-//!
-//! | sent to | selectors | introduced |
+//! | class | its superclasses | introduced |
 //! |---|---|---|
-//! | every request class | `+new`; `results` | its class's |
-//! | `VNRequest` | `revision`, `setRevision:`, `+supportedRevisions` | 10.14, 12, 12 |
-//! | `VNSequenceRequestHandler` | `performRequests:onCGImage:error:`, `performRequests:onImageData:error:` | 10.13, 11, 11 |
-//! | `VNObservation` | `uuid`, `confidence` | 10.13, 11, 11 |
-//! | `VNDetectedObjectObservation`, `VNFaceObservation` | `boundingBox`, `landmarks` | 10.13, 11, 11 |
-//! | `VNFaceObservation` | `roll`, `yaw` | 10.14, 12, 12 |
-//! | `VNFaceObservation` | `faceCaptureQuality` | 10.15, 13, 13 |
-//! | `VNFaceObservation` | `pitch` | 12.0, 15, 15 |
-//! | `VNFaceLandmarks2D` | `allPoints`, `faceContour`, `leftEye`, `rightEye`, `leftEyebrow`, `rightEyebrow`, `nose`, `noseCrest`, `medianLine`, `outerLips`, `innerLips`, `leftPupil`, `rightPupil`, `confidence` | 10.13, 11, 11 |
-//! | `VNFaceLandmarkRegion2D` | `pointCount`, `normalizedPoints` | 10.13, 11, 11 |
-//! | `VNClassificationObservation` | `identifier` | 10.13, 11, 11 |
-//! | `VNBarcodeObservation` | `payloadStringValue`, `symbology` | 10.13, 11, 11 |
-//! | `VNHorizonObservation` | `angle` | 10.13, 11, 11 |
-//! | `VNRectangleObservation` | `topLeft`, `topRight`, `bottomLeft`, `bottomRight` | 10.13, 11, 11 |
-//! | `VNPixelBufferObservation` | `pixelBuffer` | 10.13, 11, 11 |
-//! | `VNRecognizedObjectObservation` | `labels` | 10.14, 12, 12 |
-//! | `VNRecognizedTextObservation`, `VNRecognizedText` | `topCandidates:`, `string`, `confidence` | 10.15, 13, 13 |
-//! | `VNSaliencyImageObservation` | `salientObjects` | 10.15, 13, 13 |
-//! | `VNRecognizeTextRequest` | `setRecognitionLevel:`, `setRecognitionLanguages:`, `setUsesLanguageCorrection:`, `setCustomWords:`, `setMinimumTextHeight:` | 10.15, 13, 13 |
-//! | `VNRecognizeTextRequest` | `supportedRecognitionLanguagesAndReturnError:` | 12.0, 15, 15 |
-//! | `VNRecognizeTextRequest` | `setAutomaticallyDetectsLanguage:` | 13.0, 16, 16 |
-//! | `VNPoint`, `VNRecognizedPoint` | `x`, `y`, `identifier`, `confidence` | 11.0, 14, 14 |
-//! | `VNRecognizedPointsObservation` | `recognizedPointsForJointsGroupName:error:` | 11.0, 14, 14 |
-//! | `VNDetectHumanHandPoseRequest` | `setMaximumHandCount:` | 11.0, 14, 14 |
-//! | `VNHumanHandPoseObservation` | `chirality` | 12.0, 15, 15 |
-//! | `VNDetectHumanRectanglesRequest` | `setUpperBodyOnly:` | 12.0, 15, 15 |
-//! | `VNHumanBodyPose3DObservation`, `VNAnimalBodyPoseObservation` | `recognizedPointsForJointsGroupName:error:`, `bodyHeight`, `heightEstimation` | 14.0, 17, 17 |
-//! | `VNRecognizedPoint3D` | `identifier` | 14.0, 17, 17 |
-//! | `VNInstanceMaskObservation` | `allInstances`, `generateMaskForInstances:error:` | 14.0, 17, 17 |
-//! | `VNImageAestheticsScoresObservation` | `overallScore`, `isUtility` | 15.0, 18, 18 |
+//! | `VNRequest` | `NSObject` | 10.13, 11, 11 |
+//! | `VNImageBasedRequest` | `VNRequest`, `NSObject` | 10.13, 11, 11 |
+//! | `VNSequenceRequestHandler` | `NSObject` | 10.13, 11, 11 |
+//! | `VNObservation` | `NSObject` | 10.13, 11, 11 |
+//! | `VNDetectedObjectObservation` | `VNObservation`, `NSObject` | 10.13, 11, 11 |
+//! | `VNRectangleObservation` | `VNDetectedObjectObservation`, `VNObservation`, `NSObject` | 10.13, 11, 11 |
+//! | `VNFaceObservation` | `VNDetectedObjectObservation`, `VNObservation`, `NSObject` | 10.13, 11, 11 |
+//! | `VNBarcodeObservation` | `VNRectangleObservation`, `VNDetectedObjectObservation`, `VNObservation`, `NSObject` | 10.13, 11, 11 |
+//! | `VNClassificationObservation` | `VNObservation`, `NSObject` | 10.13, 11, 11 |
+//! | `VNHorizonObservation` | `VNObservation`, `NSObject` | 10.13, 11, 11 |
+//! | `VNPixelBufferObservation` | `VNObservation`, `NSObject` | 10.13, 11, 11 |
+//! | `VNFaceLandmarks` | `NSObject` | 10.13, 11, 11 |
+//! | `VNFaceLandmarks2D` | `VNFaceLandmarks`, `NSObject` | 10.13, 11, 11 |
+//! | `VNFaceLandmarkRegion` | `NSObject` | 10.13, 11, 11 |
+//! | `VNFaceLandmarkRegion2D` | `VNFaceLandmarkRegion`, `NSObject` | 10.13, 11, 11 |
+//! | `VNDetectBarcodesRequest` | `VNImageBasedRequest`, `VNRequest`, `NSObject` | 10.13, 11, 11 |
+//! | `VNDetectFaceLandmarksRequest` | `VNImageBasedRequest`, `VNRequest`, `NSObject` | 10.13, 11, 11 |
+//! | `VNDetectFaceRectanglesRequest` | `VNImageBasedRequest`, `VNRequest`, `NSObject` | 10.13, 11, 11 |
+//! | `VNDetectHorizonRequest` | `VNImageBasedRequest`, `VNRequest`, `NSObject` | 10.13, 11, 11 |
+//! | `VNRecognizedObjectObservation` | `VNDetectedObjectObservation`, `VNObservation`, `NSObject` | 10.14, 12, 12 |
+//! | `VNRecognizedTextObservation` | `VNRectangleObservation`, `VNDetectedObjectObservation`, `VNObservation`, `NSObject` | 10.15, 13, 13 |
+//! | `VNRecognizedText` | `NSObject` | 10.15, 13, 13 |
+//! | `VNSaliencyImageObservation` | `VNPixelBufferObservation`, `VNObservation`, `NSObject` | 10.15, 13, 13 |
+//! | `VNClassifyImageRequest` | `VNImageBasedRequest`, `VNRequest`, `NSObject` | 10.15, 13, 13 |
+//! | `VNDetectFaceCaptureQualityRequest` | `VNImageBasedRequest`, `VNRequest`, `NSObject` | 10.15, 13, 13 |
+//! | `VNDetectHumanRectanglesRequest` | `VNImageBasedRequest`, `VNRequest`, `NSObject` | 10.15, 13, 13 |
+//! | `VNGenerateAttentionBasedSaliencyImageRequest` | `VNImageBasedRequest`, `VNRequest`, `NSObject` | 10.15, 13, 13 |
+//! | `VNGenerateObjectnessBasedSaliencyImageRequest` | `VNImageBasedRequest`, `VNRequest`, `NSObject` | 10.15, 13, 13 |
+//! | `VNRecognizeAnimalsRequest` | `VNImageBasedRequest`, `VNRequest`, `NSObject` | 10.15, 13, 13 |
+//! | `VNRecognizeTextRequest` | `VNImageBasedRequest`, `VNRequest`, `NSObject` | 10.15, 13, 13 |
+//! | `VNPoint` | `NSObject` | 11.0, 14, 14 |
+//! | `VNDetectedPoint` | `VNPoint`, `NSObject` | 11.0, 14, 14 |
+//! | `VNRecognizedPoint` | `VNDetectedPoint`, `VNPoint`, `NSObject` | 11.0, 14, 14 |
+//! | `VNRecognizedPointsObservation` | `VNObservation`, `NSObject` | 11.0, 14, 14 |
+//! | `VNHumanBodyPoseObservation` | `VNRecognizedPointsObservation`, `VNObservation`, `NSObject` | 11.0, 14, 14 |
+//! | `VNHumanHandPoseObservation` | `VNRecognizedPointsObservation`, `VNObservation`, `NSObject` | 11.0, 14, 14 |
+//! | `VNRecognizedPoints3DObservation` | `VNObservation`, `NSObject` | 11.0, 14, 14 |
+//! | `VNStatefulRequest` | `VNImageBasedRequest`, `VNRequest`, `NSObject` | 11.0, 14, 14 |
+//! | `VNDetectHumanBodyPoseRequest` | `VNImageBasedRequest`, `VNRequest`, `NSObject` | 11.0, 14, 14 |
+//! | `VNDetectHumanHandPoseRequest` | `VNImageBasedRequest`, `VNRequest`, `NSObject` | 11.0, 14, 14 |
+//! | `VNHumanObservation` | `VNDetectedObjectObservation`, `VNObservation`, `NSObject` | 12.0, 15, 15 |
+//! | `VNDetectDocumentSegmentationRequest` | `VNImageBasedRequest`, `VNRequest`, `NSObject` | 12.0, 15, 15 |
+//! | `VNGeneratePersonSegmentationRequest` | `VNStatefulRequest`, `VNImageBasedRequest`, `VNRequest`, `NSObject` | 12.0, 15, 15 |
+//! | `VNPoint3D` | `NSObject` | 14.0, 17, 17 |
+//! | `VNRecognizedPoint3D` | `VNPoint3D`, `NSObject` | 14.0, 17, 17 |
+//! | `VNHumanBodyRecognizedPoint3D` | `VNRecognizedPoint3D`, `VNPoint3D`, `NSObject` | 14.0, 17, 17 |
+//! | `VNAnimalBodyPoseObservation` | `VNRecognizedPointsObservation`, `VNObservation`, `NSObject` | 14.0, 17, 17 |
+//! | `VNHumanBodyPose3DObservation` | `VNRecognizedPoints3DObservation`, `VNObservation`, `NSObject` | 14.0, 17, 17 |
+//! | `VNInstanceMaskObservation` | `VNObservation`, `NSObject` | 14.0, 17, 17 |
+//! | `VNDetectAnimalBodyPoseRequest` | `VNImageBasedRequest`, `VNRequest`, `NSObject` | 14.0, 17, 17 |
+//! | `VNDetectHumanBodyPose3DRequest` | `VNStatefulRequest`, `VNImageBasedRequest`, `VNRequest`, `NSObject` | 14.0, 17, 17 |
+//! | `VNGeneratePersonInstanceMaskRequest` | `VNImageBasedRequest`, `VNRequest`, `NSObject` | 14.0, 17, 17 |
+//! | `VNImageAestheticsScoresObservation` | `VNObservation`, `NSObject` | 15.0, 18, 18 (visionOS 2): the floor |
+//! | `VNCalculateImageAestheticsScoresRequest` | `VNImageBasedRequest`, `VNRequest`, `NSObject` | 15.0, 18, 18 (visionOS 2): the floor |
+//! | the protocol `VNFaceObservationAccepting`, adopted by `VNDetectFaceCaptureQualityRequest` and `VNDetectFaceLandmarksRequest` | | 10.13, 11, 11 |
+//!
+//! The selectors: every Objective-C message the product code sends to a
+//! Vision object or class — each generated method it calls, its one
+//! `msg_send!` and the native shims' sends — by the class or protocol that
+//! declares it, with the release its header gives it (the declaring class's
+//! unless the selector names its own):
+//!
+//! | declared on | selectors | sent to | introduced |
+//! |---|---|---|---|
+//! | `NSObject` | `+new` | every request class above, and `VNSequenceRequestHandler` (`ffi.rs`) | the receiving class's |
+//! | `VNRequest` | `results` | every request class, each redeclaring it typed | the receiving class's |
+//! | `VNRequest` | `revision`, `setRevision:` | the request classes | 10.14, 12, 12 |
+//! | `VNRequest` | `+supportedRevisions` | `VNRecognizeTextRequest`, by `msg_send!` (`text.rs`) | 10.14, 12, 12 |
+//! | `VNSequenceRequestHandler` | `performRequests:onCGImage:error:`, `performRequests:onImageData:error:` | `VNSequenceRequestHandler` | 10.13, 11, 11 |
+//! | the protocol `VNFaceObservationAccepting` | `setInputFaceObservations:` | `VNDetectFaceCaptureQualityRequest`, `VNDetectFaceLandmarksRequest` (`face.rs`) | 10.13, 11, 11 |
+//! | `VNObservation` | `confidence` | every observation read | 10.13, 11, 11 |
+//! | `VNObservation` | `uuid` | `VNFaceObservation` | 10.13, 11, 11 |
+//! | `VNDetectedObjectObservation` | `boundingBox` | its subclasses read | 10.13, 11, 11 |
+//! | `VNFaceObservation` | `landmarks` | `VNFaceObservation` | 10.13, 11, 11 |
+//! | `VNFaceObservation` | `roll`, `yaw` | `VNFaceObservation` | 10.14, 12, 12 |
+//! | `VNFaceObservation` | `faceCaptureQuality` | `VNFaceObservation` | 10.15, 13, 13 |
+//! | `VNFaceObservation` | `pitch` | `VNFaceObservation` | 12.0, 15, 15 |
+//! | `VNFaceLandmarks` | `confidence` | `VNFaceLandmarks2D` | 10.13, 11, 11 |
+//! | `VNFaceLandmarks2D` | `allPoints`, `faceContour`, `leftEye`, `rightEye`, `leftEyebrow`, `rightEyebrow`, `nose`, `noseCrest`, `medianLine`, `outerLips`, `innerLips`, `leftPupil`, `rightPupil` | `VNFaceLandmarks2D` | 10.13, 11, 11 |
+//! | `VNFaceLandmarkRegion` | `pointCount` | `VNFaceLandmarkRegion2D` | 10.13, 11, 11 |
+//! | `VNFaceLandmarkRegion2D` | `normalizedPoints` | `VNFaceLandmarkRegion2D` | 10.13, 11, 11 |
+//! | `VNClassificationObservation` | `identifier` | `VNClassificationObservation`, a recognized object's labels among them | 10.13, 11, 11 |
+//! | `VNBarcodeObservation` | `payloadStringValue`, `symbology` | `VNBarcodeObservation` | 10.13, 11, 11 |
+//! | `VNHorizonObservation` | `angle` | `VNHorizonObservation` | 10.13, 11, 11 |
+//! | `VNRectangleObservation` | `topLeft`, `topRight`, `bottomLeft`, `bottomRight` | `VNRectangleObservation` and its subclasses read | 10.13, 11, 11 |
+//! | `VNPixelBufferObservation` | `pixelBuffer` | `VNPixelBufferObservation`, the person segmentation's | 10.13, 11, 11 |
+//! | `VNRecognizedObjectObservation` | `labels` | `VNRecognizedObjectObservation` | 10.14, 12, 12 |
+//! | `VNRecognizedTextObservation` | `topCandidates:` | `VNRecognizedTextObservation` | 10.15, 13, 13 |
+//! | `VNRecognizedText` | `string`, `confidence` | `VNRecognizedText` | 10.15, 13, 13 |
+//! | `VNSaliencyImageObservation` | `salientObjects` | `VNSaliencyImageObservation` | 10.15, 13, 13 |
+//! | `VNRecognizeTextRequest` | `setRecognitionLevel:`, `setRecognitionLanguages:`, `setUsesLanguageCorrection:`, `setCustomWords:`, `setMinimumTextHeight:` | `VNRecognizeTextRequest` | 10.15, 13, 13 |
+//! | `VNRecognizeTextRequest` | `supportedRecognitionLanguagesAndReturnError:` | `VNRecognizeTextRequest` | 12.0, 15, 15 |
+//! | `VNRecognizeTextRequest` | `setAutomaticallyDetectsLanguage:` | `VNRecognizeTextRequest` | 13.0, 16, 16 |
+//! | `VNPoint` | `x`, `y` | `VNRecognizedPoint` | 11.0, 14, 14 |
+//! | `VNDetectedPoint` | `confidence` | `VNRecognizedPoint` | 11.0, 14, 14 |
+//! | `VNHumanBodyPoseObservation`, `VNHumanHandPoseObservation` | `recognizedPointsForJointsGroupName:error:` | the two | 11.0, 14, 14 |
+//! | `VNDetectHumanHandPoseRequest` | `setMaximumHandCount:` | `VNDetectHumanHandPoseRequest` | 11.0, 14, 14 |
+//! | `VNHumanHandPoseObservation` | `chirality` | `VNHumanHandPoseObservation` | 12.0, 15, 15 |
+//! | `VNDetectHumanRectanglesRequest` | `setUpperBodyOnly:` | `VNDetectHumanRectanglesRequest` | 12.0, 15, 15 |
+//! | `VNAnimalBodyPoseObservation` | `recognizedPointsForJointsGroupName:error:` | `VNAnimalBodyPoseObservation` | 14.0, 17, 17 |
+//! | `VNHumanBodyPose3DObservation` | `recognizedPointsForJointsGroupName:error:`, `bodyHeight`, `heightEstimation` | `VNHumanBodyPose3DObservation` | 14.0, 17, 17 |
+//! | `VNPoint3D` | `position` | `VNHumanBodyRecognizedPoint3D`, by the native shim (`objc_simd_shim.m`, `avanalyze_0_8_vn_point3d_position`) | 14.0, 17, 17 |
+//! | `VNInstanceMaskObservation` | `allInstances`, `generateMaskForInstances:error:` | `VNInstanceMaskObservation` | 14.0, 17, 17 |
+//! | `VNImageAestheticsScoresObservation` | `overallScore`, `isUtility` | `VNImageAestheticsScoresObservation` | 15.0, 18, 18 |
+//!
+//! The other native shim, the exception barrier (`objc_cxx_barrier.mm`),
+//! sends Foundation's `name`, `reason` and `UTF8String` alone, to the
+//! exception in flight.
 //!
 //! No Vision symbol is imported, strong or weak:
 //! `no_vision_symbol_is_imported` reads the test binary's own symbol
