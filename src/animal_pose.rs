@@ -16,7 +16,7 @@ use crate::BodyPoseJoint;
 use crate::ffi::{
   ImageSource, MAX_POSE_JOINTS, MAX_VISION_RESULTS_PER_FRAME, PoseBudget, PoseJoints,
   ffi_nsstring_to_smolstr, guard_native, guard_vision_ffi, pose_bbox_from_joint_bounds,
-  read_pose_joints, run_requests, sanitize_confidence, vision_point_to_normalized,
+  read_pose_joints, run_requests, sanitize_confidence, vision_point_to_normalized, vision_string,
 };
 use crate::{AnalyzeError, AppleVisionAnimalPoseOptions, BodyPoseDetection, PixelPlane};
 
@@ -29,9 +29,19 @@ use crate::{AnalyzeError, AppleVisionAnimalPoseOptions, BodyPoseDetection, Pixel
 /// `performRequests` / `results()`, so a poser is not safe to share
 /// across threads; build one per worker.
 #[cfg(target_vendor = "apple")]
-#[derive(Debug)]
 pub struct AnimalPoser {
   request: Retained<VNDetectAnimalBodyPoseRequest>,
+}
+
+/// Prints the type name and what is cached in plain Rust. The retained
+/// Vision request is never formatted: `Retained`'s `Debug` sends
+/// `-[NSObject description]` to it, which would put a Vision message
+/// outside the exception barrier and the selector census.
+#[cfg(target_vendor = "apple")]
+impl core::fmt::Debug for AnimalPoser {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.debug_struct("AnimalPoser").finish_non_exhaustive()
+  }
 }
 
 #[cfg(target_vendor = "apple")]
@@ -44,6 +54,11 @@ impl AnimalPoser {
   ///
   /// # Errors
   ///
+  /// [`AnalyzeErrorKind::BelowFloor`](crate::AnalyzeErrorKind::BelowFloor)
+  /// on a system older than [`SYSTEM_FLOOR`](crate::SYSTEM_FLOOR), checked
+  /// first, before anything is sent: the message names this constructor
+  /// and the floor.
+  ///
   /// Building a Vision request loads a model, and a model load is where
   /// Apple's stack raises instead of returning: on a host whose Neural
   /// Engine is denied it throws, and a throw that crosses into Rust
@@ -53,7 +68,9 @@ impl AnimalPoser {
   /// be declined, before any frame has been handed to it.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn new(_options: &AppleVisionAnimalPoseOptions) -> Result<Self, AnalyzeError> {
-    let request = guard_native("AnimalPoser::new", || unsafe {
+    const SITE: &str = "AnimalPoser::new";
+    crate::floor::require_floor(SITE)?;
+    let request = guard_native(SITE, || unsafe {
       let request = VNDetectAnimalBodyPoseRequest::new();
       request.setRevision(VNDetectAnimalBodyPoseRequestRevision1);
       request
@@ -117,7 +134,7 @@ impl AnimalPoser {
     let Some(results) = (unsafe { self.request.results() }) else {
       return Vec::new();
     };
-    let Some(group_name) = (unsafe { VNAnimalBodyPoseObservationJointsGroupNameAll }) else {
+    let Some(group_name) = vision_string(c"VNAnimalBodyPoseObservationJointsGroupNameAll") else {
       return Vec::new();
     };
 

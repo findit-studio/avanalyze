@@ -63,13 +63,24 @@ const MAX_SALIENCY_REGIONS_PER_FRAME: usize = 64;
 /// faces, landmarks, poses and masks are separate entry points and
 /// their models are never loaded by this one.
 #[cfg(target_vendor = "apple")]
-#[derive(Debug)]
 pub struct VisionAnalyzer {
   requests: VisionRequests,
 }
 
+/// Prints the type name and the pinned revisions in plain Rust. The
+/// retained Vision requests are never formatted: `Retained`'s `Debug`
+/// sends `-[NSObject description]` to each, which would put a Vision
+/// message outside the exception barrier and the selector census.
 #[cfg(target_vendor = "apple")]
-#[derive(Debug)]
+impl core::fmt::Debug for VisionAnalyzer {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.debug_struct("VisionAnalyzer")
+      .field("revisions", &self.requests.revisions)
+      .finish_non_exhaustive()
+  }
+}
+
+#[cfg(target_vendor = "apple")]
 struct VisionRequests {
   classify: Retained<VNClassifyImageRequest>,
   human_rectangles: Retained<VNDetectHumanRectanglesRequest>,
@@ -83,6 +94,17 @@ struct VisionRequests {
   /// closure that pinned them, so the public reader sends no message
   /// of its own.
   revisions: Revisions<VisionAnalyzerRevisions, 8>,
+}
+
+/// Pure Rust, like [`VisionAnalyzer`]'s: the pinned revisions and
+/// nothing read off a retained request.
+#[cfg(target_vendor = "apple")]
+impl core::fmt::Debug for VisionRequests {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.debug_struct("VisionRequests")
+      .field("revisions", &self.revisions)
+      .finish_non_exhaustive()
+  }
 }
 
 #[cfg(target_vendor = "apple")]
@@ -178,6 +200,11 @@ impl VisionAnalyzer {
   ///
   /// # Errors
   ///
+  /// [`AnalyzeErrorKind::BelowFloor`](crate::AnalyzeErrorKind::BelowFloor)
+  /// on a system older than [`SYSTEM_FLOOR`](crate::SYSTEM_FLOOR), checked
+  /// first, before anything is sent: the message names this constructor
+  /// and the floor.
+  ///
   /// Building a Vision request loads a model, and a model load is where
   /// Apple's stack raises instead of returning: on a host whose Neural
   /// Engine is denied it throws, and a throw that crosses into Rust
@@ -187,6 +214,7 @@ impl VisionAnalyzer {
   /// be declined, before any frame has been handed to it.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn new(options: &AnalyzeOptions) -> Result<Self, AnalyzeError> {
+    crate::floor::require_floor("VisionAnalyzer::new")?;
     Ok(Self {
       requests: VisionRequests::new(options)?,
     })

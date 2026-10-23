@@ -44,12 +44,24 @@ pub trait BarcodeDetection: Sized {
 /// `performRequests` / `results()`, so a detector is not safe to share
 /// across threads; build one per worker.
 #[cfg(target_vendor = "apple")]
-#[derive(Debug)]
 pub struct BarcodeDetector {
   request: Retained<VNDetectBarcodesRequest>,
   /// Read back from the request above inside the same guarded closure
   /// that pinned it, so the public reader sends no message of its own.
   revision: usize,
+}
+
+/// Prints the type name and what is cached in plain Rust. The retained
+/// Vision request is never formatted: `Retained`'s `Debug` sends
+/// `-[NSObject description]` to it, which would put a Vision message
+/// outside the exception barrier and the selector census.
+#[cfg(target_vendor = "apple")]
+impl core::fmt::Debug for BarcodeDetector {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.debug_struct("BarcodeDetector")
+      .field("revision", &self.revision)
+      .finish_non_exhaustive()
+  }
 }
 
 #[cfg(target_vendor = "apple")]
@@ -62,6 +74,11 @@ impl BarcodeDetector {
   ///
   /// # Errors
   ///
+  /// [`AnalyzeErrorKind::BelowFloor`](crate::AnalyzeErrorKind::BelowFloor)
+  /// on a system older than [`SYSTEM_FLOOR`](crate::SYSTEM_FLOOR), checked
+  /// first, before anything is sent: the message names this constructor
+  /// and the floor.
+  ///
   /// Building a Vision request loads a model, and a model load is where
   /// Apple's stack raises instead of returning: on a host whose Neural
   /// Engine is denied it throws, and a throw that crosses into Rust
@@ -71,7 +88,9 @@ impl BarcodeDetector {
   /// be declined, before any frame has been handed to it.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn new(_options: &AppleVisionBarcodeOptions) -> Result<Self, AnalyzeError> {
-    let (request, revision) = guard_native("BarcodeDetector::new", || unsafe {
+    const SITE: &str = "BarcodeDetector::new";
+    crate::floor::require_floor(SITE)?;
+    let (request, revision) = guard_native(SITE, || unsafe {
       let request = VNDetectBarcodesRequest::new();
       request.setRevision(VNDetectBarcodesRequestRevision4);
       // Read back here, inside the barrier that already spans every

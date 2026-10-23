@@ -184,7 +184,7 @@ empty slot inside `Analysis`, an empty `Vec` from an entry point of its own.
 Individual detections are filtered before construction — non-finite geometry,
 out-of-range confidences, degenerate boxes — and a refused detection is silently
 absent; there is no "dropped" counter. An `Err` means no analysis happened at
-all, which is a surface of exactly four kinds.
+all, which is a surface of exactly five kinds.
 
 ## Nothing Apple raises kills the process (with `panic = "unwind"`)
 
@@ -218,12 +218,51 @@ same geometry — documents the identical limitation, and `catch_unwind` is iner
 there too. Under `panic = "abort"` you get what you had before this barrier
 existed: nothing is newly broken, and nothing is quietly weakened.
 
+## System floor
+
+Every entry point is built for the same systems: macOS 15, iOS 18, tvOS 18 and
+visionOS 2 (`SYSTEM_FLOOR`). The floor is where the newest Vision class any
+entry point builds arrives: `VisionAnalyzer` always builds
+`VNCalculateImageAestheticsScoresRequest`, which is
+`API_AVAILABLE(macos(15.0), ios(18.0), tvos(18.0), visionos(2.0))`. Every other
+class the nine constructors build is older.
+
+Below the floor, every constructor refuses with `AnalyzeErrorKind::BelowFloor`
+as its first act, before it sends a message or resolves a class, and the message
+names the entry point and the floor. That refusal replaces a panic: resolving a
+Vision class below its own floor panics. `AnalyzeErrorKind::Unsupported` keeps
+its other meaning, a platform with no Vision at all, so a caller tells an old
+system from a wrong one by the kind.
+
+A refusal needs a process to refuse in, and the loader refuses to start a
+binary whose strong imports its system lacks, before `main`. So the crate
+imports no Vision symbol: every class, selector and constant it reads is
+resolved by name, after the floor check (the census is in `src/floor.rs`).
+What it still links strongly is Vision itself and CoreML, through
+`objc2-vision`'s dependencies, which arrive at macOS 10.13, iOS 11 and tvOS 11.
+Every other framework and symbol it imports is older than the oldest systems
+rustc supports. A binary deployed below macOS 10.13, iOS 11 or tvOS 11, as
+rustc's defaults for x86_64 macOS (10.12), iOS and tvOS (10) are, starts on
+the systems those two frameworks predate only if it links them weakly:
+
+```sh
+RUSTFLAGS="-C link-arg=-Wl,-weak_framework,Vision -C link-arg=-Wl,-weak_framework,CoreML"
+```
+
+A consumer that enables `objc2`'s `unstable-static-class` feature makes every
+Vision class a strong link-time import (`OBJC_CLASS_$_…`), as `objc2` documents:
+dyld then refuses such a binary at launch on a system older than a class it
+references, before `BelowFloor` can answer. That is the trade-off of opting into
+an unstable feature that changes linking. This crate does not enable it.
+
+The system is asked once, through `objc2`'s availability check, which reads the
+version the way Apple's own `@available` does (Mac Catalyst and the simulators
+included), and the answer is kept for the process.
+
 ## Requirements
 
-- macOS (Vision.framework is Apple-only). `TextRecognizer` needs macOS 13 (iOS
-  16, tvOS 16, visionOS 1): its default revision 3 and its language detection
-  start there, and below that floor `TextRecognizer::new` refuses with
-  `AnalyzeErrorKind::Unsupported`, naming it.
+- macOS 15, iOS 18, tvOS 18 or visionOS 2 (Vision.framework is Apple-only); see
+  [System floor](#system-floor).
 - A working `objc2` toolchain (Xcode command-line tools).
 - Rust **1.95** or newer (edition 2024).
 
@@ -259,7 +298,9 @@ and the traits it builds:
 - `src/conformance.rs` — runnable assertions, per entry point.
 - `src/options.rs` — per-entry configuration knobs
   (`AppleVisionTextOptions`, `AppleVisionFaceOptions`, …) and `AnalyzeOptions`.
-- `src/error.rs` — `AnalyzeError` and its four kinds.
+- `src/error.rs` — `AnalyzeError` and its five kinds.
+- `src/floor.rs` — `SYSTEM_FLOOR`, written once, and the one check every
+  constructor makes first.
 
 ## License
 

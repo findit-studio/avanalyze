@@ -9,7 +9,7 @@ use objc2_vision::*;
 use crate::ffi::{
   ImageSource, MAX_POSE_JOINTS, MAX_VISION_RESULTS_PER_FRAME, PoseBudget, PoseJoints,
   ffi_nsstring_to_smolstr, guard_native, guard_vision_ffi, pose_bbox_from_joint_bounds,
-  read_pose_joints, run_requests, sanitize_confidence, vision_point_to_normalized,
+  read_pose_joints, run_requests, sanitize_confidence, vision_point_to_normalized, vision_string,
 };
 use crate::{AnalyzeError, AppleVisionHandPoseOptions, BodyPoseJoint, BoundingBox, PixelPlane};
 
@@ -76,9 +76,19 @@ pub trait HandPoseDetection: Sized {
 /// `performRequests` / `results()`, so a poser is not safe to share
 /// across threads; build one per worker.
 #[cfg(target_vendor = "apple")]
-#[derive(Debug)]
 pub struct HandPoser {
   request: Retained<VNDetectHumanHandPoseRequest>,
+}
+
+/// Prints the type name and what is cached in plain Rust. The retained
+/// Vision request is never formatted: `Retained`'s `Debug` sends
+/// `-[NSObject description]` to it, which would put a Vision message
+/// outside the exception barrier and the selector census.
+#[cfg(target_vendor = "apple")]
+impl core::fmt::Debug for HandPoser {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.debug_struct("HandPoser").finish_non_exhaustive()
+  }
 }
 
 #[cfg(target_vendor = "apple")]
@@ -93,6 +103,11 @@ impl HandPoser {
   ///
   /// # Errors
   ///
+  /// [`AnalyzeErrorKind::BelowFloor`](crate::AnalyzeErrorKind::BelowFloor)
+  /// on a system older than [`SYSTEM_FLOOR`](crate::SYSTEM_FLOOR), checked
+  /// first, before anything is sent: the message names this constructor
+  /// and the floor.
+  ///
   /// Building a Vision request loads a model, and a model load is where
   /// Apple's stack raises instead of returning: on a host whose Neural
   /// Engine is denied it throws, and a throw that crosses into Rust
@@ -102,7 +117,9 @@ impl HandPoser {
   /// be declined, before any frame has been handed to it.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn new(options: &AppleVisionHandPoseOptions) -> Result<Self, AnalyzeError> {
-    let request = guard_native("HandPoser::new", || unsafe {
+    const SITE: &str = "HandPoser::new";
+    crate::floor::require_floor(SITE)?;
+    let request = guard_native(SITE, || unsafe {
       let request = VNDetectHumanHandPoseRequest::new();
       request.setMaximumHandCount(
         options
@@ -176,12 +193,16 @@ impl HandPoser {
       return Vec::new();
     };
 
+    let Some(group_name) = vision_string(c"VNHumanHandPoseObservationJointsGroupNameAll") else {
+      return Vec::new();
+    };
+
     let mut budget = PoseBudget::new();
     let mut hand_poses = Vec::with_capacity(results.len().min(MAX_VISION_RESULTS_PER_FRAME));
     for obs in results.iter().take(MAX_VISION_RESULTS_PER_FRAME) {
-      let Ok(points_by_joint) = (unsafe {
-        obs.recognizedPointsForJointsGroupName_error(VNHumanHandPoseObservationJointsGroupNameAll)
-      }) else {
+      let Ok(points_by_joint) =
+        (unsafe { obs.recognizedPointsForJointsGroupName_error(group_name) })
+      else {
         continue;
       };
 

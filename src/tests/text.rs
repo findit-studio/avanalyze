@@ -8,12 +8,12 @@
 //! Core Graphics bitmap the pixel-door tests draw into: no fixture to
 //! vendor, and no doubt about what it says.
 //!
-//! One refusal has no law here. Below the recognizer's floor — macOS 13,
-//! iOS 16, tvOS 16, visionOS 1 — `TextRecognizer::new` refuses with
-//! `AnalyzeErrorKind::Unsupported` before anything is sent, and that
-//! branch cannot run on a system this suite runs on: every one of them
-//! is at or above the floor, as the laws below need it to be. It is not
-//! faked.
+//! One refusal has its law elsewhere. Below the crate's floor,
+//! `TextRecognizer::new` refuses with `AnalyzeErrorKind::BelowFloor`
+//! before anything is sent, as every entry point does, and that law is
+//! in `floor`, through the seam that simulates a system below it. Every
+//! system this suite runs on is at or above the floor, as the laws below
+//! need it to be.
 
 use core::{convert::Infallible, ffi::c_void};
 
@@ -271,6 +271,9 @@ fn custom_words(request: &VNRecognizeTextRequest) -> Option<Vec<String>> {
 /// The revisions the text request class implements on this host —
 /// asked of the class itself, as [`TextRecognizer::new`] asks it.
 fn implemented_revisions() -> Vec<usize> {
+  // Vision loaded by name, as a constructor loads it, so the law does not
+  // lean on how its binary links.
+  crate::ffi::vision().expect("Vision loads");
   // SAFETY: a class property getter, returning an `NSIndexSet`.
   let revisions: Retained<NSIndexSet> =
     unsafe { msg_send![VNRecognizeTextRequest::class(), supportedRevisions] };
@@ -286,6 +289,7 @@ fn implemented_revisions() -> Vec<usize> {
 
 /// The tags a text request at `revision` and `level` lists.
 fn listed_languages(revision: usize, level: VNRequestTextRecognitionLevel) -> Vec<String> {
+  crate::ffi::vision().expect("Vision loads");
   let request = VNRecognizeTextRequest::new();
   // SAFETY: plain property writes and a documented query on a live
   // request.

@@ -218,9 +218,19 @@ pub trait FaceLandmarksDetection: Sized {
 /// `performRequests` / `results()`, so a landmarker is not safe to
 /// share across threads; build one per worker.
 #[cfg(target_vendor = "apple")]
-#[derive(Debug)]
 pub struct FaceLandmarker {
   request: Retained<VNDetectFaceLandmarksRequest>,
+}
+
+/// Prints the type name and what is cached in plain Rust. The retained
+/// Vision request is never formatted: `Retained`'s `Debug` sends
+/// `-[NSObject description]` to it, which would put a Vision message
+/// outside the exception barrier and the selector census.
+#[cfg(target_vendor = "apple")]
+impl core::fmt::Debug for FaceLandmarker {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.debug_struct("FaceLandmarker").finish_non_exhaustive()
+  }
 }
 
 #[cfg(target_vendor = "apple")]
@@ -233,6 +243,11 @@ impl FaceLandmarker {
   ///
   /// # Errors
   ///
+  /// [`AnalyzeErrorKind::BelowFloor`](crate::AnalyzeErrorKind::BelowFloor)
+  /// on a system older than [`SYSTEM_FLOOR`](crate::SYSTEM_FLOOR), checked
+  /// first, before anything is sent: the message names this constructor
+  /// and the floor.
+  ///
   /// Building a Vision request loads a model, and a model load is where
   /// Apple's stack raises instead of returning: on a host whose Neural
   /// Engine is denied it throws, and a throw that crosses into Rust
@@ -242,7 +257,9 @@ impl FaceLandmarker {
   /// be declined, before any frame has been handed to it.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn new(_options: &AppleVisionFaceLandmarkOptions) -> Result<Self, AnalyzeError> {
-    let request = guard_native("FaceLandmarker::new", || unsafe {
+    const SITE: &str = "FaceLandmarker::new";
+    crate::floor::require_floor(SITE)?;
+    let request = guard_native(SITE, || unsafe {
       let request = VNDetectFaceLandmarksRequest::new();
       request.setRevision(VNDetectFaceLandmarksRequestRevision3);
       request

@@ -40,7 +40,7 @@ fn use_feature(feature: &str) {
 /// archives below and the `links` key in `Cargo.toml` are all scoped by
 /// this tag — the reasoning is on `src/objc_simd_shim.m`.
 /// [`assert_shim_abi_tag_matches_package_version`] keeps it honest.
-const SHIM_ABI_TAG: &str = "0_7";
+const SHIM_ABI_TAG: &str = "0_8";
 
 /// Fails the build when [`SHIM_ABI_TAG`] and the package version drift.
 ///
@@ -279,6 +279,13 @@ fn build_native_half() {
   if var("DOCS_RS").is_ok() {
     return;
   }
+
+  // The integration tests (`tests/`; Cargo's `-tests` link arguments reach
+  // no unit-test binary) link with `-dead_strip_dylibs`, which drops the
+  // load command of a framework a binary imports no symbol from — Vision,
+  // here — so their laws build requests where Vision is loaded by name
+  // alone (`ffi::vision`). Consumers' links are untouched.
+  println!("cargo:rustc-link-arg-tests=-Wl,-dead_strip_dylibs");
 
   objc_build()
     .file("src/objc_simd_shim.m")

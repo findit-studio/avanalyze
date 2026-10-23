@@ -6,8 +6,12 @@ use std::borrow::Cow;
 /// The engine's failure surface is deliberately tiny: everything that
 /// *can* degrade does so silently (a refused detection is simply not
 /// emitted), so an `Err` means no analysis happened at all.
+///
+/// Marked `#[non_exhaustive]`: a later kind joins without a breaking
+/// release, and a `match` keeps a wildcard arm for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
 pub enum AnalyzeErrorKind {
   /// The frame was refused before or during the Vision pass: the input
   /// exceeded the engine's byte ceiling, or Apple's batched
@@ -16,14 +20,11 @@ pub enum AnalyzeErrorKind {
   /// Vision answers an error to its question of which languages the
   /// text request reads.
   RequestFailed,
-  /// Apple's Vision framework is not available on this platform, or not
-  /// in the version an entry point needs.
+  /// Apple's Vision framework does not exist on this platform: every
+  /// entry point off Apple refuses with this kind.
   ///
-  /// The second is a system older than an entry point's declared floor:
-  /// [`TextRecognizer::new`](crate::TextRecognizer::new) refuses with this
-  /// kind below macOS 13, iOS 16, tvOS 16 and visionOS 1, and the message
-  /// names that floor. Either way it is a fact about the system, not about
-  /// the frame or the options, and the same call refuses again.
+  /// A system that has Vision but is too old for this crate is
+  /// [`BelowFloor`](Self::BelowFloor), not this.
   Unsupported,
   /// Apple's native stack raised instead of returning: an Objective-C
   /// or C++ exception escaped Vision, CoreML, or the Neural Engine
@@ -68,6 +69,19 @@ pub enum AnalyzeErrorKind {
   /// default roster and reports success; handed a revision it does not
   /// implement, it fails every frame, one at a time.
   InvalidOptions,
+  // Declared last on purpose: the serde derive numbers a unit variant by
+  // its position, so every kind that existed in 0.7 keeps its index and a
+  // 0.7 value never decodes as this one in an ordinal-based format.
+  /// This system is older than the crate's floor,
+  /// [`SYSTEM_FLOOR`](crate::SYSTEM_FLOOR) (macOS 15, iOS 18, tvOS 18,
+  /// visionOS 2).
+  ///
+  /// Every entry point's constructor refuses with this kind first, before
+  /// it sends a message or resolves a Vision class: below a class's own
+  /// floor, resolving it panics. The message names the entry point and the
+  /// floor. It is a fact about the system, not about the frame or the
+  /// options, and the same call refuses again.
+  BelowFloor,
 }
 
 impl fmt::Display for AnalyzeErrorKind {
@@ -75,6 +89,7 @@ impl fmt::Display for AnalyzeErrorKind {
     match self {
       Self::RequestFailed => f.write_str("apple-vision request failed"),
       Self::Unsupported => f.write_str("apple-vision unavailable"),
+      Self::BelowFloor => f.write_str("apple-vision needs a newer system"),
       Self::Environment => f.write_str("apple-vision raised a native exception"),
       Self::InvalidOptions => f.write_str("apple-vision options refused"),
     }

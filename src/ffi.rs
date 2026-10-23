@@ -10,8 +10,10 @@
 
 use std::{
   borrow::Cow,
-  ffi::{c_char, c_void},
+  ffi::{CStr, c_char, c_void},
   panic::AssertUnwindSafe,
+  ptr::NonNull,
+  sync::OnceLock,
 };
 
 use objc2::{Message, exception::catch as catch_objc_exception, rc::Retained};
@@ -20,7 +22,7 @@ use objc2_core_graphics::{
   CGBitmapInfo, CGColorRenderingIntent, CGColorSpace, CGDataProvider, CGImage, CGImageAlphaInfo,
   CGImageByteOrderInfo,
 };
-use objc2_foundation::{NSArray, NSData, NSDictionary};
+use objc2_foundation::{NSArray, NSData, NSDictionary, NSString};
 use objc2_vision::{VNRequest, VNSequenceRequestHandler};
 use smol_str::{SmolStr, ToSmolStr};
 
@@ -28,6 +30,80 @@ use crate::{
   AnalyzeError, AnalyzeErrorKind, BoundingBox, PixelFormat, PixelPlane,
   plane::MAX_DECODED_IMAGE_BYTES,
 };
+
+// ----- Vision, by name ------------------------------------------------------
+
+unsafe extern "C" {
+  // `<dlfcn.h>`, in libSystem, which every Apple binary links.
+  fn dlopen(path: *const c_char, mode: i32) -> *mut c_void;
+  fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+}
+
+/// Vision.framework's binary, at its system path on every Apple platform.
+pub(crate) const VISION_PATH: &CStr = c"/System/Library/Frameworks/Vision.framework/Vision";
+
+/// `RTLD_LAZY` in `<dlfcn.h>`.
+const RTLD_LAZY: i32 = 0x1;
+
+/// A `dlopen` handle, kept for the process.
+struct Handle(NonNull<c_void>);
+
+// SAFETY: a `dlopen` handle is a process-wide token that `dlsym` takes from
+// any thread; this crate never closes it.
+unsafe impl Send for Handle {}
+// SAFETY: as above; nothing mutates through it.
+unsafe impl Sync for Handle {}
+
+/// Vision, loaded once by name and kept loaded for the life of the process.
+///
+/// The crate imports no Vision symbol (the census in the `floor` module),
+/// so a binary linked with `-dead_strip_dylibs` drops Vision's load
+/// command, and objc2's lookup of a Vision class by name would then answer
+/// nothing. [`require_floor`](crate::floor::require_floor) loads it here
+/// once the floor is met, before any class is looked up. `None` where it
+/// cannot be loaded.
+pub(crate) fn vision() -> Option<NonNull<c_void>> {
+  static VISION: OnceLock<Option<Handle>> = OnceLock::new();
+  VISION
+    .get_or_init(|| {
+      // SAFETY: `VISION_PATH` is NUL-terminated; `dlopen` only reads it,
+      // and a handle it answers stays valid while it is not closed, which
+      // it never is.
+      NonNull::new(unsafe { dlopen(VISION_PATH.as_ptr(), RTLD_LAZY) }).map(Handle)
+    })
+    .as_ref()
+    .map(|handle| handle.0)
+}
+
+/// A Vision string constant — one of the four `…JointsGroupNameAll` keys
+/// the pose extractions read — resolved by name from the loaded Vision
+/// ([`vision`]), never imported.
+///
+/// A Rust `extern` static is a strong import, and the loader refuses to
+/// start a process on a system whose Vision lacks the symbol: before
+/// `main`, so before any constructor's floor check can answer
+/// [`BelowFloor`](crate::AnalyzeErrorKind::BelowFloor). Resolved here,
+/// after that check, no Vision symbol is in the binary's imports at all
+/// (the census in the `floor` module). `None` where Vision is not loaded,
+/// or exports no such symbol.
+pub(crate) fn vision_string(name: &CStr) -> Option<&'static NSString> {
+  let handle = vision()?;
+  // SAFETY: `handle` is a live `dlopen` handle; `name` is NUL-terminated,
+  // and `dlsym` only reads it.
+  let address = unsafe { dlsym(handle.as_ptr(), name.as_ptr()) };
+  if address.is_null() {
+    return None;
+  }
+  // SAFETY: every name this is called with is a Vision
+  // `NSString *const` global (`VN_EXPORT … const …` in the SDK headers):
+  // its address holds the string's pointer, set before the image's symbols
+  // are visible, and the string lives as long as Vision, which is never
+  // unloaded.
+  let string = unsafe { address.cast::<*const NSString>().read() };
+  // SAFETY: a pointer there that is not null is a live, immutable
+  // `NSString`.
+  unsafe { string.as_ref() }
+}
 
 // ----- resource ceilings shared by more than one entry point ----------------
 
@@ -649,7 +725,7 @@ pub(crate) fn validate_raw_slice_elems<T>(elem_count: usize, max_elems: usize) -
 /// which NUL-terminates regardless.
 const GUARD_MESSAGE_CAPACITY: usize = 512;
 
-/// What [`avanalyze_0_7_guard`] reports about the call it ran.
+/// What [`avanalyze_0_8_guard`] reports about the call it ran.
 ///
 /// The numbers are the trampoline's, spelled out in
 /// `src/objc_cxx_barrier.mm`; this is where they are given meaning. A
@@ -807,7 +883,7 @@ pub(crate) fn guard_native<R, F: FnOnce() -> R>(
   // length passed, which is its own. The call may return through a
   // rethrown Rust panic, which is why the declaration is `C-unwind`.
   let status = unsafe {
-    avanalyze_0_7_guard(
+    avanalyze_0_8_guard(
       run::<F, R>,
       core::ptr::from_mut(&mut call).cast(),
       message.as_mut_ptr().cast(),
@@ -871,9 +947,9 @@ unsafe extern "C-unwind" {
   /// `src/objc_cxx_barrier.mm` — one `try`, three outcomes, and
   /// everything it cannot name left to keep unwinding.
   ///
-  /// The `0_7` is the crate's major.minor, for the reason the simd
+  /// The `0_8` is the crate's major.minor, for the reason the simd
   /// shim's declaration below spells out.
-  fn avanalyze_0_7_guard(
+  fn avanalyze_0_8_guard(
     body: unsafe extern "C-unwind" fn(*mut c_void),
     context: *mut c_void,
     message: *mut c_char,
@@ -974,11 +1050,11 @@ pub(crate) fn guard_vision_ffi<R>(detector: &'static str, fallback: R, f: impl F
 unsafe extern "C-unwind" {
   /// `src/objc_simd_shim.m` — one message send, emitted by Clang.
   ///
-  /// The `0_7` is the crate's major.minor, not decoration: C has no
+  /// The `0_8` is the crate's major.minor, not decoration: C has no
   /// namespaces, so an unversioned name would collide with a second
   /// avanalyze in the same graph. `build.rs` scopes the archive and
   /// fails the build if the tag stops matching the package version.
-  fn avanalyze_0_7_vn_point3d_position(receiver: *mut objc2::runtime::AnyObject, out: *mut f32);
+  fn avanalyze_0_8_vn_point3d_position(receiver: *mut objc2::runtime::AnyObject, out: *mut f32);
 }
 
 /// Reads `-[VNPoint3D position]` off `receiver`, as 16 floats in
@@ -1049,7 +1125,7 @@ pub(crate) unsafe fn vn_point3d_position<T: Message>(receiver: &T) -> [f32; 16] 
   // which is the length of `matrix`. The receiver is borrowed for the
   // call, so it outlives it; the caller upholds the receiver contract.
   unsafe {
-    avanalyze_0_7_vn_point3d_position(
+    avanalyze_0_8_vn_point3d_position(
       core::ptr::from_ref(receiver).cast_mut().cast(),
       matrix.as_mut_ptr(),
     );
@@ -1563,12 +1639,23 @@ impl ImageSource<'_> {
 }
 
 /// The prepared image one perform runs against.
-#[derive(Debug)]
 pub(crate) enum VisionImage {
   /// `performRequests:onImageData:` — Vision decodes.
   Encoded(Retained<NSData>),
   /// `performRequests:onCGImage:` — nothing decodes.
   Decoded(CFRetained<CGImage>),
+}
+
+/// Names the variant and nothing else: formatting the retained handle
+/// would send `-[NSObject description]` (or copy a Core Foundation
+/// description) outside the exception barrier.
+impl core::fmt::Debug for VisionImage {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    match self {
+      Self::Encoded(_) => f.write_str("VisionImage::Encoded"),
+      Self::Decoded(_) => f.write_str("VisionImage::Decoded"),
+    }
+  }
 }
 
 /// The `(bits per pixel, colour space, bitmap info)` Core Graphics needs

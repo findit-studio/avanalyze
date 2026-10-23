@@ -41,6 +41,16 @@
 //! in and in nothing else — same requests, same options, same ceilings,
 //! same per-detector degradation, same output vocabulary — because an
 //! entry point's two methods are one body reached two ways.
+//!
+//! # One system floor
+//!
+//! Every entry point is built for the same systems: [`SYSTEM_FLOOR`],
+//! macOS 15, iOS 18, tvOS 18 and visionOS 2, where the newest Vision
+//! class any of them builds arrives. Below it, each constructor refuses
+//! with [`AnalyzeErrorKind::BelowFloor`] as its first act, before it sends
+//! a message or resolves a class. Resolving a class below its own floor
+//! panics; the refusal is an `Err` that names the entry point and the
+//! floor.
 
 pub use analysis::*;
 pub use analyzer::*;
@@ -51,6 +61,7 @@ pub use contract::*;
 pub use error::*;
 pub use face::*;
 pub use face_landmarks::*;
+pub use floor::SYSTEM_FLOOR;
 pub use hand_pose::*;
 pub use options::*;
 pub use person_mask::*;
@@ -68,6 +79,7 @@ mod contract;
 mod error;
 mod face;
 mod face_landmarks;
+mod floor;
 mod hand_pose;
 mod options;
 mod person_mask;

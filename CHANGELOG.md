@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.8.0 — 2026-10-23
+
+Two arrivals.
 
 Text recognition reads the language the text is written in. `TextRecognizer`
 built its request at revision 3 and set nothing else, so Vision's defaults
@@ -9,7 +11,45 @@ came back as Latin letters, or not at all (avanalyze#40). The request's own
 properties are now options, set on the request when the recognizer is built,
 and the default turns language detection on.
 
+And the crate has one system floor, macOS 15, iOS 18, tvOS 18 and visionOS 2,
+which every entry point checks first. Until now no floor was declared, so each
+constructor resolved its Vision classes unguarded, and below a class's own floor
+that panics:
+- `VisionAnalyzer` below macOS 15, where its aesthetics request arrives;
+- the 3-D body pose, person instance mask and animal pose below macOS 14;
+- text below macOS 10.15.
+
+The barcode detector pinned revision 4, which arrives at macOS 14. Below the
+floor every constructor now refuses with `AnalyzeErrorKind::BelowFloor` instead.
+
+For that refusal to be reachable a process must start below the floor, so the
+crate imports no Vision symbol at all. The four `…JointsGroupNameAll` keys the
+pose extractors read — macOS 11 and 14, iOS and tvOS 14 and 17 — were Rust
+`extern` statics, which are strong imports, and the loader refused to start a
+binary holding them on a system without them, before `main`. They are now
+resolved by name, after the floor check. Every class and selector is resolved
+by name at run time, after it too, and each is at or below the floor; the
+`floor` module's census lists them all with their releases. What a binary
+still links strongly is Vision itself and CoreML, through `objc2-vision`'s
+dependencies, which arrive at macOS 10.13, iOS 11 and tvOS 11. A binary
+deployed below those, as rustc's defaults for x86_64 macOS, iOS and tvOS are,
+starts on the systems they predate only if it links both weakly
+(`-C link-arg=-Wl,-weak_framework,Vision`, and the same for `CoreML`). A
+consumer that enables `objc2/unstable-static-class` makes every Vision class a
+strong link-time import, so such a binary does not launch below each class's
+release, and `BelowFloor` cannot answer there: that feature is the consumer's
+trade-off, and the crate does not enable it.
+
 ### Added
+
+- **`SYSTEM_FLOOR` and `AnalyzeErrorKind::BelowFloor`.** `SYSTEM_FLOOR` names
+  the oldest systems the crate is built on, macOS 15, iOS 18, tvOS 18 and
+  visionOS 2. Below them every entry point's constructor refuses with
+  `BelowFloor` as its first act, before it sends a message or resolves a class,
+  and the message names the entry point and the floor. The floor is where the
+  newest class any entry point builds arrives:
+  `VNCalculateImageAestheticsScoresRequest`, which `VisionAnalyzer` always
+  builds, is `API_AVAILABLE(macos(15.0), ios(18.0), tvos(18.0), visionos(2.0))`.
 
 - **`AppleVisionTextOptions` carries the text request's own properties.** Eight
   fields join `min_text_len` and `max_candidates_per_observation`, each with a
@@ -75,21 +115,38 @@ and the default turns language detection on.
 - **Breaking: `AppleVisionTextOptions` is no longer `Copy`.** The roster and the
   custom words are lists. It is still `Clone`, and every entry point already
   takes it by reference.
-- **Breaking: `AnalyzeErrorKind` has a fourth variant**, `InvalidOptions`. A
-  `match` with no wildcard arm needs one more.
-- **Breaking: `TextRecognizer` has one floor — macOS 13, iOS 16, tvOS 16,
-  visionOS 1 — checked once, first.** Its default revision 3 and its language
-  detection arrive there, and everything else its constructor sends predates
-  it: the request class is macOS 10.15, the language query macOS 12. Below the
-  floor `TextRecognizer::new` refuses with `AnalyzeErrorKind::Unsupported`,
-  naming it, before the request class is resolved — where 0.7 built a
-  revision-3 request that failed every call, and on a system without the class
-  panicked looking it up. `Unsupported` now means Vision is not available here,
-  or not in the version an entry point needs. Above the floor, revision 2 or 1
-  is still a choice, with `detect_language = false`.
+- **Breaking: `AnalyzeErrorKind` has two more kinds, `InvalidOptions` and
+  `BelowFloor`, and is `#[non_exhaustive]`.** A `match` on it needs a wildcard
+  arm, so a later kind is not another breaking release. `Unsupported` keeps
+  its first meaning, a platform with no Vision at all; an Apple system older
+  than the floor is `BelowFloor`.
+- **Breaking: every entry point has one system floor, macOS 15, iOS 18, tvOS 18
+  and visionOS 2 (`SYSTEM_FLOOR`), checked once and first.** `VisionAnalyzer`,
+  `TextRecognizer`, `BarcodeDetector`, `FaceDetector`, `FaceLandmarker`,
+  `BodyPoser`, `HandPoser`, `AnimalPoser` and `PersonMasker` refuse below it
+  with `BelowFloor`, where 0.7 panicked resolving a class the system did not
+  have. Entry points whose classes are older — face detection and landmarks,
+  hand pose, 2-D body pose, text — ran on macOS 11 to 14 under 0.7 and now
+  refuse there: one floor for the crate means one question for a consumer and
+  one answer to keep true. On the text recognizer, revision 2 or 1 is still a
+  choice above the floor, with `detect_language = false`.
 
 ### Internal
 
+- **The floor is written once.** A `floor!` macro in `src/floor.rs` holds the
+  four versions. `SYSTEM_FLOOR`, the `objc2::available!` literals and the
+  version the test seam compares against all expand from it, so the three
+  cannot disagree. The system is asked once, through `objc2`, which reads the
+  version as Apple's own availability check does (Mac Catalyst and the
+  simulators included), and the answer is kept for the process.
+- **A test seam simulates the system version.** A `cfg(test)` thread-local,
+  set through a scoped guard, puts a simulated version in place of the system's
+  answer. `src/tests/floor.rs` drives every entry point through it: refused at
+  14.9, admitted at 15.0. The check itself still runs as written.
+- **The native shim's version-scoped names move to `0_8`.** `SHIM_ABI_TAG` in
+  `build.rs`, the `links` key in `Cargo.toml`, and every hand-written copy
+  `assert_versioned_names_are_consistent` cross-checks move from `0_7` to `0_8`
+  together. `build.rs` still fails the build on every host if any copy drifts.
 - **Core Text renders the text laws' page.** `src/tests/text.rs` sets a
   Chinese, a Japanese and an English line into a Core Graphics bitmap with
   Core Text and reads it through the pixel door, so no CJK fixture is vendored.

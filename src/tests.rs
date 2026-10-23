@@ -1,14 +1,23 @@
 mod plane;
 mod reference;
 
+#[cfg(feature = "serde")]
+mod error_wire;
+
 #[cfg(target_vendor = "apple")]
 mod ane_denied;
 #[cfg(target_vendor = "apple")]
 mod body_pose;
 #[cfg(target_vendor = "apple")]
+mod debug_pure;
+#[cfg(not(target_vendor = "apple"))]
+mod debug_pure_stub;
+#[cfg(target_vendor = "apple")]
 mod face;
 #[cfg(target_vendor = "apple")]
 mod ffi;
+#[cfg(target_vendor = "apple")]
+mod floor;
 #[cfg(target_vendor = "apple")]
 mod mask;
 #[cfg(target_vendor = "apple")]

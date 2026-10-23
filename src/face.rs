@@ -255,7 +255,6 @@ pub trait FaceDetection: Sized {
 /// requests, the input observations set on them for the call — so a
 /// detector is not safe to share across threads; build one per worker.
 #[cfg(target_vendor = "apple")]
-#[derive(Debug)]
 pub struct FaceDetector {
   rectangles: Retained<VNDetectFaceRectanglesRequest>,
   quality: Retained<VNDetectFaceCaptureQualityRequest>,
@@ -264,6 +263,19 @@ pub struct FaceDetector {
   /// closure that pinned them, so the public reader sends no message
   /// of its own.
   revisions: Revisions<FaceDetectorRevisions, 3>,
+}
+
+/// Prints the type name and what is cached in plain Rust. The retained
+/// Vision request is never formatted: `Retained`'s `Debug` sends
+/// `-[NSObject description]` to it, which would put a Vision message
+/// outside the exception barrier and the selector census.
+#[cfg(target_vendor = "apple")]
+impl core::fmt::Debug for FaceDetector {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.debug_struct("FaceDetector")
+      .field("revisions", &self.revisions)
+      .finish_non_exhaustive()
+  }
 }
 
 #[cfg(target_vendor = "apple")]
@@ -276,6 +288,11 @@ impl FaceDetector {
   ///
   /// # Errors
   ///
+  /// [`AnalyzeErrorKind::BelowFloor`](crate::AnalyzeErrorKind::BelowFloor)
+  /// on a system older than [`SYSTEM_FLOOR`](crate::SYSTEM_FLOOR), checked
+  /// first, before anything is sent: the message names this constructor
+  /// and the floor.
+  ///
   /// Building a Vision request loads a model, and a model load is where
   /// Apple's stack raises instead of returning: on a host whose Neural
   /// Engine is denied it throws, and a throw that crosses into Rust
@@ -285,7 +302,9 @@ impl FaceDetector {
   /// be declined, before any frame has been handed to it.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn new(_options: &AppleVisionFaceOptions) -> Result<Self, AnalyzeError> {
-    guard_native("FaceDetector::new", || unsafe {
+    const SITE: &str = "FaceDetector::new";
+    crate::floor::require_floor(SITE)?;
+    guard_native(SITE, || unsafe {
       let rectangles = VNDetectFaceRectanglesRequest::new();
       rectangles.setRevision(VNDetectFaceRectanglesRequestRevision3);
 
