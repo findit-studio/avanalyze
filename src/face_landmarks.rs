@@ -218,9 +218,19 @@ pub trait FaceLandmarksDetection: Sized {
 /// `performRequests` / `results()`, so a landmarker is not safe to
 /// share across threads; build one per worker.
 #[cfg(target_vendor = "apple")]
-#[derive(Debug)]
 pub struct FaceLandmarker {
   request: Retained<VNDetectFaceLandmarksRequest>,
+}
+
+/// Prints the type name and what is cached in plain Rust. The retained
+/// Vision request is never formatted: `Retained`'s `Debug` sends
+/// `-[NSObject description]` to it, which would put a Vision message
+/// outside the exception barrier and the selector census.
+#[cfg(target_vendor = "apple")]
+impl core::fmt::Debug for FaceLandmarker {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.debug_struct("FaceLandmarker").finish_non_exhaustive()
+  }
 }
 
 #[cfg(target_vendor = "apple")]

@@ -1639,12 +1639,23 @@ impl ImageSource<'_> {
 }
 
 /// The prepared image one perform runs against.
-#[derive(Debug)]
 pub(crate) enum VisionImage {
   /// `performRequests:onImageData:` — Vision decodes.
   Encoded(Retained<NSData>),
   /// `performRequests:onCGImage:` — nothing decodes.
   Decoded(CFRetained<CGImage>),
+}
+
+/// Names the variant and nothing else: formatting the retained handle
+/// would send `-[NSObject description]` (or copy a Core Foundation
+/// description) outside the exception barrier.
+impl core::fmt::Debug for VisionImage {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    match self {
+      Self::Encoded(_) => f.write_str("VisionImage::Encoded"),
+      Self::Decoded(_) => f.write_str("VisionImage::Decoded"),
+    }
+  }
 }
 
 /// The `(bits per pixel, colour space, bitmap info)` Core Graphics needs

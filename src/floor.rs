@@ -161,6 +161,16 @@
 //! | `VNInstanceMaskObservation` | `allInstances`, `generateMaskForInstances:error:` | `VNInstanceMaskObservation` | 14.0, 17, 17 |
 //! | `VNImageAestheticsScoresObservation` | `overallScore`, `isUtility` | `VNImageAestheticsScoresObservation` | 15.0, 18, 18 |
 //!
+//! No trait sends a message of its own. The nine entry points implement
+//! `Debug` by hand from the type name and the revisions cached at
+//! construction, so formatting one never reaches `Retained`'s `Debug`
+//! (which sends `-[NSObject description]`); `debug_pure` pins that.
+//! None derives or implements `PartialEq`, `Eq`, `Hash`, `Display`,
+//! `Default` or `Clone`, so no `isEqual:`, `hash` or `description` is
+//! reachable through them. Dropping a `Retained` is a release, a runtime
+//! call and not a message send, and the crate's own clones of one are
+//! retains of the same kind.
+//!
 //! The other native shim, the exception barrier (`objc_cxx_barrier.mm`),
 //! sends Foundation's `name`, `reason` and `UTF8String` alone, to the
 //! exception in flight.

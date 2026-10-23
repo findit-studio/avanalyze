@@ -116,12 +116,24 @@ pub trait TextDetection: Sized {
 /// `performRequests` / `results()`, so a recognizer is not safe to
 /// share across threads; build one per worker.
 #[cfg(target_vendor = "apple")]
-#[derive(Debug)]
 pub struct TextRecognizer {
   request: Retained<VNRecognizeTextRequest>,
   /// Read back from the request above inside the same guarded closure
   /// that pinned it, so the public reader sends no message of its own.
   revision: usize,
+}
+
+/// Prints the type name and what is cached in plain Rust. The retained
+/// Vision request is never formatted: `Retained`'s `Debug` sends
+/// `-[NSObject description]` to it, which would put a Vision message
+/// outside the exception barrier and the selector census.
+#[cfg(target_vendor = "apple")]
+impl core::fmt::Debug for TextRecognizer {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.debug_struct("TextRecognizer")
+      .field("revision", &self.revision)
+      .finish_non_exhaustive()
+  }
 }
 
 #[cfg(target_vendor = "apple")]

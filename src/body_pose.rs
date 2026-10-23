@@ -167,7 +167,6 @@ pub enum HeightEstimation {
 /// `performRequests` / `results()`, so a poser is not safe to share
 /// across threads; build one per worker.
 #[cfg(target_vendor = "apple")]
-#[derive(Debug)]
 pub struct BodyPoser {
   pose_2d: Retained<VNDetectHumanBodyPoseRequest>,
   pose_3d: Retained<VNDetectHumanBodyPose3DRequest>,
@@ -175,6 +174,19 @@ pub struct BodyPoser {
   /// closure that pinned them, so the public reader sends no message
   /// of its own.
   revisions: Revisions<BodyPoserRevisions, 2>,
+}
+
+/// Prints the type name and what is cached in plain Rust. The retained
+/// Vision request is never formatted: `Retained`'s `Debug` sends
+/// `-[NSObject description]` to it, which would put a Vision message
+/// outside the exception barrier and the selector census.
+#[cfg(target_vendor = "apple")]
+impl core::fmt::Debug for BodyPoser {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.debug_struct("BodyPoser")
+      .field("revisions", &self.revisions)
+      .finish_non_exhaustive()
+  }
 }
 
 #[cfg(target_vendor = "apple")]

@@ -9,6 +9,10 @@ mod ane_denied;
 #[cfg(target_vendor = "apple")]
 mod body_pose;
 #[cfg(target_vendor = "apple")]
+mod debug_pure;
+#[cfg(not(target_vendor = "apple"))]
+mod debug_pure_stub;
+#[cfg(target_vendor = "apple")]
 mod face;
 #[cfg(target_vendor = "apple")]
 mod ffi;
