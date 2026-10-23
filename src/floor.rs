@@ -18,16 +18,18 @@
 //! exists on every system from macOS 10.13, iOS 11 and tvOS 11 on, the
 //! first row's two frameworks being the newest: from there up to the floor
 //! a process starts, and every constructor refuses. The census, every
-//! framework the crate links and every Vision class, global, constant and
-//! selector it references, with the release that brought it
-//! (`API_AVAILABLE` in the SDK's headers; visionOS follows iOS), against
-//! the floor of macOS 15, iOS 18, tvOS 18 and visionOS 2:
+//! framework the crate links, every Vision class, global, constant and
+//! selector it references, and every Foundation and CoreFoundation class,
+//! selector and symbol it reaches (the Foundation tables below the Vision
+//! ones), with the release that brought it (`API_AVAILABLE` in the SDK's
+//! headers; visionOS follows iOS), against the floor of macOS 15, iOS 18,
+//! tvOS 18 and visionOS 2:
 //!
 //! | what | how it is reached | introduced (macOS, iOS, tvOS) |
 //! |---|---|---|
 //! | Vision, and CoreML, which `objc2-vision`'s dependencies link beside it | linked strongly, by those crates' own `#[link]`, which no library can weaken | 10.13, 11, 11 (visionOS 1): a process that links this crate starts only where both exist. rustc's own defaults deploy lower on three targets (x86_64 macOS 10.12, iOS 10, tvOS 10); a binary deployed there that must start on the systems the two predate links both weakly, `-C link-arg=-Wl,-weak_framework,Vision` and the same for `CoreML`, which ld64 and lld both honour beside the strong link |
-//! | every other framework and library linked (Foundation, CoreFoundation, CoreGraphics, CoreVideo, CoreImage, CoreMedia, AVFoundation, ImageIO, Metal, libobjc, libc++, libSystem, libiconv), and every symbol imported from them | linked and imported strongly | each older than the oldest systems rustc supports: macOS 10.12, iOS 10, tvOS 10, visionOS 1 |
-//! | every framework the crate reaches only by name, where the linker drops it | Vision loaded by `dlopen` from its system path once the floor is met, before any class is looked up, and kept loaded (`ffi::vision`). A binary linked with `-dead_strip_dylibs` drops the load command of a framework it imports no symbol from: Vision always, for this crate imports none; and Foundation or CoreFoundation where the binary imports none of it, which define the Foundation classes the crate names (`NSString`, `NSArray`, `NSDictionary`, `NSData`, `NSError`, `NSIndexSet`, `NSNumber`, `NSEnumerator`), looked up by name as Vision's are. Vision links both, and CoreML, so loading it loads them; no Foundation class is looked up before it, and no CoreML class or symbol is reached at all | — |
+//! | every other framework and library linked (Foundation, CoreFoundation, CoreGraphics, CoreVideo, CoreImage, CoreMedia, AVFoundation, ImageIO, Metal, libobjc, libc++, libSystem, libiconv), and every symbol imported from them | linked and imported strongly. Foundation is a strong dependency twice over: `objc2-foundation` links it by its own `#[link]`, and `build.rs` links it by name (`cargo:rustc-link-lib=framework=Foundation`), because the exception barrier's `catch (NSException *)` binds `_OBJC_EHTYPE_$_NSException`, which the link resolves through Foundation (CoreFoundation's text stub exports it, Foundation re-exports CoreFoundation), and a barrier must not lose that link if a dependency's directive ever moves | each older than the oldest systems rustc supports: macOS 10.12, iOS 10, tvOS 10, visionOS 1 |
+//! | every framework the crate reaches only by name, where the linker drops it | Vision loaded by `dlopen` from its system path once the floor is met, before any class is looked up, and kept loaded (`ffi::vision`). A binary linked with `-dead_strip_dylibs` drops the load command of a framework it imports no symbol from: Vision always, for this crate imports none. Foundation and CoreFoundation are not in that set and do not wait on Vision's load: both are strong dependencies (the row above), and the Foundation classes the crate looks up by name (the tables below) are found in the Foundation the binary itself links. The dead-strip integration binary (`tests/dead_strip.rs`) shows it: `otool -L` lists Foundation and CoreFoundation and not Vision. No CoreML class or symbol is reached at all | — |
 //! | every class below | by name at run time (objc2's `objc_getClass`, its default), after the floor check | 10.13 to 15.0, each at or below the floor |
 //! | every class below, where a consumer enables `objc2/unstable-static-class` | objc2 then emits each class as a static `OBJC_CLASS_$_…` reference, a strong link-time import: by its own documentation, "OS version < Class introduced version: Dynamic linker error on program startup" (objc2 0.6.5, `src/macros/mod.rs` 33–47, 509–513) | the class's own release: such a binary does not launch below it, so [`BelowFloor`](crate::AnalyzeErrorKind::BelowFloor) cannot answer there. The consumer's trade-off for opting into an unstable feature that changes linking, which this crate does not enable and no library can undo |
 //! | every selector below | by name (objc2's `sel_registerName` at run time; the native shim's selector reference, which dyld registers at load and which imports no symbol), sent to its class or an instance of it, after the floor check | 10.13 to 15.0, each at or below the floor |
@@ -160,6 +162,89 @@
 //! | `VNPoint3D` | `position` | `VNHumanBodyRecognizedPoint3D`, by the native shim (`objc_simd_shim.m`, `avanalyze_0_8_vn_point3d_position`) | 14.0, 17, 17 |
 //! | `VNInstanceMaskObservation` | `allInstances`, `generateMaskForInstances:error:` | `VNInstanceMaskObservation` | 14.0, 17, 17 |
 //! | `VNImageAestheticsScoresObservation` | `overallScore`, `isUtility` | `VNImageAestheticsScoresObservation` | 15.0, 18, 18 |
+//!
+//! The Foundation and CoreFoundation census. Foundation is a strong
+//! dependency (the second row of the first table), so nothing below is
+//! loaded through Vision; each row is reconciled with a call site in
+//! `src/` by source, or with the native shim that sends it. "Unannotated"
+//! means the SDK's header gives the class or selector no `API_AVAILABLE`
+//! of its own, and so no release after Foundation's first (macOS 10.0,
+//! iOS 2): older than every system the floor row names, as `NSUUID`
+//! (10.8) is the newest annotated one below.
+//!
+//! The classes and types:
+//!
+//! | class or type | how it is reached | introduced |
+//! |---|---|---|
+//! | `NSString` | an instance Vision returns, and `NSString::from_str` (`text.rs`), allocated by the runtime's `objc_alloc` entry point | unannotated |
+//! | `NSArray` | an instance Vision returns, and `NSArray::from_retained_slice` (`ffi.rs`, `face.rs`, `text.rs`) | unannotated |
+//! | `NSDictionary` | an instance Vision returns (`recognizedPointsForJointsGroupName:error:`); never created here | unannotated |
+//! | `NSData` | `NSData::with_bytes` (`ffi.rs`), the encoded image handed to Vision | unannotated |
+//! | `NSError` | an instance Vision returns through its `error:` out-parameter; never created here | unannotated |
+//! | `NSIndexSet` | an instance Vision returns (`allInstances`, `+supportedRevisions`), and `NSIndexSet::indexSetWithIndex` (`person_mask.rs`) | unannotated |
+//! | `NSNumber` | an instance Vision returns (`roll`, `yaw`, `pitch`, `faceCaptureQuality`); never created here | unannotated |
+//! | `NSUUID` | an instance Vision returns (`VNObservation.uuid`); never created here, and its class is not looked up | 10.8, 6, 9 |
+//! | `NSException` | the type the barrier's `catch (NSException *)` names (`objc_cxx_barrier.mm`), and the instance in flight; never created by product code | unannotated |
+//! | `NSEnumerator` | a type only: the `objc2-foundation` feature is on for its iterators, but no `NSEnumerator` is created and none is sent a message, because the array and dictionary iterators fast-enumerate the collection itself and `objectEnumerator` and `keyEnumerator` are never sent. Its class is not looked up | unannotated |
+//! | `NSObject` | the root of every class above and below, and the receiver of `+new` (the Vision table above) | unannotated |
+//!
+//! The one Foundation symbol the crate imports, strong: `_OBJC_EHTYPE_$_NSException`
+//! (the exception type-information record), bound by `catch (NSException *)` at
+//! `objc_cxx_barrier.mm:314`, defined in CoreFoundation and resolved through the
+//! Foundation link of the first table (`nm -m` of the `dead_strip` test binary
+//! reads it as `(from CoreFoundation)`). It is unannotated, older than every system the
+//! floor row names, and so loads on any system the process can start on. The
+//! test-only archive (`objc_cxx_barrier_test.mm`) also imports
+//! `_OBJC_CLASS_$_NSException` and `_OBJC_METACLASS_$_NSException`, strong,
+//! to raise the exceptions the barrier tests need; it is not part of the
+//! library, and the same release applies. Foundation exports no other
+//! symbol this crate binds: `NSNotFound` is an integer constant compiled in
+//! by `objc2-foundation` (`NSIntegerMax`), and `NSUTF8StringEncoding` is
+//! the integer 4 written in `ffi.rs`.
+//!
+//! The selectors and calls, by the class or protocol that declares them:
+//!
+//! | declared on | selectors | sent to, and where | introduced |
+//! |---|---|---|---|
+//! | `NSString` | `lengthOfBytesUsingEncoding:` | every string read from Vision, bounded by `ffi_nsstring_to_smolstr` (`ffi.rs`), and again inside `objc2`'s UTF-8 read below | unannotated |
+//! | `NSString` | `UTF8String` | the same strings, by `objc2`'s string read behind `to_smolstr()` (`ffi.rs`); and the barrier, to the in-flight exception's `name` and `reason` (`objc_cxx_barrier.mm`) | unannotated |
+//! | `NSString` | `initWithBytes:length:encoding:` | the string `NSString::from_str` allocates (`text.rs`: languages and custom words) | unannotated |
+//! | `NSArray` | `count` | every results array Vision returns (`len`, `is_empty`: `face.rs`, `barcode.rs` and the other extractors) | unannotated |
+//! | `NSArray` | `initWithObjects:count:` | the array `NSArray::from_retained_slice` allocates (`ffi.rs`, `face.rs`, `text.rs`) | unannotated |
+//! | the protocol `NSFastEnumeration` | `countByEnumeratingWithState:objects:count:` | the arrays Vision returns (`.iter()` in every extractor) and the pose dictionaries (`.keys()`, `ffi.rs`); not an `NSEnumerator` | unannotated |
+//! | `NSDictionary` | `count` | the pose dictionary (`dict.len()`, `ffi.rs`) | unannotated |
+//! | `NSDictionary` | `objectForKey:` | the pose dictionary (`ffi.rs`) | unannotated |
+//! | `NSData` | `initWithBytes:length:` | the data `NSData::with_bytes` allocates (`ffi.rs`) | unannotated |
+//! | `NSError` | `localizedDescription` | an error Vision returns (`ffi.rs`, `text.rs`) | unannotated |
+//! | `NSIndexSet` | `indexSetWithIndex:` | `NSIndexSet` (class message, `person_mask.rs`) | unannotated |
+//! | `NSIndexSet` | `firstIndex`, `indexGreaterThanIndex:` | the instance set Vision returns, and the revisions set (`person_mask.rs`, `text.rs`) | unannotated |
+//! | `NSIndexSet` | `containsIndex:` | the revisions set of `VNRecognizeTextRequest` (`text.rs`) | unannotated |
+//! | `NSNumber` | `floatValue` | the `NSNumber` Vision returns for a face's `roll`, `yaw`, `pitch` and `faceCaptureQuality` (`face.rs`) | unannotated |
+//! | `NSUUID` | `UUIDString` | the `uuid` of a `VNFaceObservation` (`face.rs`) | 10.8, 6, 9 |
+//! | `NSException` | `name`, `reason` | the exception in flight, in the barrier's catch handler (`objc_cxx_barrier.mm`) | unannotated |
+//!
+//! These are the only Foundation messages the crate sends. Three kinds of
+//! call are not sends and are not rows: `alloc` is the runtime's
+//! `objc_alloc`, retain, release and autorelease are the runtime's
+//! `objc_retain`, `objc_release` and `objc_autorelease` (the
+//! `Retained` clones and drops), and the class lookups are
+//! `objc_getClass`. All three are in libobjc, which is linked strongly.
+//!
+//! The CoreFoundation functions product code calls, every one imported
+//! strong from CoreFoundation by `objc2-core-foundation`'s binding, each
+//! unannotated in `CFData.h` and `CFBase.h` (older than macOS 10.12):
+//!
+//! | function | called by |
+//! |---|---|
+//! | `CFDataCreate` | `CFData::new`, copying a tight pixel plane (`ffi.rs`) |
+//! | `CFDataCreateMutable`, `CFDataAppendBytes`, `CFDataGetLength` | `CFMutableData::new`, `CFMutableData::append_bytes` and `length`, copying a strided pixel plane row by row (`ffi.rs`) |
+//! | `CFRelease` | the drop of every `CFRetained` (`CFData`, `CFMutableData`, `CGImage`, `CGColorSpace`, `CGDataProvider`) |
+//!
+//! `CGPoint` and `CGRect` are plain structures: no symbol is imported for
+//! them. CoreGraphics and CoreVideo functions are the other strong imports
+//! of the first table's second row, each unannotated or older than
+//! macOS 10.12 in its header (`CGImageCreate` 10.0, `CGDataProviderCreateWithCFData` 10.4,
+//! `CGColorSpaceCreateDeviceRGB` and `…DeviceGray` 10.0, the `CVPixelBuffer…` functions 10.4).
 //!
 //! No trait sends a message of its own. The nine entry points implement
 //! `Debug` by hand from the type name and the revisions cached at
