@@ -26,16 +26,6 @@ pub enum AnalyzeErrorKind {
   /// A system that has Vision but is too old for this crate is
   /// [`BelowFloor`](Self::BelowFloor), not this.
   Unsupported,
-  /// This system is older than the crate's floor,
-  /// [`SYSTEM_FLOOR`](crate::SYSTEM_FLOOR) (macOS 15, iOS 18, tvOS 18,
-  /// visionOS 2).
-  ///
-  /// Every entry point's constructor refuses with this kind first, before
-  /// it sends a message or resolves a Vision class: below a class's own
-  /// floor, resolving it panics. The message names the entry point and the
-  /// floor. It is a fact about the system, not about the frame or the
-  /// options, and the same call refuses again.
-  BelowFloor,
   /// Apple's native stack raised instead of returning: an Objective-C
   /// or C++ exception escaped Vision, CoreML, or the Neural Engine
   /// layers beneath them, and this crate's barrier caught it.
@@ -79,6 +69,19 @@ pub enum AnalyzeErrorKind {
   /// default roster and reports success; handed a revision it does not
   /// implement, it fails every frame, one at a time.
   InvalidOptions,
+  // Declared last on purpose: the serde derive numbers a unit variant by
+  // its position, so every kind that existed in 0.7 keeps its index and a
+  // 0.7 value never decodes as this one in an ordinal-based format.
+  /// This system is older than the crate's floor,
+  /// [`SYSTEM_FLOOR`](crate::SYSTEM_FLOOR) (macOS 15, iOS 18, tvOS 18,
+  /// visionOS 2).
+  ///
+  /// Every entry point's constructor refuses with this kind first, before
+  /// it sends a message or resolves a Vision class: below a class's own
+  /// floor, resolving it panics. The message names the entry point and the
+  /// floor. It is a fact about the system, not about the frame or the
+  /// options, and the same call refuses again.
+  BelowFloor,
 }
 
 impl fmt::Display for AnalyzeErrorKind {

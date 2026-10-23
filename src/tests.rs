@@ -1,6 +1,9 @@
 mod plane;
 mod reference;
 
+#[cfg(feature = "serde")]
+mod error_wire;
+
 #[cfg(target_vendor = "apple")]
 mod ane_denied;
 #[cfg(target_vendor = "apple")]
